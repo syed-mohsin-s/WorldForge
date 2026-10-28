@@ -16,6 +16,7 @@ env/
 .coverage
 htmlcov/
 *.log
+MUJOCO_LOG.TXT
 
 # OS & Editor
 .DS_Store

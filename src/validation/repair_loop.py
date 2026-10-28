@@ -40,6 +40,7 @@ class CostTracker:
 
     # Compute time
     total_cpu_core_seconds: float = 0.0
+    total_gib_seconds: float = 0.0
 
     # Pricing tier
     pricing_tier: str = "standard"  # "standard" or "contributor"
@@ -64,8 +65,9 @@ class CostTracker:
             "timestamp": time.time(),
         })
 
-    def log_compute(self, core_seconds: float) -> None:
+    def log_compute(self, core_seconds: float, gib_seconds: float = 0.0) -> None:
         self.total_cpu_core_seconds += core_seconds
+        self.total_gib_seconds += gib_seconds
 
     @property
     def total_cost_usd(self) -> float:
@@ -80,7 +82,10 @@ class CostTracker:
             self.total_input_tokens * in_rate
             + self.total_output_tokens * out_rate
         )
-        compute_cost = self.total_cpu_core_seconds * 0.00003942
+        compute_cost = (
+            self.total_cpu_core_seconds * 0.00003942
+            + self.total_gib_seconds * 0.00000667
+        )
         return api_cost + compute_cost
 
     def summary(self) -> str:

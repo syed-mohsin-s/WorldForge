@@ -282,3 +282,4 @@ class SAM31Tracker:
             tracks=tracks,
         )
         return result, frame0_depth
+

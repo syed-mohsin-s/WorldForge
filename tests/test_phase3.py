@@ -257,3 +257,4 @@ class TestEndToEndPerception:
         assert cost_tracker.total_output_tokens > 0
 
         env.close()
+
