@@ -1,0 +1,53 @@
+{
+  "scene_id": "pick_place_cube",
+  "table_z": 0.0,
+  "camera": {
+    "pos": [0.6, -0.6, 0.8],
+    "lookat": [0.0, 0.0, 0.05],
+    "fovy": 45.0,
+    "resolution": [640, 480]
+  },
+  "objects": [
+    {
+      "id": "red_cube",
+      "label": "red plastic cube",
+      "primitive": "box",
+      "size": [0.025, 0.025, 0.025],
+      "position": [0.15, 0.0, 0.0],
+      "quaternion": [1, 0, 0, 0],
+      "material": "plastic",
+      "is_static": false,
+      "joint": {"type": "free", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
+      "parent_id": null
+    },
+    {
+      "id": "target_coaster",
+      "label": "wooden coaster (target zone)",
+      "primitive": "cylinder",
+      "size": [0.04, 0.005],
+      "position": [-0.15, 0.1, 0.0],
+      "quaternion": [1, 0, 0, 0],
+      "material": "wood",
+      "is_static": true,
+      "joint": {"type": "fixed", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
+      "parent_id": null
+    }
+  ],
+  "task": {
+    "task_type": "pick_and_place",
+    "description": "Pick up the red cube and place it on the wooden coaster.",
+    "manipulated_object_id": "red_cube",
+    "target_position": [-0.15, 0.1, 0.035],
+    "target_joint_delta": null,
+    "waypoints": [
+      [0.15, 0.0, 0.10, 1.0],
+      [0.15, 0.0, 0.03, 1.0],
+      [0.15, 0.0, 0.03, -1.0],
+      [0.15, 0.0, 0.12, -1.0],
+      [-0.15, 0.1, 0.12, -1.0],
+      [-0.15, 0.1, 0.04, -1.0],
+      [-0.15, 0.1, 0.04, 1.0]
+    ]
+  }
+}
+

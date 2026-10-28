@@ -1,0 +1,68 @@
+{
+  "scene_id": "articulated_drawer",
+  "table_z": 0.0,
+  "camera": {
+    "pos": [0.5, -0.5, 0.6],
+    "lookat": [0.0, 0.0, 0.1],
+    "fovy": 45.0,
+    "resolution": [640, 480]
+  },
+  "objects": [
+    {
+      "id": "cabinet_body",
+      "label": "wooden cabinet body",
+      "primitive": "box",
+      "size": [0.12, 0.1, 0.08],
+      "position": [0.0, 0.0, 0.0],
+      "quaternion": [1, 0, 0, 0],
+      "material": "wood",
+      "is_static": true,
+      "joint": {"type": "fixed", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
+      "parent_id": null
+    },
+    {
+      "id": "drawer_panel",
+      "label": "wooden drawer front panel",
+      "primitive": "box",
+      "size": [0.10, 0.005, 0.06],
+      "position": [0.0, -0.105, 0.0],
+      "quaternion": [1, 0, 0, 0],
+      "material": "wood",
+      "is_static": false,
+      "joint": {
+        "type": "slide",
+        "axis": [0, -1, 0],
+        "range": [0.0, 0.12],
+        "damping": 2.0,
+        "is_prior_guess": true
+      },
+      "parent_id": "cabinet_body"
+    },
+    {
+      "id": "drawer_handle",
+      "label": "metal drawer handle",
+      "primitive": "cylinder",
+      "size": [0.008, 0.03],
+      "position": [0.0, -0.01, 0.0],
+      "quaternion": [0.7071068, 0.7071068, 0, 0],
+      "material": "metal",
+      "is_static": false,
+      "joint": {"type": "fixed", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
+      "parent_id": "drawer_panel"
+    }
+  ],
+  "task": {
+    "task_type": "articulate_joint",
+    "description": "Grasp the drawer handle and pull the drawer open by 10 cm.",
+    "manipulated_object_id": "drawer_panel",
+    "target_position": null,
+    "target_joint_delta": 0.10,
+    "waypoints": [
+      [0.0, -0.12, 0.085, 1.0],
+      [0.0, -0.12, 0.085, -1.0],
+      [0.0, -0.22, 0.085, -1.0],
+      [0.0, -0.22, 0.085, 1.0]
+    ]
+  }
+}
+

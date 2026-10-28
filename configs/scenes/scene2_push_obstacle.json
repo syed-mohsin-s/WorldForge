@@ -1,0 +1,63 @@
+{
+  "scene_id": "push_obstacle",
+  "table_z": 0.0,
+  "camera": {
+    "pos": [0.0, -0.8, 0.7],
+    "lookat": [0.0, 0.0, 0.05],
+    "fovy": 45.0,
+    "resolution": [640, 480]
+  },
+  "objects": [
+    {
+      "id": "blue_cylinder",
+      "label": "blue plastic cylinder to push",
+      "primitive": "cylinder",
+      "size": [0.02, 0.04],
+      "position": [0.1, -0.05, 0.0],
+      "quaternion": [1, 0, 0, 0],
+      "material": "plastic",
+      "is_static": false,
+      "joint": {"type": "free", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
+      "parent_id": null
+    },
+    {
+      "id": "metal_obstacle",
+      "label": "heavy metal box obstacle",
+      "primitive": "box",
+      "size": [0.03, 0.03, 0.06],
+      "position": [0.0, 0.05, 0.0],
+      "quaternion": [1, 0, 0, 0],
+      "material": "metal",
+      "is_static": false,
+      "joint": {"type": "free", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
+      "parent_id": null
+    },
+    {
+      "id": "target_zone_marker",
+      "label": "rubber target zone marker",
+      "primitive": "cylinder",
+      "size": [0.05, 0.002],
+      "position": [-0.15, 0.1, 0.0],
+      "quaternion": [1, 0, 0, 0],
+      "material": "rubber",
+      "is_static": true,
+      "joint": {"type": "fixed", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
+      "parent_id": null
+    }
+  ],
+  "task": {
+    "task_type": "push_to_target",
+    "description": "Push the blue cylinder around or through the metal obstacle to the target zone.",
+    "manipulated_object_id": "blue_cylinder",
+    "target_position": [-0.15, 0.1, 0.04],
+    "target_joint_delta": null,
+    "waypoints": [
+      [0.16, -0.05, 0.06, -0.5],
+      [0.12, -0.05, 0.055, -0.5],
+      [0.0, -0.05, 0.055, -0.5],
+      [-0.10, 0.05, 0.055, -0.5],
+      [-0.15, 0.10, 0.055, -0.5]
+    ]
+  }
+}
+

@@ -1,0 +1,36 @@
+# WorldForge Material Properties Lookup Table
+# Each material maps to physical ranges for domain randomization.
+# density_range: [min, max] in kg/m^3
+# sliding_friction_range: [min, max] (dimensionless, MuJoCo tangent friction)
+# rgba: default RGBA color [r, g, b, a] in [0,1]
+
+plastic:
+  density_range: [900, 1400]
+  sliding_friction_range: [0.3, 0.5]
+  rgba: [0.8, 0.2, 0.2, 1.0]
+
+metal:
+  density_range: [2700, 8000]
+  sliding_friction_range: [0.2, 0.4]
+  rgba: [0.7, 0.7, 0.75, 1.0]
+
+wood:
+  density_range: [400, 900]
+  sliding_friction_range: [0.4, 0.6]
+  rgba: [0.72, 0.53, 0.26, 1.0]
+
+ceramic:
+  density_range: [2200, 2600]
+  sliding_friction_range: [0.3, 0.5]
+  rgba: [0.95, 0.95, 0.9, 1.0]
+
+rubber:
+  density_range: [1100, 1500]
+  sliding_friction_range: [0.8, 1.2]
+  rgba: [0.15, 0.15, 0.15, 1.0]
+
+cardboard:
+  density_range: [150, 400]
+  sliding_friction_range: [0.4, 0.6]
+  rgba: [0.76, 0.6, 0.42, 1.0]
+
