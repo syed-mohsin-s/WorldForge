@@ -4,7 +4,7 @@
 >
 > Converts video specifications into validated, trainable MuJoCo 3.x Gymnasium environments.
 
-[![CI Tests](https://img.shields.io/badge/tests-52%20passed-brightgreen.svg)]()
+[![CI Tests](https://img.shields.io/badge/tests-61%20passed-brightgreen.svg)]()
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)]()
 [![MuJoCo 3.x](https://img.shields.io/badge/mujoco-3.17.0-orange.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -14,13 +14,25 @@
 ## Architecture Overview
 
 ```
-SceneGraph (Pydantic V2)
+Monocular Video / RGB-D
         │
-        ▼ (Deterministic)
-MJCF Builder (MuJoCo 3.x XML)
+        ▼ (Stage 1: SAM 3.1)
+SAM 3.1 Tracker (Mask Segmentation, 4px Boundary Erosion, 2D Trajectories)
         │
-        ▼
-WorldForgeEnv (Gymnasium Env, 4-DoF Cartesian Mocap Weld)
+        ▼ (Stage 2: 3D Lift)
+3D Lifter (Pinhole Back-Projection, RANSAC Plane Fit, SVD Trajectory Fit)
+        │
+        ▼ (Stage 3: Muse Spark 1.2)
+Muse Spark Reasoner (Physical Material Priors, Hierarchy Inference, Oracle Waypoints)
+        │
+        ▼ (Stage 4: Scene Graph)
+SceneGraph (Pydantic V2 Strict Models + Auto-Snap Height Grounding)
+        │
+        ▼ (Stage 5: MJCF Compiler)
+MJCF Builder (MuJoCo 3.x XML, Mocap Weld Equality, condim="4")
+        │
+        ▼ (Stage 6: Multi-Stage Shaped Dense Rewards)
+WorldForgeEnv (Gymnasium 4-DoF Mocap Cartesian Env, Cross-Platform WGL/EGL)
         │
         ├── Multi-Stage Shaped Dense Reward
         │     • pick_and_place (reach → grasp → lift → place → success)
@@ -34,7 +46,7 @@ WorldForgeEnv (Gymnasium Env, 4-DoF Cartesian Mocap Weld)
         │     • Gate 4: Closed-Loop Waypoint Oracle Solvability
         │     • Gate 5: Fast PPO Convergence (beats random baseline)
         │
-        └── Self-Healing Repair Loop + CostTracker
+        └── Stage 7: Self-Healing Repair Loop + CostTracker
 ```
 
 ---
@@ -52,6 +64,10 @@ WorldForge-RL/
 ├── src/
 │   ├── schema/
 │   │   └── scene_graph.py            # Pydantic V2 models with table auto-snap
+│   ├── perception/
+│   │   ├── sam_tracker.py            # SAM 3.1 tracking, 4px erosion & sim ground-truth
+│   │   ├── lift_3d.py                # Pinhole ray-plane math, RANSAC table & SVD trajectory
+│   │   └── spark_reasoner.py         # Muse Spark 1.2 reasoning & SceneGraph synthesis
 │   ├── compiler/
 │   │   ├── mjcf_builder.py           # Deterministic SceneGraph -> MJCF XML compiler
 │   │   ├── base_env.py               # WorldForgeEnv (Gymnasium 4-DoF Mocap Env)
@@ -62,7 +78,8 @@ WorldForge-RL/
 │       └── repair_loop.py            # CostTracker + automated self-healing loop
 └── tests/
     ├── test_phase1.py                # 25 Phase 1 tests (Schema, MJCF, Env)
-    └── test_phase2.py                # 27 Phase 2 tests (Rewards, Gates 1–5, PPO, Repair)
+    ├── test_phase2.py                # 27 Phase 2 tests (Rewards, Gates 1–5, PPO, Repair)
+    └── test_phase3.py                # 9 Phase 3 tests (SAM 3.1, 3D lift, Muse Spark, End-to-End)
 ```
 
 ---
@@ -82,14 +99,14 @@ cd WorldForge
 
 # Create virtual environment and install dependencies
 uv venv .venv --python 3.12
-uv pip install --python .venv/Scripts/python.exe mujoco gymnasium pydantic pyyaml numpy scipy pytest stable-baselines3 "imageio[ffmpeg]"
+uv pip install --python .venv/Scripts/python.exe mujoco gymnasium pydantic pyyaml numpy scipy pytest stable-baselines3 "imageio[ffmpeg]" opencv-python-headless httpx
 ```
 
 ### Running Tests
 
 ```bash
-# Run full test suite (52 tests)
-.venv/Scripts/python.exe -m pytest tests/test_phase1.py tests/test_phase2.py -v
+# Run full test suite across all 3 phases (61 tests)
+.venv/Scripts/python.exe -m pytest tests/test_phase1.py tests/test_phase2.py tests/test_phase3.py -v
 ```
 
 ---
@@ -106,3 +123,4 @@ uv pip install --python .venv/Scripts/python.exe mujoco gymnasium pydantic pyyam
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+
