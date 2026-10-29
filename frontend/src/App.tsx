@@ -5,9 +5,7 @@ import {
   Box,
   Check,
   CheckCircle2,
-  ChevronRight,
   Clock,
-  Code,
   Copy,
   Cpu,
   DollarSign,
@@ -15,7 +13,6 @@ import {
   Layers,
   Play,
   RefreshCw,
-  RotateCcw,
   ShieldCheck,
   Sparkles,
   Terminal,
@@ -34,7 +31,6 @@ import {
 
 import {
   API_BASE,
-  CostTelemetry,
   PipelineRunResult,
   PipelineStageEvent,
   SceneGraph,
