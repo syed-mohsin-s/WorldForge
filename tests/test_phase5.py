@@ -186,3 +186,42 @@ def test_api_run_pipeline():
     assert "render_diff" in data
     assert "ppo_results" in data
     assert "cost_telemetry" in data
+
+
+def test_api_sim_endpoints():
+    """Verify live MuJoCo 3.17 simulation endpoints return real physics states."""
+    # Reset
+    resp = client.post("/api/sim/reset", json={"scene_id": "scene1_pick_place"})
+    assert resp.status_code == 200
+    st = resp.json()
+    assert st["step"] == 0
+    assert len(st["gripperPos"]) == 3
+    assert "red_cube" in st["objectPositions"]
+    assert "target_coaster" in st["objectPositions"]
+    assert "fingerAperture" in st
+    assert "diagnostics" in st
+    assert "reward" in st
+
+    # Manual action step
+    resp = client.post(
+        "/api/sim/step",
+        json={"scene_id": "scene1_pick_place", "action": [0.0, 0.0, -0.5, 1.0]},
+    )
+    assert resp.status_code == 200
+    st_step = resp.json()
+    assert st_step["step"] == 1
+    assert st_step["gripperCmd"] == 1.0
+
+    # Oracle step
+    resp = client.post("/api/sim/oracle-step", json={"scene_id": "scene1_pick_place"})
+    assert resp.status_code == 200
+    st_oracle = resp.json()
+    assert st_oracle["step"] == 2
+
+    # Trajectory
+    resp = client.get("/api/sim/trajectory?scene_id=scene1_pick_place&max_steps=10")
+    assert resp.status_code == 200
+    traj = resp.json()
+    assert len(traj) == 10
+    assert traj[0]["step"] == 0
+    assert traj[9]["step"] == 9

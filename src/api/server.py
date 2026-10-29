@@ -25,8 +25,12 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import mujoco
+import numpy as np
+from src.compiler.base_env import WorldForgeEnv
+from src.compiler.generated_reward import compute_reward
 from src.pipeline import OUTPUTS_ROOT, SCENES_DIR, run_worldforge_pipeline, stream_worldforge_pipeline
 from src.schema.scene_graph import SceneGraph
+from src.validation.ppo_runner import OracleController
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -61,6 +65,100 @@ class RunRequest(BaseModel):
     inject_fault: bool = Field(default=False, description="Whether to inject Gate 3 zero-reward fault to demo self-healing")
     provider: Literal["auto", "baseten", "meta", "local"] = Field(default="auto", description="LLM provider")
     quick_ppo: bool = Field(default=True, description="Use 4096 timesteps for rapid interactive training")
+
+
+class SimActionRequest(BaseModel):
+    """Real MuJoCo 3.17 simulation action request."""
+    scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
+    action: tuple[float, float, float, float] = Field(
+        default=(0.0, 0.0, 0.0, 1.0),
+        description="4-DoF [dx, dy, dz, grip_cmd] action executed by MuJoCo 3.17 mocap weld",
+    )
+
+
+class SimResetRequest(BaseModel):
+    """Real MuJoCo 3.17 simulation reset request."""
+    scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
+
+
+# Active in-memory simulation sessions per scene
+active_sim_sessions: dict[str, dict[str, Any]] = {}
+
+
+def _load_scene_graph(scene_id: str) -> SceneGraph:
+    clean_id = scene_id.replace(".json", "")
+    target = SCENES_DIR / f"{clean_id}.json"
+    if not target.exists():
+        for p in SCENES_DIR.glob("*.json"):
+            if clean_id in p.stem or p.stem in clean_id:
+                target = p
+                break
+    if not target.exists():
+        target = SCENES_DIR / "scene1_pick_place.json"
+    with open(target, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return SceneGraph.model_validate(data)
+
+
+def _extract_sim_state(
+    env: WorldForgeEnv,
+    sg: SceneGraph,
+    step: int,
+    grip_cmd: float = 1.0,
+) -> dict[str, Any]:
+    """Extract ground-truth MuJoCo 3.17 physics state, body positions, aperture, and rewards."""
+    grip_pos = env.data.mocap_pos[0].tolist()
+    obj_pos: dict[str, list[float]] = {}
+    obj_quat: dict[str, list[float]] = {}
+
+    for obj in sg.objects:
+        try:
+            bid = env.model.body(obj.id).id
+            obj_pos[obj.id] = env.data.xpos[bid].tolist()
+            obj_quat[obj.id] = env.data.xquat[bid].tolist()
+        except Exception:
+            obj_pos[obj.id] = list(obj.position)
+            obj_quat[obj.id] = list(obj.quaternion)
+
+    aperture = 0.04
+    try:
+        lf_id = env.model.body("finger_L").id
+        rf_id = env.model.body("finger_R").id
+        aperture = float(np.linalg.norm(env.data.xpos[lf_id] - env.data.xpos[rf_id]))
+    except Exception:
+        pass
+
+    reward, term, r_info = compute_reward(env.model, env.data, sg)
+
+    d_reach = float(r_info.get("d_reach", 0.0))
+    d_goal = float(r_info.get("d_place", r_info.get("d_goal", 0.0)))
+    grasp_bonus = float(r_info.get("grasp_bonus", 0.0))
+    lift_reward = float(r_info.get("lift_reward", 0.0))
+    place_reward = float(r_info.get("place_reward", 0.0))
+    reach_reward = float(r_info.get("reach_reward", 0.0))
+
+    return {
+        "step": step,
+        "gripperPos": grip_pos,
+        "gripperCmd": float(grip_cmd),
+        "fingerAperture": aperture,
+        "isGrasped": bool(grasp_bonus > 0.5),
+        "objectPositions": obj_pos,
+        "objectQuaternions": obj_quat,
+        "diagnostics": {
+            "dReach": d_reach,
+            "dGoal": d_goal,
+        },
+        "reward": float(reward),
+        "terminated": bool(term),
+        "stageBreakdown": {
+            "reach": reach_reward,
+            "graspOrClearance": grasp_bonus,
+            "liftOrProgress": lift_reward,
+            "placeOrGoal": place_reward,
+            "terminalBonus": 10.0 if term else 0.0,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +247,101 @@ def get_scene(scene_id: str) -> dict[str, Any]:
     with open(target, "r", encoding="utf-8") as f:
         data = json.load(f)
     return data
+
+
+# ---------------------------------------------------------------------------
+# Real MuJoCo 3.17 Interactive Simulation Endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/sim/reset")
+def sim_reset(req: SimResetRequest) -> dict[str, Any]:
+    """Reset the live MuJoCo 3.17 simulation environment and return ground-truth state."""
+    clean_id = req.scene_id.replace(".json", "")
+    sg = _load_scene_graph(clean_id)
+    env = WorldForgeEnv(sg)
+    env.reset(seed=42)
+    ctrl = OracleController(sg.task.waypoints)
+    active_sim_sessions[clean_id] = {
+        "env": env,
+        "sg": sg,
+        "ctrl": ctrl,
+        "step": 0,
+        "grip_cmd": 1.0,
+    }
+    return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
+
+
+@app.post("/api/sim/step")
+def sim_step(req: SimActionRequest) -> dict[str, Any]:
+    """Execute a single real physics step in MuJoCo 3.17 with the given 4-DoF action."""
+    clean_id = req.scene_id.replace(".json", "")
+    if clean_id not in active_sim_sessions:
+        sim_reset(SimResetRequest(scene_id=clean_id))
+
+    session = active_sim_sessions[clean_id]
+    env: WorldForgeEnv = session["env"]
+    sg: SceneGraph = session["sg"]
+
+    action_arr = np.array(req.action, dtype=np.float32)
+    obs, r, term, trunc, info = env.step(action_arr)
+    session["step"] += 1
+    session["grip_cmd"] = float(req.action[3])
+
+    return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
+
+
+@app.post("/api/sim/oracle-step")
+def sim_oracle_step(req: SimResetRequest) -> dict[str, Any]:
+    """Step the deterministic Waypoint Oracle controller inside MuJoCo 3.17."""
+    clean_id = req.scene_id.replace(".json", "")
+    if clean_id not in active_sim_sessions:
+        sim_reset(SimResetRequest(scene_id=clean_id))
+
+    session = active_sim_sessions[clean_id]
+    env: WorldForgeEnv = session["env"]
+    sg: SceneGraph = session["sg"]
+    ctrl: OracleController = session["ctrl"]
+
+    action = ctrl.get_action(env)
+    obs, r, term, trunc, info = env.step(action)
+    session["step"] += 1
+    session["grip_cmd"] = float(action[3])
+
+    return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
+
+
+@app.get("/api/sim/trajectory")
+def sim_trajectory(
+    scene_id: str = Query("scene1_pick_place"),
+    max_steps: int = Query(120),
+) -> list[dict[str, Any]]:
+    """Compute and return the full high-fidelity MuJoCo 3.17 physics trajectory."""
+    clean_id = scene_id.replace(".json", "")
+    sg = _load_scene_graph(clean_id)
+    env = WorldForgeEnv(sg)
+    ctrl = OracleController(sg.task.waypoints)
+    env.reset(seed=42)
+
+    trajectory: list[dict[str, Any]] = []
+    terminated = False
+    last_grip = sg.task.waypoints[-1][3] if sg.task.waypoints else 0.0
+
+    for s in range(max_steps):
+        if not terminated:
+            action = ctrl.get_action(env)
+            obs, r, term, trunc, info = env.step(action)
+            if term or trunc:
+                terminated = True
+            grip_cmd = float(action[3])
+        else:
+            idle_act = np.array([0.0, 0.0, 0.0, last_grip], dtype=np.float32)
+            env.step(idle_act)
+            grip_cmd = float(last_grip)
+
+        trajectory.append(_extract_sim_state(env, sg, step=s, grip_cmd=grip_cmd))
+
+    env.close()
+    return trajectory
 
 
 @app.post("/api/run")

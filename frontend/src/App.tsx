@@ -40,7 +40,11 @@ import {
   createDefaultSimState,
   fetchSceneDetails,
   fetchScenes,
+  fetchSimTrajectory,
   fetchSystemStatus,
+  resetSimulation,
+  stepOracle,
+  stepSimulation,
   streamPipeline,
 } from './engine/worldforge';
 import SceneCanvas from './components/SceneCanvas';
@@ -187,8 +191,8 @@ export function App() {
   const [repairDiff, setRepairDiff] = useState<string>('');
   const [liveGateResults, setLiveGateResults] = useState<Record<string, any>>({});
 
-  // Inspector tab
-  const [activeTab, setActiveTab] = useState<'reasoning' | 'scenegraph' | 'mjcf' | 'reward'>('reasoning');
+  // Inspector tab: 3D Simulation, Spark Reasoning, SceneGraph JSON, MJCF XML, Reward Code
+  const [activeTab, setActiveTab] = useState<'simulation' | 'reasoning' | 'scenegraph' | 'mjcf' | 'reward'>('simulation');
   const [copied, setCopied] = useState<boolean>(false);
 
   // Real-time timers
@@ -207,26 +211,33 @@ export function App() {
         fetchSceneDetails(id)
           .then((sg) => {
             setActiveSceneGraph(sg);
-            setSimState(createDefaultSimState(sg));
+            return resetSimulation(id);
+          })
+          .then((realSimState) => {
+            setSimState(realSimState);
+            setRewardHistory([realSimState]);
           })
           .catch(() => {});
       }
     }).catch(console.error);
   }, []);
 
-  // Update active scene graph when selection changes
+  // Update active scene graph and reset live MuJoCo simulation on backend when selection changes
   useEffect(() => {
     fetchSceneDetails(selectedSceneId)
       .then((sg) => {
         setActiveSceneGraph(sg);
-        setSimState(createDefaultSimState(sg));
-        setRewardHistory([]);
+        return resetSimulation(selectedSceneId);
+      })
+      .then((realSimState) => {
+        setSimState(realSimState);
+        setRewardHistory([realSimState]);
         if (isSimPlaying) {
           setIsSimPlaying(false);
           if (playTimerRef.current) clearInterval(playTimerRef.current);
         }
       })
-      .catch((err) => console.warn('Could not load scene details:', err));
+      .catch((err) => console.warn('Could not sync with backend simulation:', err));
   }, [selectedSceneId]);
 
   useEffect(() => {
@@ -302,7 +313,14 @@ export function App() {
         } else if (ev.stage === 'complete' && ev.summary) {
           setRunResult(ev.summary);
           setActiveSceneGraph(ev.summary.scene_graph);
-          setSimState(createDefaultSimState(ev.summary.scene_graph));
+          resetSimulation(selectedSceneId)
+            .then((st) => {
+              setSimState(st);
+              setRewardHistory([st]);
+            })
+            .catch(() => {
+              setSimState(createDefaultSimState(ev.summary!.scene_graph));
+            });
           setLiveGateResults(ev.summary.gate_results);
           if (ev.summary.repair_diff) setRepairDiff(ev.summary.repair_diff);
           if (ev.summary.repair_attempts) setSelfHealingRetries(ev.summary.repair_attempts);
@@ -335,70 +353,14 @@ export function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
-  // ── 3D PBR Workbench Interactive Handlers ─────────────────────────
+  // ── Real MuJoCo 3.17 Physics Backend Simulation Handlers ─────────
   const handleManualAction = (action: [number, number, number, number]) => {
-    const [dx, dy, dz, grip] = action;
-    setSimState((prev) => {
-      const curGrip = prev.gripperPos;
-      const nextGrip: [number, number, number] = [
-        curGrip[0] + dx * 0.015,
-        curGrip[1] + dy * 0.015,
-        Math.max(activeSceneGraph.table_z + 0.02, curGrip[2] + dz * 0.015),
-      ];
-      const newGripCmd = grip;
-      const aperture = newGripCmd > 0 ? 0.06 : 0.012;
-      const manipObjId = activeSceneGraph.task.manipulated_object_id;
-      const objPos = prev.objectPositions[manipObjId] ?? [0.15, -0.15, 0.026];
-      const distGripObj = Math.hypot(nextGrip[0] - objPos[0], nextGrip[1] - objPos[1], nextGrip[2] - objPos[2]);
-      const isGrasped = newGripCmd < 0 && (prev.isGrasped || distGripObj < 0.045);
-
-      const nextObjectPositions = { ...prev.objectPositions };
-      if (isGrasped) {
-        nextObjectPositions[manipObjId] = [
-          nextGrip[0],
-          nextGrip[1],
-          Math.max(activeSceneGraph.table_z + 0.025, nextGrip[2] - 0.025),
-        ];
-      }
-      const targetPos = activeSceneGraph.task.target_position ?? [-0.15, 0.15, 0.026];
-      const currObjPos = nextObjectPositions[manipObjId] ?? objPos;
-      const distObjGoal = Math.hypot(
-        currObjPos[0] - targetPos[0],
-        currObjPos[1] - targetPos[1],
-        currObjPos[2] - targetPos[2]
-      );
-
-      const rReach = 1.0 - Math.tanh(5.0 * distGripObj);
-      const rGrasp = isGrasped ? 2.0 : 0.0;
-      const rLift = 3.0 * Math.max(0.0, currObjPos[2] - activeSceneGraph.table_z - 0.025);
-      const rPlace = isGrasped || distObjGoal < 0.05 ? 5.0 * (1.0 - Math.tanh(5.0 * distObjGoal)) : 0.0;
-      const totalR = rReach + rGrasp + rLift + rPlace;
-      const terminated = distObjGoal < 0.035;
-
-      const nextState: SimState = {
-        step: prev.step + 1,
-        gripperPos: nextGrip,
-        gripperCmd: newGripCmd,
-        fingerAperture: aperture,
-        isGrasped,
-        objectPositions: nextObjectPositions,
-        diagnostics: {
-          dReach: distGripObj,
-          dGoal: distObjGoal,
-        },
-        reward: totalR,
-        terminated,
-        stageBreakdown: {
-          reach: rReach,
-          graspOrClearance: rGrasp,
-          liftOrProgress: rLift,
-          placeOrGoal: rPlace,
-          terminalBonus: terminated ? 10.0 : 0.0,
-        },
-      };
-      setRewardHistory((h) => [...h.slice(-150), nextState]);
-      return nextState;
-    });
+    stepSimulation(selectedSceneId, action)
+      .then((nextState) => {
+        setSimState(nextState);
+        setRewardHistory((h) => [...h.slice(-150), nextState]);
+      })
+      .catch((err) => console.error('MuJoCo sim step error:', err));
   };
 
   const handleToggleSimPlay = () => {
@@ -407,118 +369,51 @@ export function App() {
       setIsSimPlaying(false);
     } else {
       setIsSimPlaying(true);
-      const wps = activeSceneGraph.task.waypoints;
-      if (!wps || wps.length === 0) return;
-
-      let wpIdx = 0;
-      playTimerRef.current = window.setInterval(() => {
-        if (wpIdx >= wps.length) {
-          if (playTimerRef.current) clearInterval(playTimerRef.current);
+      fetchSimTrajectory(selectedSceneId, 120)
+        .then((traj) => {
+          let wpIdx = 0;
+          playTimerRef.current = window.setInterval(() => {
+            if (wpIdx >= traj.length) {
+              if (playTimerRef.current) clearInterval(playTimerRef.current);
+              setIsSimPlaying(false);
+              return;
+            }
+            const st = traj[wpIdx++];
+            setSimState(st);
+            setRewardHistory((h) => [...h.slice(-150), st]);
+          }, 33); // 30 FPS playback of real MuJoCo 3.17 solver steps
+        })
+        .catch((err) => {
+          console.error('Trajectory playback error:', err);
           setIsSimPlaying(false);
-          return;
-        }
-        const [wx, wy, wz, grip] = wps[wpIdx];
-        setSimState((prev) => {
-          const cur = prev.gripperPos;
-          const dx = wx - cur[0];
-          const dy = wy - cur[1];
-          const dz = wz - cur[2];
-          const dist = Math.hypot(dx, dy, dz);
-
-          if (dist < 0.015) {
-            wpIdx++;
-          }
-
-          const stepSize = 0.012;
-          const ratio = dist > 1e-6 ? Math.min(1.0, stepSize / dist) : 1.0;
-          const nextGrip: [number, number, number] = [
-            cur[0] + dx * ratio,
-            cur[1] + dy * ratio,
-            cur[2] + dz * ratio,
-          ];
-          const aperture = grip > 0 ? 0.06 : 0.012;
-          const manipId = activeSceneGraph.task.manipulated_object_id;
-          const prevObj = prev.objectPositions[manipId] ?? [0.15, -0.15, 0.026];
-          const distGripObj = Math.hypot(nextGrip[0] - prevObj[0], nextGrip[1] - prevObj[1], nextGrip[2] - prevObj[2]);
-          const isGrasped = grip < 0 && (prev.isGrasped || distGripObj < 0.045);
-
-          const nextPositions = { ...prev.objectPositions };
-          if (isGrasped) {
-            nextPositions[manipId] = [nextGrip[0], nextGrip[1], Math.max(activeSceneGraph.table_z + 0.025, nextGrip[2] - 0.025)];
-          }
-          const target = activeSceneGraph.task.target_position ?? [-0.15, 0.15, 0.026];
-          const cObj = nextPositions[manipId] ?? prevObj;
-          const distGoal = Math.hypot(cObj[0] - target[0], cObj[1] - target[1], cObj[2] - target[2]);
-
-          const rReach = 1.0 - Math.tanh(5.0 * distGripObj);
-          const rGrasp = isGrasped ? 2.0 : 0.0;
-          const rLift = 3.0 * Math.max(0.0, cObj[2] - activeSceneGraph.table_z - 0.025);
-          const rPlace = isGrasped || distGoal < 0.05 ? 5.0 * (1.0 - Math.tanh(5.0 * distGoal)) : 0.0;
-          const totalR = rReach + rGrasp + rLift + rPlace;
-          const term = distGoal < 0.035;
-
-          const st: SimState = {
-            step: prev.step + 1,
-            gripperPos: nextGrip,
-            gripperCmd: grip,
-            fingerAperture: aperture,
-            isGrasped,
-            objectPositions: nextPositions,
-            diagnostics: { dReach: distGripObj, dGoal: distGoal },
-            reward: totalR,
-            terminated: term,
-            stageBreakdown: {
-              reach: rReach,
-              graspOrClearance: rGrasp,
-              liftOrProgress: rLift,
-              placeOrGoal: rPlace,
-              terminalBonus: term ? 10.0 : 0.0,
-            },
-          };
-          setRewardHistory((h) => [...h.slice(-150), st]);
-          return st;
         });
-      }, 50);
     }
   };
 
   const handleResetSim = () => {
     if (playTimerRef.current) clearInterval(playTimerRef.current);
     setIsSimPlaying(false);
-    setSimState(createDefaultSimState(activeSceneGraph));
-    setRewardHistory([]);
+    resetSimulation(selectedSceneId)
+      .then((st) => {
+        setSimState(st);
+        setRewardHistory([st]);
+      })
+      .catch(() => {
+        setSimState(createDefaultSimState(activeSceneGraph));
+        setRewardHistory([]);
+      });
   };
 
   const handleStepOracleEnd = () => {
-    const wps = activeSceneGraph.task.waypoints;
-    if (!wps || wps.length === 0) return;
-    const lastWp = wps[wps.length - 1];
-    const manipId = activeSceneGraph.task.manipulated_object_id;
-    const target = activeSceneGraph.task.target_position ?? [-0.15, 0.15, 0.026];
-
-    const nextPositions = { ...simState.objectPositions };
-    nextPositions[manipId] = [target[0], target[1], target[2]];
-
-    const st: SimState = {
-      step: simState.step + 50,
-      gripperPos: [lastWp[0], lastWp[1], lastWp[2]],
-      gripperCmd: lastWp[3],
-      fingerAperture: lastWp[3] > 0 ? 0.06 : 0.012,
-      isGrasped: false,
-      objectPositions: nextPositions,
-      diagnostics: { dReach: 0.01, dGoal: 0.005 },
-      reward: 11.0,
-      terminated: true,
-      stageBreakdown: {
-        reach: 1.0,
-        graspOrClearance: 2.0,
-        liftOrProgress: 3.0,
-        placeOrGoal: 5.0,
-        terminalBonus: 10.0,
-      },
-    };
-    setSimState(st);
-    setRewardHistory((h) => [...h.slice(-150), st]);
+    fetchSimTrajectory(selectedSceneId, 120)
+      .then((traj) => {
+        if (traj.length > 0) {
+          const finalState = traj[traj.length - 1];
+          setSimState(finalState);
+          setRewardHistory(traj);
+        }
+      })
+      .catch(console.error);
   };
 
   const totalTime = runResult ? runResult.total_duration_s : elapsedSeconds;
@@ -911,6 +806,17 @@ export function App() {
               <div className="flex items-center justify-between border-b border-zinc-800 pb-2 mb-3">
                 <div className="flex items-center gap-1">
                   <button
+                    onClick={() => setActiveTab('simulation')}
+                    className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer flex items-center gap-1.5 ${
+                      activeTab === 'simulation'
+                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800/80 font-bold'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    <Box className="h-3.5 w-3.5 text-emerald-400" />
+                    3D Simulation
+                  </button>
+                  <button
                     onClick={() => setActiveTab('reasoning')}
                     className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
                       activeTab === 'reasoning'
@@ -954,7 +860,9 @@ export function App() {
                 <button
                   onClick={() => {
                     const text =
-                      activeTab === 'reasoning'
+                      activeTab === 'simulation'
+                        ? JSON.stringify(simState, null, 2)
+                        : activeTab === 'reasoning'
                         ? liveReasoning
                         : activeTab === 'scenegraph'
                         ? JSON.stringify(runResult?.scene_graph, null, 2)
@@ -972,62 +880,77 @@ export function App() {
                 </button>
               </div>
 
-              <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 p-3 font-mono text-[11px] overflow-y-auto max-h-[560px] leading-relaxed">
-                {activeTab === 'reasoning' && (
-                  <div className="space-y-2">
-                    <div className="flex items-center gap-2 text-violet-400 text-xs font-semibold mb-2">
-                      <Terminal className="h-3.5 w-3.5" />
-                      meta-models/muse-spark-open-1026 Reasoning Stream:
-                    </div>
-                    {liveReasoning ? (
-                      <p className="whitespace-pre-wrap text-zinc-300">{liveReasoning}</p>
-                    ) : (
-                      <p className="text-zinc-600 italic">
-                        Reasoning stream idle. Click &quot;Forge &amp; Validate Environment&quot; to stream
-                        reasoning tokens live from Baseten.
-                      </p>
-                    )}
-                    <div ref={reasoningEndRef} />
-                  </div>
-                )}
-
-                {activeTab === 'scenegraph' && (
-                  <pre className="text-emerald-300 whitespace-pre-wrap">
-                    {runResult?.scene_graph
-                      ? JSON.stringify(runResult.scene_graph, null, 2)
-                      : '// Pydantic V2 SceneGraph will appear here after Stage 4'}
-                  </pre>
-                )}
-
-                {activeTab === 'mjcf' && (
-                  <pre className="text-cyan-300 whitespace-pre-wrap">
-                    {runResult?.mjcf_xml
-                      ? runResult.mjcf_xml
-                      : '<!-- MuJoCo 3.17 MJCF XML will compile here in Stage 5 -->'}
-                  </pre>
-                )}
-
-                {activeTab === 'reward' && (
-                  <div className="space-y-3">
-                    {repairDiff && (
-                      <div className="p-2.5 rounded-lg bg-amber-950/60 border border-amber-600/70 shadow-sm">
-                        <div className="text-amber-300 text-xs font-semibold flex items-center gap-1.5 mb-1.5">
-                          <RefreshCw className="h-3.5 w-3.5 text-amber-400 animate-spin" />
-                          Muse Spark Automated Self-Healing Patch Diff:
-                        </div>
-                        <pre className="text-emerald-300 whitespace-pre-wrap font-mono text-[10.5px]">
-                          {repairDiff}
-                        </pre>
+              {activeTab === 'simulation' ? (
+                <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative flex flex-col min-h-[540px]">
+                  <SceneCanvas
+                    scene={activeSceneGraph}
+                    simState={simState}
+                    rewardHistory={rewardHistory}
+                    isPlaying={isSimPlaying}
+                    onTogglePlay={handleToggleSimPlay}
+                    onResetSim={handleResetSim}
+                    onStepOracleEnd={handleStepOracleEnd}
+                    onManualAction={handleManualAction}
+                  />
+                </div>
+              ) : (
+                <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 p-3 font-mono text-[11px] overflow-y-auto max-h-[560px] leading-relaxed">
+                  {activeTab === 'reasoning' && (
+                    <div className="space-y-2">
+                      <div className="flex items-center gap-2 text-violet-400 text-xs font-semibold mb-2">
+                        <Terminal className="h-3.5 w-3.5" />
+                        meta-models/muse-spark-open-1026 Reasoning Stream:
                       </div>
-                    )}
-                    <pre className="text-amber-300 whitespace-pre-wrap font-mono text-[11px]">
-                      {runResult?.reward_code
-                        ? runResult.reward_code
-                        : '# Dense multi-stage reward function synthesized in Stage 6'}
+                      {liveReasoning ? (
+                        <p className="whitespace-pre-wrap text-zinc-300">{liveReasoning}</p>
+                      ) : (
+                        <p className="text-zinc-600 italic">
+                          Reasoning stream idle. Click &quot;Forge &amp; Validate Environment&quot; to stream
+                          reasoning tokens live from Baseten.
+                        </p>
+                      )}
+                      <div ref={reasoningEndRef} />
+                    </div>
+                  )}
+
+                  {activeTab === 'scenegraph' && (
+                    <pre className="text-emerald-300 whitespace-pre-wrap">
+                      {runResult?.scene_graph
+                        ? JSON.stringify(runResult.scene_graph, null, 2)
+                        : '// Pydantic V2 SceneGraph will appear here after Stage 4'}
                     </pre>
-                  </div>
-                )}
-              </div>
+                  )}
+
+                  {activeTab === 'mjcf' && (
+                    <pre className="text-cyan-300 whitespace-pre-wrap">
+                      {runResult?.mjcf_xml
+                        ? runResult.mjcf_xml
+                        : '<!-- MuJoCo 3.17 MJCF XML will compile here in Stage 5 -->'}
+                    </pre>
+                  )}
+
+                  {activeTab === 'reward' && (
+                    <div className="space-y-3">
+                      {repairDiff && (
+                        <div className="p-2.5 rounded-lg bg-amber-950/60 border border-amber-600/70 shadow-sm">
+                          <div className="text-amber-300 text-xs font-semibold flex items-center gap-1.5 mb-1.5">
+                            <RefreshCw className="h-3.5 w-3.5 text-amber-400 animate-spin" />
+                            Muse Spark Automated Self-Healing Patch Diff:
+                          </div>
+                          <pre className="text-emerald-300 whitespace-pre-wrap font-mono text-[10.5px]">
+                            {repairDiff}
+                          </pre>
+                        </div>
+                      )}
+                      <pre className="text-amber-300 whitespace-pre-wrap font-mono text-[11px]">
+                        {runResult?.reward_code
+                          ? runResult.reward_code
+                          : '# Dense multi-stage reward function synthesized in Stage 6'}
+                      </pre>
+                    </div>
+                  )}
+                </div>
+              )}
             </section>
 
             {/* ── Right Pane: Validation Gates 1–5 & RL Rollout (4 Cols) ─ */}
