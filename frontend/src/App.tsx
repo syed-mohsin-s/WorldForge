@@ -191,8 +191,8 @@ export function App() {
   const [repairDiff, setRepairDiff] = useState<string>('');
   const [liveGateResults, setLiveGateResults] = useState<Record<string, any>>({});
 
-  // Inspector tab: 3D Simulation, Spark Reasoning, SceneGraph JSON, MJCF XML, Reward Code
-  const [activeTab, setActiveTab] = useState<'simulation' | 'reasoning' | 'scenegraph' | 'mjcf' | 'reward'>('simulation');
+  // Inspector tab: Spark Reasoning, SceneGraph JSON, MJCF XML, Reward Code
+  const [activeTab, setActiveTab] = useState<'reasoning' | 'scenegraph' | 'mjcf' | 'reward'>('reasoning');
   const [copied, setCopied] = useState<boolean>(false);
 
   // Real-time timers
@@ -806,17 +806,6 @@ export function App() {
               <div className="flex items-center justify-between border-b border-zinc-800 pb-2 mb-3">
                 <div className="flex items-center gap-1">
                   <button
-                    onClick={() => setActiveTab('simulation')}
-                    className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer flex items-center gap-1.5 ${
-                      activeTab === 'simulation'
-                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800/80 font-bold'
-                        : 'text-zinc-400 hover:text-zinc-200'
-                    }`}
-                  >
-                    <Box className="h-3.5 w-3.5 text-emerald-400" />
-                    3D Simulation
-                  </button>
-                  <button
                     onClick={() => setActiveTab('reasoning')}
                     className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
                       activeTab === 'reasoning'
@@ -857,100 +846,94 @@ export function App() {
                   </button>
                 </div>
 
-                <button
-                  onClick={() => {
-                    const text =
-                      activeTab === 'simulation'
-                        ? JSON.stringify(simState, null, 2)
-                        : activeTab === 'reasoning'
-                        ? liveReasoning
-                        : activeTab === 'scenegraph'
-                        ? JSON.stringify(runResult?.scene_graph, null, 2)
-                        : activeTab === 'mjcf'
-                        ? runResult?.mjcf_xml || ''
-                        : repairDiff
-                        ? `${repairDiff}\n\n${runResult?.reward_code || ''}`
-                        : runResult?.reward_code || '';
-                    handleCopy(text);
-                  }}
-                  className="p-1 rounded text-zinc-400 hover:text-white cursor-pointer transition-colors"
-                  title="Copy to clipboard"
-                >
-                  {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={() => setCurrentView('workbench')}
+                    className="text-[11px] px-2.5 py-1 rounded bg-zinc-900 hover:bg-zinc-800 text-emerald-300 hover:text-emerald-200 border border-emerald-900/60 hover:border-emerald-700/80 flex items-center gap-1.5 font-medium transition-colors cursor-pointer"
+                    title="Switch to full-screen 3D PBR Workbench"
+                  >
+                    <Box className="h-3.5 w-3.5 text-emerald-400" />
+                    <span>3D Workbench ↗</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      const text =
+                        activeTab === 'reasoning'
+                          ? liveReasoning
+                          : activeTab === 'scenegraph'
+                          ? JSON.stringify(runResult?.scene_graph, null, 2)
+                          : activeTab === 'mjcf'
+                          ? runResult?.mjcf_xml || ''
+                          : repairDiff
+                          ? `${repairDiff}\n\n${runResult?.reward_code || ''}`
+                          : runResult?.reward_code || '';
+                      handleCopy(text);
+                    }}
+                    className="p-1 rounded text-zinc-400 hover:text-white cursor-pointer transition-colors"
+                    title="Copy to clipboard"
+                  >
+                    {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+                  </button>
+                </div>
               </div>
 
-              {activeTab === 'simulation' ? (
-                <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative flex flex-col min-h-[540px]">
-                  <SceneCanvas
-                    scene={activeSceneGraph}
-                    simState={simState}
-                    rewardHistory={rewardHistory}
-                    isPlaying={isSimPlaying}
-                    onTogglePlay={handleToggleSimPlay}
-                    onResetSim={handleResetSim}
-                    onStepOracleEnd={handleStepOracleEnd}
-                    onManualAction={handleManualAction}
-                  />
-                </div>
-              ) : (
-                <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 p-3 font-mono text-[11px] overflow-y-auto max-h-[560px] leading-relaxed">
-                  {activeTab === 'reasoning' && (
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2 text-violet-400 text-xs font-semibold mb-2">
-                        <Terminal className="h-3.5 w-3.5" />
-                        meta-models/muse-spark-open-1026 Reasoning Stream:
-                      </div>
-                      {liveReasoning ? (
-                        <p className="whitespace-pre-wrap text-zinc-300">{liveReasoning}</p>
-                      ) : (
-                        <p className="text-zinc-600 italic">
-                          Reasoning stream idle. Click &quot;Forge &amp; Validate Environment&quot; to stream
-                          reasoning tokens live from Baseten.
-                        </p>
-                      )}
-                      <div ref={reasoningEndRef} />
+              <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 p-3 font-mono text-[11px] overflow-y-auto max-h-[560px] leading-relaxed">
+                {activeTab === 'reasoning' && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-violet-400 text-xs font-semibold mb-2">
+                      <Terminal className="h-3.5 w-3.5" />
+                      meta-models/muse-spark-open-1026 Reasoning Stream:
                     </div>
-                  )}
+                    {liveReasoning ? (
+                      <p className="whitespace-pre-wrap text-zinc-300">{liveReasoning}</p>
+                    ) : (
+                      <p className="text-zinc-600 italic">
+                        Reasoning stream idle. Click &quot;Forge &amp; Validate Environment&quot; to stream
+                        reasoning tokens live from Baseten.
+                      </p>
+                    )}
+                    <div ref={reasoningEndRef} />
+                  </div>
+                )}
 
-                  {activeTab === 'scenegraph' && (
-                    <pre className="text-emerald-300 whitespace-pre-wrap">
-                      {runResult?.scene_graph
-                        ? JSON.stringify(runResult.scene_graph, null, 2)
-                        : '// Pydantic V2 SceneGraph will appear here after Stage 4'}
-                    </pre>
-                  )}
+                {activeTab === 'scenegraph' && (
+                  <pre className="text-emerald-300 whitespace-pre-wrap">
+                    {runResult?.scene_graph
+                      ? JSON.stringify(runResult.scene_graph, null, 2)
+                      : '// Pydantic V2 SceneGraph will appear here after Stage 4'}
+                  </pre>
+                )}
 
-                  {activeTab === 'mjcf' && (
-                    <pre className="text-cyan-300 whitespace-pre-wrap">
-                      {runResult?.mjcf_xml
-                        ? runResult.mjcf_xml
-                        : '<!-- MuJoCo 3.17 MJCF XML will compile here in Stage 5 -->'}
-                    </pre>
-                  )}
+                {activeTab === 'mjcf' && (
+                  <pre className="text-cyan-300 whitespace-pre-wrap">
+                    {runResult?.mjcf_xml
+                      ? runResult.mjcf_xml
+                      : '<!-- MuJoCo 3.17 MJCF XML will compile here in Stage 5 -->'}
+                  </pre>
+                )}
 
-                  {activeTab === 'reward' && (
-                    <div className="space-y-3">
-                      {repairDiff && (
-                        <div className="p-2.5 rounded-lg bg-amber-950/60 border border-amber-600/70 shadow-sm">
-                          <div className="text-amber-300 text-xs font-semibold flex items-center gap-1.5 mb-1.5">
-                            <RefreshCw className="h-3.5 w-3.5 text-amber-400 animate-spin" />
-                            Muse Spark Automated Self-Healing Patch Diff:
-                          </div>
-                          <pre className="text-emerald-300 whitespace-pre-wrap font-mono text-[10.5px]">
-                            {repairDiff}
-                          </pre>
+                {activeTab === 'reward' && (
+                  <div className="space-y-3">
+                    {repairDiff && (
+                      <div className="p-2.5 rounded-lg bg-amber-950/60 border border-amber-600/70 shadow-sm">
+                        <div className="text-amber-300 text-xs font-semibold flex items-center gap-1.5 mb-1.5">
+                          <RefreshCw className="h-3.5 w-3.5 text-amber-400 animate-spin" />
+                          Muse Spark Automated Self-Healing Patch Diff:
                         </div>
-                      )}
-                      <pre className="text-amber-300 whitespace-pre-wrap font-mono text-[11px]">
-                        {runResult?.reward_code
-                          ? runResult.reward_code
-                          : '# Dense multi-stage reward function synthesized in Stage 6'}
-                      </pre>
-                    </div>
-                  )}
-                </div>
-              )}
+                        <pre className="text-emerald-300 whitespace-pre-wrap font-mono text-[10.5px]">
+                          {repairDiff}
+                        </pre>
+                      </div>
+                    )}
+                    <pre className="text-amber-300 whitespace-pre-wrap font-mono text-[11px]">
+                      {runResult?.reward_code
+                        ? runResult.reward_code
+                        : '# Dense multi-stage reward function synthesized in Stage 6'}
+                    </pre>
+                  </div>
+                )}
+              </div>
             </section>
 
             {/* ── Right Pane: Validation Gates 1–5 & RL Rollout (4 Cols) ─ */}
