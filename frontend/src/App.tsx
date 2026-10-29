@@ -53,8 +53,44 @@ const STAGES = [
   { id: 8, name: 'Render + Diff', desc: 'Mask IoU Refinement', isAi: false },
 ];
 
+const DEFAULT_SCENES: SceneMeta[] = [
+  {
+    scene_id: 'pick_place_cube',
+    file_id: 'scene1_pick_place',
+    file_name: 'scene1_pick_place.json',
+    task_type: 'pick_and_place',
+    description: 'Pick up the red cube and place it precisely on the target coaster.',
+    num_objects: 2,
+    objects: [],
+    table_z: 0.0,
+    has_articulated_joint: false,
+  },
+  {
+    scene_id: 'push_obstacle',
+    file_id: 'scene2_push_obstacle',
+    file_name: 'scene2_push_obstacle.json',
+    task_type: 'push_to_target',
+    description: 'Push the cylinder around the obstacle to the target marker.',
+    num_objects: 3,
+    objects: [],
+    table_z: 0.0,
+    has_articulated_joint: false,
+  },
+  {
+    scene_id: 'articulated_drawer',
+    file_id: 'scene3_articulated_drawer',
+    file_name: 'scene3_articulated_drawer.json',
+    task_type: 'articulate_joint',
+    description: 'Grasp the handle and pull open the slide drawer by 10cm.',
+    num_objects: 3,
+    objects: [],
+    table_z: 0.0,
+    has_articulated_joint: true,
+  },
+];
+
 export function App() {
-  const [scenes, setScenes] = useState<SceneMeta[]>([]);
+  const [scenes, setScenes] = useState<SceneMeta[]>(DEFAULT_SCENES);
   const [selectedSceneId, setSelectedSceneId] = useState<string>('scene1_pick_place');
   const [provider, setProvider] = useState<string>('auto');
   const [injectFault, setInjectFault] = useState<boolean>(false);

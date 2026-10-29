@@ -24,3 +24,4 @@ Write-Host "============================================================" -Foreg
 Write-Host "Press Ctrl+C or close the terminal to stop."
 
 Wait-Process -Id $backend.Id, $frontend.Id
+
