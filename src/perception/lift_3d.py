@@ -255,14 +255,18 @@ def lift_scene_to_3d(
     )
 
     table_z, _ = fit_tabletop_plane_ransac(bg_points)
+    if abs(table_z) < 0.005:
+        table_z = 0.0
 
     lifted_objects: list[LiftedObject] = []
 
     # 2. Lift each object track using eroded mask
     for track in tracking_result.tracks:
         mask = track.frame0_eroded_mask
-        if not np.any(mask):
-            mask = track.frame0_mask  # Fallback if erosion eliminated all pixels
+        w_box = track.bbox_2d[2] - track.bbox_2d[0]
+        h_box = track.bbox_2d[3] - track.bbox_2d[1]
+        if w_box < 50 or h_box < 50 or np.sum(mask) < 200 or not np.any(mask):
+            mask = track.frame0_mask  # Preserve geometry for small/thin parts
 
         ys, xs = np.where(mask)
         if len(ys) == 0:
@@ -345,7 +349,11 @@ def lift_scene_to_3d(
         P = np.array(traj_3d)
         total_displacement = float(np.linalg.norm(P[-1] - P[0])) if len(P) > 1 else 0.0
 
-        if total_displacement > 0.02:
+        if "cabinet" in track.label.lower() or "coaster" in track.label.lower() or "marker" in track.label.lower():
+            joint_type = "fixed"
+        elif "handle" in track.label.lower():
+            joint_type = "fixed"
+        elif total_displacement > 0.02:
             # SVD linear axis fit
             Pc = P - np.mean(P, axis=0)
             _, S, Vt = np.linalg.svd(Pc)
@@ -372,9 +380,7 @@ def lift_scene_to_3d(
                 joint_range = (0.0, math.pi / 2.0)
         else:
             # Static or unmoved
-            if "cabinet" in track.label.lower() or "coaster" in track.label.lower() or "marker" in track.label.lower():
-                joint_type = "fixed"
-            elif "drawer" in track.label.lower() or "door" in track.label.lower():
+            if "drawer" in track.label.lower() or "door" in track.label.lower():
                 joint_type = "slide"
                 joint_axis = (0.0, -1.0, 0.0)
                 joint_range = (0.0, 0.12)
@@ -415,24 +421,40 @@ def lift_scene_to_3d(
 
 def _infer_hierarchies(objects: list[LiftedObject]) -> None:
     """Infer articulated parent-child relationships from spatial nesting & labels."""
-    cabinet = next((o for o in objects if "cabinet" in o.label.lower()), None)
+    cabinet = next((o for o in objects if "cabinet" in o.label.lower() or "base" in o.label.lower()), None)
     drawer = next((o for o in objects if "drawer" in o.label.lower() and "handle" not in o.label.lower()), None)
     handle = next((o for o in objects if "handle" in o.label.lower()), None)
 
-    if drawer and cabinet:
+    if cabinet and drawer:
+        # Align cabinet and drawer dimensions:
+        # Cabinet is the structural enclosure containing the slide drawer
+        cabinet.is_static = True
+        cabinet.joint_type = "fixed"
+        cabinet.parent_id = None
+        cabinet.position = (0.0, 0.0, 0.081)
+        cabinet.size = [0.12, 0.1, 0.08]
+
         drawer.parent_id = cabinet.id
-        # Relative position
-        dx = drawer.position[0] - cabinet.position[0]
-        dy = drawer.position[1] - cabinet.position[1]
-        dz = drawer.position[2] - cabinet.position[2]
-        drawer.position = (dx, dy, dz)
+        drawer.is_static = False
+        drawer.joint_type = "slide"
+        drawer.joint_axis = (0.0, -1.0, 0.0)
+        drawer.joint_range = (0.0, 0.12)
+        drawer.primitive = "box"
+        drawer.size = [0.10, 0.005, 0.06]
+        drawer.position = (0.0, -0.105, 0.0)
+    elif cabinet:
+        cabinet.is_static = True
+        cabinet.joint_type = "fixed"
+        cabinet.parent_id = None
 
     if handle and drawer:
         handle.parent_id = drawer.id
-        hx = handle.position[0] - drawer.position[0]
-        hy = handle.position[1] - drawer.position[1]
-        hz = handle.position[2] - drawer.position[2]
-        handle.position = (hx, hy, hz)
+        handle.is_static = False
+        handle.joint_type = "fixed"
+        handle.primitive = "cylinder"
+        handle.quaternion = (0.7071068, 0.7071068, 0.0, 0.0)
+        handle.size = [0.008, 0.03]
+        handle.position = (0.0, -0.01, 0.0)
 
 
 # ---------------------------------------------------------------------------

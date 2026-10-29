@@ -260,6 +260,7 @@ export function App() {
 
   const handleRunPipeline = () => {
     setIsRunning(true);
+    setRunResult(null);
     setActiveStage(1);
     setCompletedStages([]);
     setStageTimings({});
@@ -477,7 +478,7 @@ export function App() {
         {/* Impact Telemetry Pills */}
         <div className="flex flex-wrap items-center gap-2.5 text-xs">
           {/* Self-Healing Dynamic Retry Pill */}
-          {selfHealingRetries > 0 && !runResult?.self_healing_applied && (
+          {isRunning && selfHealingRetries > 0 && !runResult?.self_healing_applied && (
             <div className="px-3 py-1.5 rounded-full bg-red-950/80 border border-red-600/80 text-red-200 font-mono font-semibold animate-pulse flex items-center gap-1.5 shadow-sm shadow-red-500/20">
               <AlertTriangle className="h-3.5 w-3.5 text-red-400" />
               <span>Self-Healing Retries: {selfHealingRetries} / 4 (Gate 3 Fix In-Flight)</span>

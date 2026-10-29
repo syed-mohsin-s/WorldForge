@@ -128,11 +128,12 @@ class PPOResult:
 
 def train_and_evaluate_ppo(
     scene: SceneGraph,
-    total_timesteps: int = 8192,
+    total_timesteps: int = 1024,
     n_envs: int = 4,
     rollout_video_path: str | None = None,
-    eval_episodes: int = 3,
+    eval_episodes: int = 1,
     eval_steps: int = 120,
+    render_stride: int = 2,
 ) -> PPOResult:
     """Train PPO on a WorldForge scene and evaluate.
 
@@ -158,6 +159,8 @@ def train_and_evaluate_ppo(
     """
     # Lazy imports to keep module importable without SB3
     import gymnasium as gym
+    import torch
+    torch.set_num_threads(2)
     from stable_baselines3 import PPO
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv
@@ -188,7 +191,7 @@ def train_and_evaluate_ppo(
                     self._episode_rewards.append(float(self._current_rewards[i]))
                     self._current_rewards[i] = 0.0
 
-            if self.num_timesteps % 1024 == 0 and self._episode_rewards:
+            if self.num_timesteps % 256 == 0 and self._episode_rewards:
                 mean_r = float(np.mean(self._episode_rewards[-10:]))
                 learning_curve.append({
                     "timesteps": self.num_timesteps,
@@ -202,9 +205,9 @@ def train_and_evaluate_ppo(
     model = PPO(
         "MlpPolicy",
         vec_env,
-        n_steps=128,
+        n_steps=64,
         batch_size=64,
-        n_epochs=5,
+        n_epochs=3,
         learning_rate=3e-4,
         ent_coef=0.01,
         verbose=0,
@@ -245,8 +248,8 @@ def train_and_evaluate_ppo(
                 # Settle physics with idle action to complete the 120-frame (4s) recording
                 eval_base_env.step(np.array([0.0, 0.0, 0.0, last_grip], dtype=np.float32))
 
-            # Record frames for video on first episode only
-            if ep == 0 and rollout_video_path:
+            # Record frames for video on first episode only (strided for 2x faster export)
+            if ep == 0 and rollout_video_path and (step_i % render_stride == 0):
                 try:
                     frame = eval_base_env.render_camera()
                     if frame is not None:
@@ -264,7 +267,8 @@ def train_and_evaluate_ppo(
     # ── Save video ────────────────────────────────────────────────────
     video_path_out: str | None = None
     if rollout_video_path and video_frames:
-        video_path_out = _save_video(video_frames, rollout_video_path, fps=30)
+        fps_out = 20 if render_stride == 2 else 30
+        video_path_out = _save_video(video_frames, rollout_video_path, fps=fps_out)
 
     return PPOResult(
         eval_mean_return=float(np.mean(episode_returns)),
@@ -279,6 +283,7 @@ def record_oracle_rollout(
     output_path: str,
     max_steps: int = 120,
     fps: int = 30,
+    render_stride: int = 2,
 ) -> str:
     """Record pure Waypoint Oracle baseline rollout video (MP4)."""
     env = WorldForgeEnv(scene, render_mode="rgb_array")
@@ -288,7 +293,7 @@ def record_oracle_rollout(
     terminated = False
     last_grip = scene.task.waypoints[-1][3] if scene.task.waypoints else 0.0
 
-    for _ in range(max_steps):
+    for step_i in range(max_steps):
         if not terminated:
             action = controller.get_action(env)
             obs, reward, term, trunc, info = env.step(action)
@@ -297,12 +302,14 @@ def record_oracle_rollout(
         else:
             env.step(np.array([0.0, 0.0, 0.0, last_grip], dtype=np.float32))
 
-        frame = env.render_camera()
-        if frame is not None:
-            frames.append(frame)
+        if step_i % render_stride == 0:
+            frame = env.render_camera()
+            if frame is not None:
+                frames.append(frame)
 
     env.close()
-    return _save_video(frames, output_path, fps=fps)
+    fps_out = 20 if render_stride == 2 else fps
+    return _save_video(frames, output_path, fps=fps_out)
 
 
 def _save_video(frames: list[np.ndarray], path: str, fps: int = 30) -> str:

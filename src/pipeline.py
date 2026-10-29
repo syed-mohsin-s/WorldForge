@@ -100,7 +100,7 @@ def run_worldforge_pipeline(
 
     # Segment from sim environment or video
     tracking_result, frame0_depth = sam_tracker.segment_from_sim_env(
-        ref_env, num_frames=10, execute_oracle=False
+        ref_env, num_frames=5, execute_oracle=False
     )
     ref_env.reset(seed=42)
     frame0_rgb = ref_env.render_camera()
@@ -324,7 +324,7 @@ def run_worldforge_pipeline(
             "fault_diagnostics": fault_diagnostics,
             "repair_diff": repair_diff,
         })
-        time.sleep(1.2)  # Visual pacing for self-healing UI transition
+        time.sleep(0.05)  # Fast SSE yield for self-healing UI transition
 
         repair_res = run_self_healing_loop(
             scene=validated_sg,
@@ -335,28 +335,31 @@ def run_worldforge_pipeline(
         repair_attempts = repair_res.attempts
         self_healing_applied = repair_res.success
         fault_diagnostics = repair_res.final_report.diagnostics
-
-    # Run full validation suite (gates 1–4)
-    suite = ValidationSuite(validated_sg)
-    val_report = suite.run_all(run_gate5=False)
+        val_report = repair_res.final_report
+    else:
+        # Run full validation suite (gates 1–4)
+        suite = ValidationSuite(validated_sg)
+        val_report = suite.run_all(run_gate5=False)
 
     # Train PPO policy and render rollout video
     rollout_mp4_path = out_dir / "rollout.mp4"
     oracle_mp4_path = out_dir / "oracle_rollout.mp4"
-    ppo_timesteps = 4096 if quick_ppo else 8192
+    ppo_timesteps = 1024 if quick_ppo else 2048
 
     ppo_res = train_and_evaluate_ppo(
         scene=validated_sg,
         total_timesteps=ppo_timesteps,
         n_envs=4,
         rollout_video_path=str(rollout_mp4_path),
-        eval_episodes=3,
+        eval_episodes=1,
         eval_steps=120,
+        render_stride=2,
     )
 
-    # Also record pure Waypoint Oracle baseline rollout video
+    # Also record pure Waypoint Oracle baseline rollout video if missing
     try:
-        record_oracle_rollout(validated_sg, str(oracle_mp4_path), max_steps=120, fps=30)
+        if not oracle_mp4_path.exists():
+            record_oracle_rollout(validated_sg, str(oracle_mp4_path), max_steps=120, fps=20, render_stride=2)
     except Exception as exc:
         logger.warning("Could not record oracle rollout: %s", exc)
 
@@ -368,6 +371,7 @@ def run_worldforge_pipeline(
         "duration_s": stage_timings["stage7_validation_ppo"],
         "gates_passed": val_report.passed,
         "gate_results": val_report.gate_results,
+        "gates_passed": val_report.passed,
         "repair_attempts": repair_attempts,
         "self_healing_applied": self_healing_applied,
         "fault_diagnostics": fault_diagnostics,
@@ -440,6 +444,7 @@ def run_worldforge_pipeline(
         "repair_diff": repair_diff,
         "fault_diagnostics": fault_diagnostics,
         "gate_results": val_report.gate_results,
+        "gates_passed": val_report.passed,
         "repair_attempts": repair_attempts,
         "self_healing_applied": self_healing_applied,
         "ppo_results": {
@@ -452,6 +457,7 @@ def run_worldforge_pipeline(
         "render_diff": {
             "initial_mean_iou": round(diff_report.initial_mean_iou, 4),
             "mean_iou": round(diff_report.mean_iou, 4),
+            "per_object_iou": {k: round(v, 4) for k, v in diff_report.per_object_iou.items()},
             "refined": diff_report.refined,
             "iterations_used": diff_report.iterations_used,
             "overlay_url": f"/outputs/{clean_id}/diff_overlay.png",

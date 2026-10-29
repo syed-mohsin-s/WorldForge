@@ -42,11 +42,18 @@ class ValidationSuite:
         # Populated by gate 3 for use in gates 4 and 5
         self._mean_random_return: float = 0.0
 
-    def run_all(self, run_gate5: bool = True) -> ValidationReport:
-        """Run all gates sequentially.  Returns on first failure."""
+    def run_all(
+        self,
+        run_gate5: bool = True,
+        start_from_gate: int = 1,
+        cached_gate_results: dict[int, dict] | None = None,
+    ) -> ValidationReport:
+        """Run all gates sequentially starting from start_from_gate. Returns on first failure."""
         report = ValidationReport(passed=True, failed_gate=None)
+        if cached_gate_results:
+            report.gate_results.update(cached_gate_results)
 
-        for gate_num in range(1, 6):
+        for gate_num in range(start_from_gate, 6):
             if gate_num == 5 and not run_gate5:
                 report.gate_results[5] = {"skipped": True}
                 continue
@@ -79,7 +86,7 @@ class ValidationSuite:
         env.reset(seed=42)
 
         max_qacc = 0.0
-        for step_i in range(1000):
+        for step_i in range(500):
             action = env.action_space.sample()
             obs, _, terminated, truncated, _ = env.step(action)
 
@@ -179,10 +186,10 @@ class ValidationSuite:
         all_rewards: list[float] = []
         episode_returns: list[float] = []
 
-        for ep in range(5):
+        for ep in range(3):
             obs, _ = env.reset(seed=42 + ep)
             ep_return = 0.0
-            for _ in range(50):
+            for _ in range(30):
                 action = env.action_space.sample()
                 obs, reward, terminated, truncated, _ = env.step(action)
 

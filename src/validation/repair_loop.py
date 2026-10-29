@@ -232,6 +232,8 @@ def run_self_healing_loop(
     repairs_applied: list[str] = []
     current_scene = copy.deepcopy(scene)
     current_reward_override = reward_fn_override
+    cached_gate_results: dict[int, dict] = {}
+    last_failed_gate: int | None = None
 
     result = RepairResult(
         final_report=ValidationReport(passed=False, failed_gate=None),
@@ -252,6 +254,12 @@ def run_self_healing_loop(
         # Build validation suite
         suite = ValidationSuite(current_scene, verbose=verbose)
 
+        # If previous attempt only failed on Gate 3 (reward logic), Gate 1 and Gate 2
+        # already passed and cannot be altered by Python reward changes: resume from Gate 3
+        start_gate = 1
+        if attempt > 1 and last_failed_gate == 3 and 1 in cached_gate_results and 2 in cached_gate_results:
+            start_gate = 3
+
         # If we have a reward override (for testing broken rewards),
         # monkey-patch the env factory
         if current_reward_override is not None and attempt == 1:
@@ -264,11 +272,24 @@ def run_self_healing_loop(
             _be._get_default_reward = _patched_default
 
             try:
-                report = suite.run_all(run_gate5=run_gate5)
+                report = suite.run_all(
+                    run_gate5=run_gate5,
+                    start_from_gate=start_gate,
+                    cached_gate_results=cached_gate_results,
+                )
             finally:
                 _be._get_default_reward = _orig_get_default
         else:
-            report = suite.run_all(run_gate5=run_gate5)
+            report = suite.run_all(
+                run_gate5=run_gate5,
+                start_from_gate=start_gate,
+                cached_gate_results=cached_gate_results,
+            )
+
+        # Cache passed gates
+        for g_num, g_res in report.gate_results.items():
+            if g_res.get("passed", False):
+                cached_gate_results[g_num] = g_res
 
         elapsed = time.time() - t0
         cost_tracker.log_compute(elapsed)  # approximate as 1 core
@@ -284,6 +305,7 @@ def run_self_healing_loop(
 
         # ── Attempt repair ────────────────────────────────────────────
         gate = report.failed_gate
+        last_failed_gate = gate
         diag = report.diagnostics
         if verbose:
             print(f"  Gate {gate} failed, attempting repair...")
