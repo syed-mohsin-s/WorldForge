@@ -142,15 +142,14 @@ def evaluate_and_align_sim(
             iterations_used += 1
 
             # Check if all objects meet threshold
-            current_mean = float(np.mean(list(per_obj_iou.values())))
-            if current_mean >= refine_if_below:
+            if all(v >= refine_if_below for v in per_obj_iou.values()):
                 break
 
             # Adjust each object whose IoU is below threshold
             scene_updated = False
             for obj_node in current_scene.objects:
                 obj_id = obj_node.id
-                if obj_id not in target_masks or obj_node.is_static:
+                if obj_id not in target_masks or obj_node.parent_id is not None:
                     continue
 
                 t_mask = target_masks[obj_id]
@@ -173,6 +172,11 @@ def evaluate_and_align_sim(
                 step_scale = 0.75
                 new_x = obj_node.position[0] + float(dp_world[0]) * step_scale
                 new_y = obj_node.position[1] + float(dp_world[1]) * step_scale
+
+                # Scale adjustment based on 2D mask pixel area ratio
+                area_ratio = float(t_mask.sum()) / max(float(s_mask.sum()), 1.0)
+                s_factor = float(np.clip(np.sqrt(area_ratio), 0.8, 1.25))
+                obj_node.size = [float(s * (1.0 + 0.6 * (s_factor - 1.0))) for s in obj_node.size]
 
                 # Keep height grounded to table
                 half_h = obj_node.size[2] if obj_node.primitive == "box" else obj_node.size[1]
@@ -271,3 +275,4 @@ def _create_overlay_image(
     )
 
     return composite
+

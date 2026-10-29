@@ -17,6 +17,16 @@ env/
 htmlcov/
 *.log
 MUJOCO_LOG.TXT
+outputs/
+
+# Environment Variables & Secrets
+.env
+*.env.local
+
+# Frontend Bundles
+frontend/node_modules/
+frontend/dist/
+frontend/.aistudio/
 
 # OS & Editor
 .DS_Store

@@ -1,0 +1,5 @@
+{
+  "name": "WorldForge-RL Studio",
+  "description": "Back-to-Front RL Environment Synthesis for Tabletop Manipulation — converts monocular video and 3D scene graphs into validated, trainable MuJoCo 3.x Gymnasium environments.",
+  "requestFramePermissions": []
+}

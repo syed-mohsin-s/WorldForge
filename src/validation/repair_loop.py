@@ -14,9 +14,14 @@ and repaired on retry #2 without needing a live LLM.
 from __future__ import annotations
 
 import copy
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from src.schema.scene_graph import SceneGraph
 from src.validation.gates import ValidationReport, ValidationSuite

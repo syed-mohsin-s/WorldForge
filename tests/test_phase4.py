@@ -238,3 +238,4 @@ def test_modal_runner_micro_budget_enforcement():
         runner.run_validation(sg, run_gate5=False)
 
     assert "Budget cap of $0.00 exceeded" in str(exc_info.value)
+
