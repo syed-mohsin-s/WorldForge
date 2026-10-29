@@ -55,6 +55,26 @@ OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_ROOT)), name="outputs")
 
 
+def ensure_preview_assets():
+    """Ensure cached preview assets exist for all golden scenes."""
+    for file_path in SCENES_DIR.glob("*.json"):
+        clean_id = file_path.stem
+        out_dir = OUTPUTS_ROOT / clean_id
+        if (
+            not (out_dir / "frame0_masks.png").exists()
+            or not (out_dir / "diff_overlay.png").exists()
+            or not (out_dir / "oracle_rollout.mp4").exists()
+        ):
+            try:
+                from scripts.generate_previews import generate_scene_previews
+                generate_scene_previews(clean_id, SCENES_DIR, OUTPUTS_ROOT)
+            except Exception as exc:
+                logger.warning("Could not auto-generate preview assets for %s: %s", clean_id, exc)
+
+
+ensure_preview_assets()
+
+
 # ---------------------------------------------------------------------------
 # Request & Response Schemas
 # ---------------------------------------------------------------------------
@@ -205,9 +225,10 @@ def list_scenes() -> list[dict[str, Any]]:
             with open(file_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             sg = SceneGraph.model_validate(data)
+            clean_stem = file_path.stem
             scenes_meta.append({
                 "scene_id": sg.scene_id,
-                "file_id": file_path.stem,
+                "file_id": clean_stem,
                 "file_name": file_path.name,
                 "task_type": sg.task.task_type,
                 "description": sg.task.description,
@@ -224,11 +245,38 @@ def list_scenes() -> list[dict[str, Any]]:
                 ],
                 "table_z": sg.table_z,
                 "has_articulated_joint": any(o.joint.type in ("slide", "hinge") for o in sg.objects),
+                "masks_url": f"/outputs/{clean_stem}/frame0_masks.png",
+                "diff_url": f"/outputs/{clean_stem}/diff_overlay.png",
+                "rollout_url": f"/outputs/{clean_stem}/rollout.mp4",
+                "oracle_url": f"/outputs/{clean_stem}/oracle_rollout.mp4",
             })
         except Exception as exc:
             logger.warning("Could not load scene file %s: %s", file_path, exc)
 
     return scenes_meta
+
+
+@app.get("/api/scene-preview/{scene_id}")
+def get_scene_preview(scene_id: str) -> dict[str, Any]:
+    """Retrieve scene-specific Stage 1 perception masks, Stage 8 render+diff overlay, and 4.0s rollouts."""
+    clean_id = scene_id.replace(".json", "")
+    target = SCENES_DIR / f"{clean_id}.json"
+    if not target.exists():
+        for p in SCENES_DIR.glob("*.json"):
+            if clean_id in p.stem or p.stem in clean_id:
+                clean_id = p.stem
+                target = p
+                break
+    if not target.exists():
+        clean_id = "scene1_pick_place"
+
+    return {
+        "scene_id": clean_id,
+        "masks_url": f"/outputs/{clean_id}/frame0_masks.png",
+        "diff_url": f"/outputs/{clean_id}/diff_overlay.png",
+        "rollout_url": f"/outputs/{clean_id}/rollout.mp4",
+        "oracle_url": f"/outputs/{clean_id}/oracle_rollout.mp4",
+    }
 
 
 @app.get("/api/scenes/{scene_id}")

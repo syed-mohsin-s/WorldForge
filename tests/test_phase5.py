@@ -145,6 +145,19 @@ def test_api_scenes():
     assert "scene1_pick_place" in file_ids
     assert "scene2_push_obstacle" in file_ids
     assert "scene3_articulated_drawer" in file_ids
+    assert "masks_url" in scenes[0]
+    assert "diff_url" in scenes[0]
+
+
+def test_api_scene_preview():
+    resp = client.get("/api/scene-preview/scene2_push_obstacle")
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["scene_id"] == "scene2_push_obstacle"
+    assert "/outputs/scene2_push_obstacle/frame0_masks.png" in data["masks_url"]
+    assert "/outputs/scene2_push_obstacle/diff_overlay.png" in data["diff_url"]
+    assert "/outputs/scene2_push_obstacle/rollout.mp4" in data["rollout_url"]
+    assert "/outputs/scene2_push_obstacle/oracle_rollout.mp4" in data["oracle_url"]
 
 
 def test_api_get_scene_details():

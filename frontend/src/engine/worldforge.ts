@@ -80,6 +80,10 @@ export interface SceneMeta {
   }>;
   table_z: number;
   has_articulated_joint: boolean;
+  masks_url?: string;
+  diff_url?: string;
+  rollout_url?: string;
+  oracle_url?: string;
 }
 
 export interface SystemStatus {
@@ -300,6 +304,18 @@ export async function fetchScenes(): Promise<SceneMeta[]> {
 export async function fetchSceneDetails(sceneId: string): Promise<SceneGraph> {
   const res = await fetch(`${API_BASE}/api/scenes/${sceneId}`);
   if (!res.ok) throw new Error(`Scene Details HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchScenePreview(sceneId: string): Promise<{
+  scene_id: string;
+  masks_url: string;
+  diff_url: string;
+  rollout_url: string;
+  oracle_url: string;
+}> {
+  const res = await fetch(`${API_BASE}/api/scene-preview/${sceneId}`);
+  if (!res.ok) throw new Error(`Scene Preview HTTP ${res.status}`);
   return res.json();
 }
 
