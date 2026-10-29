@@ -993,3 +993,5 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     </div>
   );
 };
+
+export default SceneCanvas;

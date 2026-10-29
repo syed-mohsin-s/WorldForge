@@ -103,6 +103,7 @@ export interface PpoResults {
   eval_std_return: number;
   learning_curve: Array<{ timesteps: number; mean_reward: number }>;
   video_url: string;
+  oracle_video_url?: string;
 }
 
 export interface RenderDiffResults {
@@ -123,6 +124,8 @@ export interface PipelineRunResult {
   scene_graph: SceneGraph;
   mjcf_xml: string;
   reward_code: string;
+  repair_diff?: string;
+  fault_diagnostics?: string;
   gate_results: Record<string, any>;
   repair_attempts: number;
   self_healing_applied: boolean;
@@ -141,12 +144,16 @@ export interface PipelineStageEvent {
   scene_graph?: SceneGraph;
   mjcf_xml?: string;
   reward_code?: string;
+  repair_diff?: string;
+  fault_diagnostics?: string;
+  repair_attempt?: number;
   gate_results?: Record<string, any>;
   repair_attempts?: number;
   self_healing_applied?: boolean;
   ppo_eval_mean_return?: number;
   learning_curve?: Array<{ timesteps: number; mean_reward: number }>;
   video_url?: string;
+  oracle_video_url?: string;
   initial_mean_iou?: number;
   mean_iou?: number;
   refined?: boolean;
@@ -155,6 +162,109 @@ export interface PipelineStageEvent {
   masks_image_url?: string;
   summary?: PipelineRunResult;
   error?: string;
+}
+
+export interface MaterialSpec {
+  density_range: [number, number];
+  sliding_friction_range: [number, number];
+  rgba: [number, number, number, number];
+}
+
+export const MATERIAL_DB: Record<string, MaterialSpec> = {
+  plastic: {
+    density_range: [900, 1400],
+    sliding_friction_range: [0.3, 0.5],
+    rgba: [0.8, 0.2, 0.2, 1.0],
+  },
+  metal: {
+    density_range: [2700, 8000],
+    sliding_friction_range: [0.2, 0.4],
+    rgba: [0.7, 0.7, 0.75, 1.0],
+  },
+  wood: {
+    density_range: [400, 900],
+    sliding_friction_range: [0.4, 0.6],
+    rgba: [0.72, 0.53, 0.26, 1.0],
+  },
+  ceramic: {
+    density_range: [2200, 2600],
+    sliding_friction_range: [0.3, 0.5],
+    rgba: [0.95, 0.95, 0.9, 1.0],
+  },
+  rubber: {
+    density_range: [1100, 1500],
+    sliding_friction_range: [0.8, 1.2],
+    rgba: [0.15, 0.15, 0.15, 1.0],
+  },
+  cardboard: {
+    density_range: [150, 400],
+    sliding_friction_range: [0.4, 0.6],
+    rgba: [0.76, 0.6, 0.42, 1.0],
+  },
+};
+
+export function computeHalfHeight(obj: ObjectNode): number {
+  if (obj.primitive === "box") return obj.size[2] ?? 0.02;
+  if (obj.primitive === "cylinder") return obj.size[1] ?? 0.02;
+  if (obj.primitive === "sphere") return obj.size[0] ?? 0.02;
+  return 0.02;
+}
+
+export interface SimState {
+  step: number;
+  gripperPos: [number, number, number];
+  gripperCmd: number;
+  fingerAperture: number;
+  isGrasped: boolean;
+  objectPositions: Record<string, [number, number, number]>;
+  objectQuaternions?: Record<string, [number, number, number, number]>;
+  diagnostics: {
+    dReach: number;
+    dGoal: number;
+  };
+  reward: number;
+  terminated: boolean;
+  stageBreakdown: {
+    reach: number;
+    graspOrClearance: number;
+    liftOrProgress: number;
+    placeOrGoal: number;
+    terminalBonus: number;
+  };
+}
+
+export function createDefaultSimState(scene?: SceneGraph | null): SimState {
+  const objectPositions: Record<string, [number, number, number]> = {};
+  if (scene) {
+    for (const obj of scene.objects) {
+      objectPositions[obj.id] = [...obj.position];
+    }
+  }
+  const defaultGrip: [number, number, number] = scene?.task.waypoints?.[0]
+    ? [scene.task.waypoints[0][0], scene.task.waypoints[0][1], scene.task.waypoints[0][2]]
+    : [0.0, 0.0, 0.3];
+
+  return {
+    step: 0,
+    gripperPos: defaultGrip,
+    gripperCmd: 1.0,
+    fingerAperture: 0.04,
+    isGrasped: false,
+    objectPositions,
+    diagnostics: {
+      dReach: 0.15,
+      dGoal: 0.25,
+    },
+    reward: 0.0,
+    terminated: false,
+    stageBreakdown: {
+      reach: 0.0,
+      graspOrClearance: 0.0,
+      liftOrProgress: 0.0,
+      placeOrGoal: 0.0,
+      terminalBonus: 0.0,
+    },
+  };
 }
 
 export async function fetchSystemStatus(): Promise<SystemStatus> {
@@ -166,6 +276,12 @@ export async function fetchSystemStatus(): Promise<SystemStatus> {
 export async function fetchScenes(): Promise<SceneMeta[]> {
   const res = await fetch(`${API_BASE}/api/scenes`);
   if (!res.ok) throw new Error(`Scenes HTTP ${res.status}`);
+  return res.json();
+}
+
+export async function fetchSceneDetails(sceneId: string): Promise<SceneGraph> {
+  const res = await fetch(`${API_BASE}/api/scenes/${sceneId}`);
+  if (!res.ok) throw new Error(`Scene Details HTTP ${res.status}`);
   return res.json();
 }
 

@@ -147,6 +147,18 @@ def test_api_scenes():
     assert "scene3_articulated_drawer" in file_ids
 
 
+def test_api_get_scene_details():
+    resp = client.get("/api/scenes/scene1_pick_place")
+    assert resp.status_code == 200
+    sg_data = resp.json()
+    assert sg_data["scene_id"] == "pick_place_cube"
+    assert "camera" in sg_data
+    assert "objects" in sg_data
+    assert len(sg_data["objects"]) >= 2
+    assert "task" in sg_data
+    assert len(sg_data["task"]["waypoints"]) >= 5
+
+
 def test_api_upload_video():
     dummy_video_bytes = b"fake mp4 video bytes for testing"
     resp = client.post(

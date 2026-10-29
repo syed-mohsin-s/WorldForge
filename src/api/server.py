@@ -133,6 +133,24 @@ def list_scenes() -> list[dict[str, Any]]:
     return scenes_meta
 
 
+@app.get("/api/scenes/{scene_id}")
+def get_scene(scene_id: str) -> dict[str, Any]:
+    """Retrieve full SceneGraph JSON for a given scene ID or file ID."""
+    clean_id = scene_id.replace(".json", "")
+    target = SCENES_DIR / f"{clean_id}.json"
+    if not target.exists():
+        for p in SCENES_DIR.glob("*.json"):
+            if clean_id in p.stem or p.stem in clean_id:
+                target = p
+                break
+    if not target.exists():
+        raise HTTPException(status_code=404, detail=f"Scene '{scene_id}' not found")
+
+    with open(target, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data
+
+
 @app.post("/api/run")
 def run_pipeline(req: RunRequest) -> dict[str, Any]:
     """Execute the complete 8-stage pipeline synchronously and return all telemetry."""

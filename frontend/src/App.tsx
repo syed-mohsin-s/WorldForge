@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  Box,
   Check,
   CheckCircle2,
   ChevronRight,
@@ -14,6 +15,7 @@ import {
   Layers,
   Play,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
   Sparkles,
   Terminal,
@@ -35,12 +37,17 @@ import {
   CostTelemetry,
   PipelineRunResult,
   PipelineStageEvent,
+  SceneGraph,
   SceneMeta,
+  SimState,
   SystemStatus,
+  createDefaultSimState,
+  fetchSceneDetails,
   fetchScenes,
   fetchSystemStatus,
   streamPipeline,
 } from './engine/worldforge';
+import SceneCanvas from './components/SceneCanvas';
 
 const STAGES = [
   { id: 1, name: 'SAM 3.1', desc: '4px Boundary Erosion', isAi: true },
@@ -89,12 +96,86 @@ const DEFAULT_SCENES: SceneMeta[] = [
   },
 ];
 
+const DEFAULT_FALLBACK_SCENE: SceneGraph = {
+  scene_id: 'scene1_pick_place',
+  table_z: 0.0,
+  camera: {
+    pos: [0.8, -0.8, 0.7],
+    lookat: [0.0, 0.0, 0.1],
+    fovy: 45.0,
+    resolution: [640, 480],
+  },
+  objects: [
+    {
+      id: 'table',
+      label: 'tabletop',
+      primitive: 'box',
+      size: [0.4, 0.4, 0.02],
+      position: [0.0, 0.0, -0.02],
+      material: 'wood',
+      is_static: true,
+      joint: { type: 'fixed' },
+      parent_id: null,
+    },
+    {
+      id: 'cube',
+      label: 'red_cube',
+      primitive: 'box',
+      size: [0.025, 0.025, 0.025],
+      position: [0.15, -0.15, 0.026],
+      material: 'plastic',
+      is_static: false,
+      joint: { type: 'free' },
+      parent_id: null,
+    },
+    {
+      id: 'coaster',
+      label: 'target_coaster',
+      primitive: 'cylinder',
+      size: [0.045, 0.003],
+      position: [-0.15, 0.15, 0.004],
+      material: 'cardboard',
+      is_static: true,
+      joint: { type: 'fixed' },
+      parent_id: null,
+    },
+  ],
+  task: {
+    task_type: 'pick_and_place',
+    description: 'Pick up the red cube and place it precisely on the target coaster.',
+    manipulated_object_id: 'cube',
+    target_position: [-0.15, 0.15, 0.026],
+    waypoints: [
+      [0.15, -0.15, 0.25, 1.0],
+      [0.15, -0.15, 0.12, 1.0],
+      [0.15, -0.15, 0.12, -1.0],
+      [0.15, -0.15, 0.30, -1.0],
+      [-0.15, 0.15, 0.30, -1.0],
+      [-0.15, 0.15, 0.15, -1.0],
+      [-0.15, 0.15, 0.15, 1.0],
+    ],
+  },
+};
+
 export function App() {
   const [scenes, setScenes] = useState<SceneMeta[]>(DEFAULT_SCENES);
   const [selectedSceneId, setSelectedSceneId] = useState<string>('scene1_pick_place');
   const [provider, setProvider] = useState<string>('auto');
   const [injectFault, setInjectFault] = useState<boolean>(false);
   const [status, setStatus] = useState<SystemStatus | null>(null);
+
+  // View switch: Pipeline Studio vs Interactive 3D PBR Workbench
+  const [currentView, setCurrentView] = useState<'studio' | 'workbench'>('studio');
+
+  // Video view mode: PPO vs Oracle vs Raw Masks
+  const [videoMode, setVideoMode] = useState<'ppo' | 'oracle' | 'raw'>('ppo');
+
+  // 3D PBR Workbench State
+  const [activeSceneGraph, setActiveSceneGraph] = useState<SceneGraph>(DEFAULT_FALLBACK_SCENE);
+  const [simState, setSimState] = useState<SimState>(() => createDefaultSimState(DEFAULT_FALLBACK_SCENE));
+  const [rewardHistory, setRewardHistory] = useState<SimState[]>([]);
+  const [isSimPlaying, setIsSimPlaying] = useState<boolean>(false);
+  const playTimerRef = useRef<number | null>(null);
 
   // Execution state
   const [isRunning, setIsRunning] = useState<boolean>(false);
@@ -105,6 +186,11 @@ export function App() {
   const [runResult, setRunResult] = useState<PipelineRunResult | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  // Self-Healing Telemetry State
+  const [selfHealingRetries, setSelfHealingRetries] = useState<number>(0);
+  const [repairDiff, setRepairDiff] = useState<string>('');
+  const [liveGateResults, setLiveGateResults] = useState<Record<string, any>>({});
+
   // Inspector tab
   const [activeTab, setActiveTab] = useState<'reasoning' | 'scenegraph' | 'mjcf' | 'reward'>('reasoning');
   const [copied, setCopied] = useState<boolean>(false);
@@ -114,19 +200,52 @@ export function App() {
   const timerRef = useRef<number | null>(null);
   const reasoningEndRef = useRef<HTMLDivElement | null>(null);
 
+  // Initial fetch of system telemetry and scene catalog
   useEffect(() => {
     fetchSystemStatus().then(setStatus).catch(console.error);
     fetchScenes().then((scs) => {
       setScenes(scs);
-      if (scs.length > 0) setSelectedSceneId(scs[0].file_id || scs[0].scene_id);
+      if (scs.length > 0) {
+        const id = scs[0].file_id || scs[0].scene_id;
+        setSelectedSceneId(id);
+        fetchSceneDetails(id)
+          .then((sg) => {
+            setActiveSceneGraph(sg);
+            setSimState(createDefaultSimState(sg));
+          })
+          .catch(() => {});
+      }
     }).catch(console.error);
   }, []);
+
+  // Update active scene graph when selection changes
+  useEffect(() => {
+    fetchSceneDetails(selectedSceneId)
+      .then((sg) => {
+        setActiveSceneGraph(sg);
+        setSimState(createDefaultSimState(sg));
+        setRewardHistory([]);
+        if (isSimPlaying) {
+          setIsSimPlaying(false);
+          if (playTimerRef.current) clearInterval(playTimerRef.current);
+        }
+      })
+      .catch((err) => console.warn('Could not load scene details:', err));
+  }, [selectedSceneId]);
 
   useEffect(() => {
     if (reasoningEndRef.current) {
       reasoningEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [liveReasoning]);
+
+  // Clean up playback timer on unmount
+  useEffect(() => {
+    return () => {
+      if (playTimerRef.current) clearInterval(playTimerRef.current);
+      if (timerRef.current) clearInterval(timerRef.current);
+    };
+  }, []);
 
   const handleRunPipeline = () => {
     setIsRunning(true);
@@ -136,6 +255,9 @@ export function App() {
     setLiveReasoning('');
     setErrorMsg(null);
     setElapsedSeconds(0);
+    setSelfHealingRetries(0);
+    setRepairDiff('');
+    setLiveGateResults({});
 
     const startT = Date.now();
     timerRef.current = window.setInterval(() => {
@@ -164,8 +286,30 @@ export function App() {
           if (ev.reasoning_trace) {
             setLiveReasoning(ev.reasoning_trace);
           }
+          if (ev.status === 'self_healing') {
+            if (ev.repair_attempt) setSelfHealingRetries(ev.repair_attempt);
+            if (ev.gate_results) setLiveGateResults(ev.gate_results);
+            if (ev.repair_diff) {
+              setRepairDiff(ev.repair_diff);
+              setActiveTab('reward');
+            }
+          }
+          if (ev.gate_results) {
+            setLiveGateResults(ev.gate_results);
+          }
+          if (ev.repair_diff) {
+            setRepairDiff(ev.repair_diff);
+          }
+          if (ev.repair_attempts) {
+            setSelfHealingRetries(ev.repair_attempts);
+          }
         } else if (ev.stage === 'complete' && ev.summary) {
           setRunResult(ev.summary);
+          setActiveSceneGraph(ev.summary.scene_graph);
+          setSimState(createDefaultSimState(ev.summary.scene_graph));
+          setLiveGateResults(ev.summary.gate_results);
+          if (ev.summary.repair_diff) setRepairDiff(ev.summary.repair_diff);
+          if (ev.summary.repair_attempts) setSelfHealingRetries(ev.summary.repair_attempts);
           setCompletedStages([1, 2, 3, 4, 5, 6, 7, 8]);
           setActiveStage(null);
           setIsRunning(false);
@@ -195,6 +339,192 @@ export function App() {
     setTimeout(() => setCopied(false), 2000);
   };
 
+  // ── 3D PBR Workbench Interactive Handlers ─────────────────────────
+  const handleManualAction = (action: [number, number, number, number]) => {
+    const [dx, dy, dz, grip] = action;
+    setSimState((prev) => {
+      const curGrip = prev.gripperPos;
+      const nextGrip: [number, number, number] = [
+        curGrip[0] + dx * 0.015,
+        curGrip[1] + dy * 0.015,
+        Math.max(activeSceneGraph.table_z + 0.02, curGrip[2] + dz * 0.015),
+      ];
+      const newGripCmd = grip;
+      const aperture = newGripCmd > 0 ? 0.06 : 0.012;
+      const manipObjId = activeSceneGraph.task.manipulated_object_id;
+      const objPos = prev.objectPositions[manipObjId] ?? [0.15, -0.15, 0.026];
+      const distGripObj = Math.hypot(nextGrip[0] - objPos[0], nextGrip[1] - objPos[1], nextGrip[2] - objPos[2]);
+      const isGrasped = newGripCmd < 0 && (prev.isGrasped || distGripObj < 0.045);
+
+      const nextObjectPositions = { ...prev.objectPositions };
+      if (isGrasped) {
+        nextObjectPositions[manipObjId] = [
+          nextGrip[0],
+          nextGrip[1],
+          Math.max(activeSceneGraph.table_z + 0.025, nextGrip[2] - 0.025),
+        ];
+      }
+      const targetPos = activeSceneGraph.task.target_position ?? [-0.15, 0.15, 0.026];
+      const currObjPos = nextObjectPositions[manipObjId] ?? objPos;
+      const distObjGoal = Math.hypot(
+        currObjPos[0] - targetPos[0],
+        currObjPos[1] - targetPos[1],
+        currObjPos[2] - targetPos[2]
+      );
+
+      const rReach = 1.0 - Math.tanh(5.0 * distGripObj);
+      const rGrasp = isGrasped ? 2.0 : 0.0;
+      const rLift = 3.0 * Math.max(0.0, currObjPos[2] - activeSceneGraph.table_z - 0.025);
+      const rPlace = isGrasped || distObjGoal < 0.05 ? 5.0 * (1.0 - Math.tanh(5.0 * distObjGoal)) : 0.0;
+      const totalR = rReach + rGrasp + rLift + rPlace;
+      const terminated = distObjGoal < 0.035;
+
+      const nextState: SimState = {
+        step: prev.step + 1,
+        gripperPos: nextGrip,
+        gripperCmd: newGripCmd,
+        fingerAperture: aperture,
+        isGrasped,
+        objectPositions: nextObjectPositions,
+        diagnostics: {
+          dReach: distGripObj,
+          dGoal: distObjGoal,
+        },
+        reward: totalR,
+        terminated,
+        stageBreakdown: {
+          reach: rReach,
+          graspOrClearance: rGrasp,
+          liftOrProgress: rLift,
+          placeOrGoal: rPlace,
+          terminalBonus: terminated ? 10.0 : 0.0,
+        },
+      };
+      setRewardHistory((h) => [...h.slice(-150), nextState]);
+      return nextState;
+    });
+  };
+
+  const handleToggleSimPlay = () => {
+    if (isSimPlaying) {
+      if (playTimerRef.current) clearInterval(playTimerRef.current);
+      setIsSimPlaying(false);
+    } else {
+      setIsSimPlaying(true);
+      const wps = activeSceneGraph.task.waypoints;
+      if (!wps || wps.length === 0) return;
+
+      let wpIdx = 0;
+      playTimerRef.current = window.setInterval(() => {
+        if (wpIdx >= wps.length) {
+          if (playTimerRef.current) clearInterval(playTimerRef.current);
+          setIsSimPlaying(false);
+          return;
+        }
+        const [wx, wy, wz, grip] = wps[wpIdx];
+        setSimState((prev) => {
+          const cur = prev.gripperPos;
+          const dx = wx - cur[0];
+          const dy = wy - cur[1];
+          const dz = wz - cur[2];
+          const dist = Math.hypot(dx, dy, dz);
+
+          if (dist < 0.015) {
+            wpIdx++;
+          }
+
+          const stepSize = 0.012;
+          const ratio = dist > 1e-6 ? Math.min(1.0, stepSize / dist) : 1.0;
+          const nextGrip: [number, number, number] = [
+            cur[0] + dx * ratio,
+            cur[1] + dy * ratio,
+            cur[2] + dz * ratio,
+          ];
+          const aperture = grip > 0 ? 0.06 : 0.012;
+          const manipId = activeSceneGraph.task.manipulated_object_id;
+          const prevObj = prev.objectPositions[manipId] ?? [0.15, -0.15, 0.026];
+          const distGripObj = Math.hypot(nextGrip[0] - prevObj[0], nextGrip[1] - prevObj[1], nextGrip[2] - prevObj[2]);
+          const isGrasped = grip < 0 && (prev.isGrasped || distGripObj < 0.045);
+
+          const nextPositions = { ...prev.objectPositions };
+          if (isGrasped) {
+            nextPositions[manipId] = [nextGrip[0], nextGrip[1], Math.max(activeSceneGraph.table_z + 0.025, nextGrip[2] - 0.025)];
+          }
+          const target = activeSceneGraph.task.target_position ?? [-0.15, 0.15, 0.026];
+          const cObj = nextPositions[manipId] ?? prevObj;
+          const distGoal = Math.hypot(cObj[0] - target[0], cObj[1] - target[1], cObj[2] - target[2]);
+
+          const rReach = 1.0 - Math.tanh(5.0 * distGripObj);
+          const rGrasp = isGrasped ? 2.0 : 0.0;
+          const rLift = 3.0 * Math.max(0.0, cObj[2] - activeSceneGraph.table_z - 0.025);
+          const rPlace = isGrasped || distGoal < 0.05 ? 5.0 * (1.0 - Math.tanh(5.0 * distGoal)) : 0.0;
+          const totalR = rReach + rGrasp + rLift + rPlace;
+          const term = distGoal < 0.035;
+
+          const st: SimState = {
+            step: prev.step + 1,
+            gripperPos: nextGrip,
+            gripperCmd: grip,
+            fingerAperture: aperture,
+            isGrasped,
+            objectPositions: nextPositions,
+            diagnostics: { dReach: distGripObj, dGoal: distGoal },
+            reward: totalR,
+            terminated: term,
+            stageBreakdown: {
+              reach: rReach,
+              graspOrClearance: rGrasp,
+              liftOrProgress: rLift,
+              placeOrGoal: rPlace,
+              terminalBonus: term ? 10.0 : 0.0,
+            },
+          };
+          setRewardHistory((h) => [...h.slice(-150), st]);
+          return st;
+        });
+      }, 50);
+    }
+  };
+
+  const handleResetSim = () => {
+    if (playTimerRef.current) clearInterval(playTimerRef.current);
+    setIsSimPlaying(false);
+    setSimState(createDefaultSimState(activeSceneGraph));
+    setRewardHistory([]);
+  };
+
+  const handleStepOracleEnd = () => {
+    const wps = activeSceneGraph.task.waypoints;
+    if (!wps || wps.length === 0) return;
+    const lastWp = wps[wps.length - 1];
+    const manipId = activeSceneGraph.task.manipulated_object_id;
+    const target = activeSceneGraph.task.target_position ?? [-0.15, 0.15, 0.026];
+
+    const nextPositions = { ...simState.objectPositions };
+    nextPositions[manipId] = [target[0], target[1], target[2]];
+
+    const st: SimState = {
+      step: simState.step + 50,
+      gripperPos: [lastWp[0], lastWp[1], lastWp[2]],
+      gripperCmd: lastWp[3],
+      fingerAperture: lastWp[3] > 0 ? 0.06 : 0.012,
+      isGrasped: false,
+      objectPositions: nextPositions,
+      diagnostics: { dReach: 0.01, dGoal: 0.005 },
+      reward: 11.0,
+      terminated: true,
+      stageBreakdown: {
+        reach: 1.0,
+        graspOrClearance: 2.0,
+        liftOrProgress: 3.0,
+        placeOrGoal: 5.0,
+        terminalBonus: 10.0,
+      },
+    };
+    setSimState(st);
+    setRewardHistory((h) => [...h.slice(-150), st]);
+  };
+
   const totalTime = runResult ? runResult.total_duration_s : elapsedSeconds;
   const currentCost = runResult ? runResult.cost_telemetry.total_cost_usd : 0.0018;
   const currentIoU = runResult ? Math.round(runResult.render_diff.mean_iou * 1000) / 10 : 87.8;
@@ -202,7 +532,7 @@ export function App() {
   return (
     <div className="min-h-screen bg-zinc-950 text-zinc-100 flex flex-col font-sans selection:bg-violet-500/30">
       {/* ──────────────────────────────────────────────────────────── */}
-      {/* Top Impact & Partner Telemetry Bar (30% Rubric Weight)        */}
+      {/* Top Header: Telemetry + View Switcher + Self-Healing Status   */}
       {/* ──────────────────────────────────────────────────────────── */}
       <header className="border-b border-zinc-800/80 bg-zinc-950/90 backdrop-blur px-6 py-3 sticky top-0 z-50 flex flex-wrap items-center justify-between gap-4">
         <div className="flex items-center gap-3">
@@ -222,9 +552,49 @@ export function App() {
           </div>
         </div>
 
-        {/* 4 Impact Telemetry Pills */}
+        {/* View Switcher: Studio vs 3D PBR Workbench */}
+        <div className="flex items-center rounded-lg bg-zinc-900 p-1 border border-zinc-800 shadow-inner">
+          <button
+            onClick={() => setCurrentView('studio')}
+            className={`px-3 py-1 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+              currentView === 'studio'
+                ? 'bg-violet-600 text-white shadow-md shadow-violet-600/30 font-bold'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Zap className="h-3.5 w-3.5" />
+            <span>⚡ 8-Stage Pipeline Studio</span>
+          </button>
+          <button
+            onClick={() => setCurrentView('workbench')}
+            className={`px-3 py-1 rounded-md text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+              currentView === 'workbench'
+                ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30 font-bold'
+                : 'text-zinc-400 hover:text-zinc-200'
+            }`}
+          >
+            <Box className="h-3.5 w-3.5" />
+            <span>🎮 3D PBR Workbench</span>
+          </button>
+        </div>
+
+        {/* Impact Telemetry Pills */}
         <div className="flex flex-wrap items-center gap-2.5 text-xs">
-          {/* Pill 1: Authoring Speedup */}
+          {/* Self-Healing Dynamic Retry Pill */}
+          {selfHealingRetries > 0 && !runResult?.self_healing_applied && (
+            <div className="px-3 py-1.5 rounded-full bg-red-950/80 border border-red-600/80 text-red-200 font-mono font-semibold animate-pulse flex items-center gap-1.5 shadow-sm shadow-red-500/20">
+              <AlertTriangle className="h-3.5 w-3.5 text-red-400" />
+              <span>Self-Healing Retries: {selfHealingRetries} / 4 (Gate 3 Fix In-Flight)</span>
+            </div>
+          )}
+          {runResult?.self_healing_applied && (
+            <div className="px-3 py-1.5 rounded-full bg-emerald-950/80 border border-emerald-600/80 text-emerald-200 font-mono font-semibold flex items-center gap-1.5 shadow-sm">
+              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+              <span>Self-Healing: {runResult.repair_attempts} Attempts (Auto-Patched)</span>
+            </div>
+          )}
+
+          {/* Speedup */}
           <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2 shadow-sm">
             <Clock className="h-3.5 w-3.5 text-emerald-400" />
             <span className="text-zinc-400">Speedup:</span>
@@ -233,459 +603,633 @@ export function App() {
             </span>
           </div>
 
-          {/* Pill 2: Model Engine */}
-          <div className="px-3 py-1.5 rounded-full bg-violet-950/40 border border-violet-800/60 flex items-center gap-2 shadow-sm">
-            <Cpu className="h-3.5 w-3.5 text-violet-400" />
-            <span className="text-zinc-300 font-mono text-[11px]">
-              meta-models/muse-spark-open-1026 <span className="text-violet-400">(Baseten 2M TPM)</span> + SAM 3.1
-            </span>
-          </div>
-
-          {/* Pill 3: Credits & Cost */}
+          {/* Credits & Cost */}
           <div className="px-3 py-1.5 rounded-full bg-zinc-900 border border-zinc-800 flex items-center gap-2 shadow-sm">
             <DollarSign className="h-3.5 w-3.5 text-amber-400" />
-            <span className="font-mono text-zinc-300 font-medium">
-              ${currentCost.toFixed(4)}
-            </span>
-            <span className="text-zinc-500 text-[10px]">
-              ($150 Meta + $100 Baseten + $130 Modal)
-            </span>
+            <span className="font-mono text-zinc-300 font-medium">${currentCost.toFixed(4)}</span>
+            <span className="text-zinc-500 text-[10px]">($150 Meta + $100 B10)</span>
           </div>
 
-          {/* Pill 4: Mask IoU */}
+          {/* Mask IoU */}
           <div className="px-3 py-1.5 rounded-full bg-emerald-950/40 border border-emerald-800/60 flex items-center gap-2 shadow-sm">
             <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
-            <span className="text-zinc-400">Sim-to-Real Mask IoU:</span>
+            <span className="text-zinc-400">IoU:</span>
             <span className="font-mono font-bold text-emerald-300">{currentIoU}%</span>
           </div>
         </div>
       </header>
 
       {/* ──────────────────────────────────────────────────────────── */}
-      {/* Interactive 8-Stage Pipeline Flow Header                      */}
+      {/* 3D PBR Workbench View or Pipeline Studio View                 */}
       {/* ──────────────────────────────────────────────────────────── */}
-      <section className="bg-zinc-900/60 border-b border-zinc-800/80 px-6 py-4">
-        <div className="flex items-center justify-between mb-3">
-          <div className="flex items-center gap-2 text-xs font-semibold text-zinc-300 uppercase tracking-wider">
-            <Activity className="h-3.5 w-3.5 text-emerald-400 animate-pulse" />
-            End-to-End Autonomous Pipeline (MuJoCo 3.17 Physics Single Source of Truth)
-          </div>
-          {runResult?.self_healing_applied && (
-            <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-950/80 border border-amber-600/70 text-amber-300 text-[11px] font-mono animate-bounce">
-              <RefreshCw className="h-3 w-3 animate-spin" />
-              Self-Healing Loop Auto-Patched Fault (Gate 3 Fixed)
-            </div>
-          )}
-        </div>
-
-        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2.5">
-          {STAGES.map((st) => {
-            const isCompleted = completedStages.includes(st.id);
-            const isCurrent = activeStage === st.id;
-            const timing = stageTimings[String(st.id)];
-
-            let borderStyle = 'border-zinc-800 bg-zinc-900/40 text-zinc-400';
-            if (isCurrent) {
-              borderStyle = st.isAi
-                ? 'border-violet-500 bg-violet-950/40 text-violet-200 ring-2 ring-violet-500/30'
-                : 'border-emerald-500 bg-emerald-950/40 text-emerald-200 ring-2 ring-emerald-500/30';
-            } else if (isCompleted) {
-              borderStyle = st.isAi
-                ? 'border-violet-800/80 bg-violet-950/30 text-violet-300'
-                : 'border-emerald-800/80 bg-emerald-950/30 text-emerald-300';
-            }
-
-            return (
-              <div
-                key={st.id}
-                className={`p-2.5 rounded-xl border transition-all duration-300 relative flex flex-col justify-between ${borderStyle}`}
+      {currentView === 'workbench' ? (
+        <div className="flex-1 flex flex-col relative overflow-hidden">
+          <div className="px-6 py-2.5 bg-zinc-900/60 border-b border-zinc-800 flex items-center justify-between text-xs">
+            <div className="flex items-center gap-3">
+              <span className="text-zinc-400 font-medium">Active Scene:</span>
+              <select
+                value={selectedSceneId}
+                onChange={(e) => setSelectedSceneId(e.target.value)}
+                className="bg-zinc-900 border border-zinc-700 rounded-lg px-2.5 py-1 text-xs text-white cursor-pointer"
               >
-                <div className="flex items-center justify-between gap-1 mb-1">
-                  <span className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
-                    st.isAi ? 'bg-violet-900/60 text-violet-300' : 'bg-emerald-900/60 text-emerald-300'
-                  }`}>
-                    {st.isAi ? 'META / B10' : 'PYTHON'}
-                  </span>
-                  {isCompleted ? (
-                    <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-                  ) : isCurrent ? (
-                    <RefreshCw className="h-3.5 w-3.5 animate-spin text-violet-400" />
-                  ) : (
-                    <span className="text-[10px] font-mono text-zinc-600">#{st.id}</span>
-                  )}
-                </div>
-                <div className="font-semibold text-xs text-white truncate">{st.name}</div>
-                <div className="text-[10px] text-zinc-400 truncate mt-0.5">{st.desc}</div>
-                <div className="mt-2 text-[10px] font-mono text-zinc-500 flex items-center justify-between border-t border-zinc-800/60 pt-1">
-                  <span>Status:</span>
-                  <span className={isCompleted ? 'text-emerald-400' : isCurrent ? 'text-amber-400' : 'text-zinc-500'}>
-                    {isCompleted ? `${timing ?? 0.3}s` : isCurrent ? 'running' : 'queued'}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </section>
-
-      {/* ──────────────────────────────────────────────────────────── */}
-      {/* Control Bar                                                   */}
-      {/* ──────────────────────────────────────────────────────────── */}
-      <div className="border-b border-zinc-800 px-6 py-3 bg-zinc-900/40 flex flex-wrap items-center justify-between gap-4">
-        <div className="flex flex-wrap items-center gap-3 text-xs">
-          {/* Scene Preset Selector */}
-          <div className="flex items-center gap-2">
-            <span className="text-zinc-400 font-medium">Scene Preset:</span>
-            <select
-              value={selectedSceneId}
-              onChange={(e) => setSelectedSceneId(e.target.value)}
-              disabled={isRunning}
-              className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-violet-500 cursor-pointer"
-            >
-              {scenes.map((s) => (
-                <option key={s.file_id || s.scene_id} value={s.file_id || s.scene_id}>
-                  {s.file_id === 'scene1_pick_place' ? 'Scene 1: Red Cube Pick & Place' :
-                   s.file_id === 'scene2_push_obstacle' ? 'Scene 2: Push Around Obstacle' :
-                   s.file_id === 'scene3_articulated_drawer' ? 'Scene 3: Articulated Slide Drawer' : s.scene_id}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* Model Provider Selector */}
-          <div className="flex items-center gap-2">
-            <span className="text-zinc-400 font-medium">Model Engine:</span>
-            <select
-              value={provider}
-              onChange={(e) => setProvider(e.target.value)}
-              disabled={isRunning}
-              className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs text-violet-300 font-mono focus:outline-none focus:border-violet-500 cursor-pointer"
-            >
-              <option value="auto">Baseten: meta-models/muse-spark-open-1026 (Live)</option>
-              <option value="meta">Meta Model API: muse-spark-1.2</option>
-              <option value="local">Deterministic Local (Offline Fallback)</option>
-            </select>
-          </div>
-
-          {/* Fault Injection Toggle */}
-          <label className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-zinc-700 cursor-pointer select-none">
-            <input
-              type="checkbox"
-              checked={injectFault}
-              onChange={(e) => setInjectFault(e.target.checked)}
-              disabled={isRunning}
-              className="accent-amber-500 rounded"
-            />
-            <span className="text-zinc-300 font-medium">Inject Gate 3 Fault (Demo Self-Healing)</span>
-          </label>
-        </div>
-
-        {/* Action Button */}
-        <button
-          onClick={handleRunPipeline}
-          disabled={isRunning}
-          className={`px-5 py-2 rounded-lg font-semibold text-xs flex items-center gap-2 shadow-lg transition-all duration-200 cursor-pointer ${
-            isRunning
-              ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
-              : 'bg-gradient-to-r from-violet-600 to-emerald-500 hover:from-violet-500 hover:to-emerald-400 text-white shadow-violet-500/20'
-          }`}
-        >
-          {isRunning ? (
-            <>
-              <RefreshCw className="h-4 w-4 animate-spin" />
-              Synthesizing Environment ({elapsedSeconds}s)...
-            </>
-          ) : (
-            <>
-              <Play className="h-4 w-4 fill-white" />
-              Forge &amp; Validate Environment
-            </>
-          )}
-        </button>
-      </div>
-
-      {errorMsg && (
-        <div className="bg-red-950/60 border-b border-red-800/80 px-6 py-2.5 text-xs text-red-200 flex items-center gap-2">
-          <AlertTriangle className="h-4 w-4 text-red-400 shrink-0" />
-          <span>{errorMsg}</span>
-        </div>
-      )}
-
-      {/* ──────────────────────────────────────────────────────────── */}
-      {/* 3-Pane Studio Workspace                                      */}
-      {/* ──────────────────────────────────────────────────────────── */}
-      <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-zinc-800">
-        {/* ── Left Pane: Perception & Render + Diff (3 Cols) ─────── */}
-        <section className="lg:col-span-4 p-5 space-y-5 overflow-y-auto bg-zinc-950/50">
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
-                <Eye className="h-4 w-4 text-violet-400" />
-                Stage 1: SAM 3.1 4px-Eroded Masks
-              </h2>
-              <span className="text-[10px] font-mono text-emerald-400">Zero Flying Pixels</span>
+                {scenes.map((s) => (
+                  <option key={s.file_id || s.scene_id} value={s.file_id || s.scene_id}>
+                    {s.file_id === 'scene1_pick_place'
+                      ? 'Scene 1: Red Cube Pick & Place'
+                      : s.file_id === 'scene2_push_obstacle'
+                      ? 'Scene 2: Push Around Obstacle'
+                      : s.file_id === 'scene3_articulated_drawer'
+                      ? 'Scene 3: Articulated Slide Drawer'
+                      : s.scene_id}
+                  </option>
+                ))}
+              </select>
             </div>
-            <div className="aspect-video w-full rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative group">
-              <img
-                src={runResult?.render_diff?.masks_url ? `${API_BASE}${runResult.render_diff.masks_url}` : `${API_BASE}/outputs/${selectedSceneId}/frame0_masks.png`}
-                alt="SAM 3.1 Segmentation"
-                className="w-full h-full object-cover"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src =
-                    'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect width="640" height="480" fill="%2318181b"/><text x="50%" y="50%" font-size="14" fill="%2371717a" text-anchor="middle" dominant-baseline="middle">Click Forge to generate SAM 3.1 masks</text></svg>';
-                }}
-              />
-              <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 backdrop-blur text-[10px] font-mono text-zinc-300">
-                Frame 0 Mask Overlay
-              </div>
-            </div>
-          </div>
-
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
-                <Layers className="h-4 w-4 text-emerald-400" />
-                Stage 8: Render + Diff Mask IoU
-              </h2>
-              <span className="text-[10px] font-mono text-emerald-400 font-bold">
-                {runResult ? `${Math.round(runResult.render_diff.mean_iou * 1000) / 10}% IoU` : '87.8% IoU'}
+            <div className="flex items-center gap-2">
+              <span className="text-[11px] text-zinc-400 font-mono">
+                Three.js PBR Engine · M6 Breadboard · MuJoCo Mocap Weld
               </span>
             </div>
-            <div className="aspect-video w-full rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative">
-              <img
-                src={runResult?.render_diff?.overlay_url ? `${API_BASE}${runResult.render_diff.overlay_url}` : `${API_BASE}/outputs/${selectedSceneId}/diff_overlay.png`}
-                alt="Render Diff Overlay"
-                className="w-full h-full object-cover"
-                onError={(e) => {
-                  (e.target as HTMLImageElement).src =
-                    'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect width="640" height="480" fill="%2318181b"/><text x="50%" y="50%" font-size="14" fill="%2371717a" text-anchor="middle" dominant-baseline="middle">Render+Diff Green/Red Composite</text></svg>';
-                }}
-              />
-              <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 backdrop-blur text-[10px] font-mono text-zinc-300 flex items-center gap-2">
-                <span className="h-2 w-2 rounded-full bg-emerald-500 inline-block" /> Overlap
-                <span className="h-2 w-2 rounded-full bg-red-500 inline-block ml-1" /> Mismatch
+          </div>
+          <div className="flex-1 relative">
+            <SceneCanvas
+              scene={activeSceneGraph}
+              simState={simState}
+              rewardHistory={rewardHistory}
+              isPlaying={isSimPlaying}
+              onTogglePlay={handleToggleSimPlay}
+              onResetSim={handleResetSim}
+              onStepOracleEnd={handleStepOracleEnd}
+              onManualAction={handleManualAction}
+            />
+          </div>
+        </div>
+      ) : (
+        <>
+          {/* ──────────────────────────────────────────────────────────── */}
+          {/* Interactive 8-Stage Pipeline Flow Header                      */}
+          {/* ──────────────────────────────────────────────────────────── */}
+          <section className="bg-zinc-900/60 border-b border-zinc-800/80 px-6 py-4">
+            <div className="flex items-center justify-between mb-3">
+              <div className="flex items-center gap-2 text-xs font-semibold text-zinc-300 uppercase tracking-wider">
+                <Activity className="h-3.5 w-3.5 text-emerald-400 animate-pulse" />
+                End-to-End Autonomous Pipeline (MuJoCo 3.17 Physics Single Source of Truth)
               </div>
-            </div>
-          </div>
-
-          {/* 3D Lifting Telemetry */}
-          <div className="p-3.5 rounded-xl bg-zinc-900/60 border border-zinc-800 text-xs space-y-2">
-            <span className="font-semibold text-zinc-300 flex items-center gap-1.5">
-              <Cpu className="h-3.5 w-3.5 text-violet-400" />
-              Stage 2: 3D Lift Metric Invariants
-            </span>
-            <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-zinc-400">
-              <div>Table Height: <span className="text-zinc-200">z = 0.000m</span></div>
-              <div>Grounding: <span className="text-emerald-400">z + h/2 + 0.001m</span></div>
-              <div>Plane Normal: <span className="text-zinc-200">[0, 0, 1]</span></div>
-              <div>Integrator: <span className="text-violet-300">implicitfast</span></div>
-            </div>
-          </div>
-        </section>
-
-        {/* ── Center Pane: Tabbed Inspector & Live Reasoning (4 Cols) ─ */}
-        <section className="lg:col-span-4 p-5 flex flex-col bg-zinc-950">
-          <div className="flex items-center justify-between border-b border-zinc-800 pb-2 mb-3">
-            <div className="flex items-center gap-1">
-              <button
-                onClick={() => setActiveTab('reasoning')}
-                className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
-                  activeTab === 'reasoning'
-                    ? 'bg-violet-950 text-violet-300 border border-violet-800/80'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                Spark Reasoning
-              </button>
-              <button
-                onClick={() => setActiveTab('scenegraph')}
-                className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
-                  activeTab === 'scenegraph'
-                    ? 'bg-emerald-950 text-emerald-300 border border-emerald-800/80'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                SceneGraph
-              </button>
-              <button
-                onClick={() => setActiveTab('mjcf')}
-                className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
-                  activeTab === 'mjcf'
-                    ? 'bg-zinc-800 text-white'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                MJCF XML
-              </button>
-              <button
-                onClick={() => setActiveTab('reward')}
-                className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
-                  activeTab === 'reward'
-                    ? 'bg-zinc-800 text-white'
-                    : 'text-zinc-400 hover:text-zinc-200'
-                }`}
-              >
-                Reward Code
-              </button>
+              {runResult?.self_healing_applied && (
+                <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-amber-950/80 border border-amber-600/70 text-amber-300 text-[11px] font-mono">
+                  <RefreshCw className="h-3 w-3 animate-spin" />
+                  Self-Healing Loop Auto-Patched Fault (Gate 3 Fixed)
+                </div>
+              )}
             </div>
 
+            <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-2.5">
+              {STAGES.map((st) => {
+                const isCompleted = completedStages.includes(st.id);
+                const isCurrent = activeStage === st.id;
+                const timing = stageTimings[String(st.id)];
+
+                let borderStyle = 'border-zinc-800 bg-zinc-900/40 text-zinc-400';
+                if (isCurrent) {
+                  borderStyle = st.isAi
+                    ? 'border-violet-500 bg-violet-950/40 text-violet-200 ring-2 ring-violet-500/30'
+                    : 'border-emerald-500 bg-emerald-950/40 text-emerald-200 ring-2 ring-emerald-500/30';
+                } else if (isCompleted) {
+                  borderStyle = st.isAi
+                    ? 'border-violet-800/80 bg-violet-950/30 text-violet-300'
+                    : 'border-emerald-800/80 bg-emerald-950/30 text-emerald-300';
+                }
+
+                return (
+                  <div
+                    key={st.id}
+                    className={`p-2.5 rounded-xl border transition-all duration-300 relative flex flex-col justify-between ${borderStyle}`}
+                  >
+                    <div className="flex items-center justify-between gap-1 mb-1">
+                      <span
+                        className={`text-[10px] font-mono font-bold px-1.5 py-0.5 rounded ${
+                          st.isAi ? 'bg-violet-900/60 text-violet-300' : 'bg-emerald-900/60 text-emerald-300'
+                        }`}
+                      >
+                        {st.isAi ? 'META / B10' : 'PYTHON'}
+                      </span>
+                      {isCompleted ? (
+                        <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                      ) : isCurrent ? (
+                        <RefreshCw className="h-3.5 w-3.5 animate-spin text-violet-400" />
+                      ) : (
+                        <span className="text-[10px] font-mono text-zinc-600">#{st.id}</span>
+                      )}
+                    </div>
+                    <div className="font-semibold text-xs text-white truncate">{st.name}</div>
+                    <div className="text-[10px] text-zinc-400 truncate mt-0.5">{st.desc}</div>
+                    <div className="mt-2 text-[10px] font-mono text-zinc-500 flex items-center justify-between border-t border-zinc-800/60 pt-1">
+                      <span>Status:</span>
+                      <span className={isCompleted ? 'text-emerald-400' : isCurrent ? 'text-amber-400' : 'text-zinc-500'}>
+                        {isCompleted ? `${timing ?? 0.3}s` : isCurrent ? 'running' : 'queued'}
+                      </span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </section>
+
+          {/* ──────────────────────────────────────────────────────────── */}
+          {/* Control Bar                                                   */}
+          {/* ──────────────────────────────────────────────────────────── */}
+          <div className="border-b border-zinc-800 px-6 py-3 bg-zinc-900/40 flex flex-wrap items-center justify-between gap-4">
+            <div className="flex flex-wrap items-center gap-3 text-xs">
+              {/* Scene Preset Selector */}
+              <div className="flex items-center gap-2">
+                <span className="text-zinc-400 font-medium">Scene Preset:</span>
+                <select
+                  value={selectedSceneId}
+                  onChange={(e) => setSelectedSceneId(e.target.value)}
+                  disabled={isRunning}
+                  className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs text-white focus:outline-none focus:border-violet-500 cursor-pointer"
+                >
+                  {scenes.map((s) => (
+                    <option key={s.file_id || s.scene_id} value={s.file_id || s.scene_id}>
+                      {s.file_id === 'scene1_pick_place'
+                        ? 'Scene 1: Red Cube Pick & Place'
+                        : s.file_id === 'scene2_push_obstacle'
+                        ? 'Scene 2: Push Around Obstacle'
+                        : s.file_id === 'scene3_articulated_drawer'
+                        ? 'Scene 3: Articulated Slide Drawer'
+                        : s.scene_id}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* Model Provider Selector */}
+              <div className="flex items-center gap-2">
+                <span className="text-zinc-400 font-medium">Model Engine:</span>
+                <select
+                  value={provider}
+                  onChange={(e) => setProvider(e.target.value)}
+                  disabled={isRunning}
+                  className="bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs text-violet-300 font-mono focus:outline-none focus:border-violet-500 cursor-pointer"
+                >
+                  <option value="auto">Baseten: meta-models/muse-spark-open-1026 (Live)</option>
+                  <option value="meta">Meta Model API: muse-spark-1.2</option>
+                  <option value="local">Deterministic Local (Offline Fallback)</option>
+                </select>
+              </div>
+
+              {/* Fault Injection Toggle */}
+              <label className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-zinc-700 cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={injectFault}
+                  onChange={(e) => setInjectFault(e.target.checked)}
+                  disabled={isRunning}
+                  className="accent-amber-500 rounded"
+                />
+                <span className="text-zinc-300 font-medium">Inject Gate 3 Fault (Demo Self-Healing)</span>
+              </label>
+            </div>
+
+            {/* Action Button */}
             <button
-              onClick={() => {
-                const text =
-                  activeTab === 'reasoning' ? liveReasoning :
-                  activeTab === 'scenegraph' ? JSON.stringify(runResult?.scene_graph, null, 2) :
-                  activeTab === 'mjcf' ? runResult?.mjcf_xml || '' : runResult?.reward_code || '';
-                handleCopy(text);
-              }}
-              className="p-1 rounded text-zinc-400 hover:text-white cursor-pointer transition-colors"
-              title="Copy to clipboard"
+              onClick={handleRunPipeline}
+              disabled={isRunning}
+              className={`px-5 py-2 rounded-lg font-semibold text-xs flex items-center gap-2 shadow-lg transition-all duration-200 cursor-pointer ${
+                isRunning
+                  ? 'bg-zinc-800 text-zinc-500 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-violet-600 to-emerald-500 hover:from-violet-500 hover:to-emerald-400 text-white shadow-violet-500/20'
+              }`}
             >
-              {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+              {isRunning ? (
+                <>
+                  <RefreshCw className="h-4 w-4 animate-spin" />
+                  Synthesizing Environment ({elapsedSeconds}s)...
+                </>
+              ) : (
+                <>
+                  <Play className="h-4 w-4 fill-white" />
+                  Forge &amp; Validate Environment
+                </>
+              )}
             </button>
           </div>
 
-          <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 p-3 font-mono text-[11px] overflow-y-auto max-h-[560px] leading-relaxed">
-            {activeTab === 'reasoning' && (
-              <div className="space-y-2">
-                <div className="flex items-center gap-2 text-violet-400 text-xs font-semibold mb-2">
-                  <Terminal className="h-3.5 w-3.5" />
-                  meta-models/muse-spark-open-1026 Reasoning Stream:
+          {errorMsg && (
+            <div className="bg-red-950/60 border-b border-red-800/80 px-6 py-2.5 text-xs text-red-200 flex items-center gap-2">
+              <AlertTriangle className="h-4 w-4 text-red-400 shrink-0" />
+              <span>{errorMsg}</span>
+            </div>
+          )}
+
+          {/* ──────────────────────────────────────────────────────────── */}
+          {/* 3-Pane Studio Workspace                                      */}
+          {/* ──────────────────────────────────────────────────────────── */}
+          <main className="flex-1 grid grid-cols-1 lg:grid-cols-12 divide-y lg:divide-y-0 lg:divide-x divide-zinc-800">
+            {/* ── Left Pane: Perception & Render + Diff (3 Cols) ─────── */}
+            <section className="lg:col-span-4 p-5 space-y-5 overflow-y-auto bg-zinc-950/50">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                    <Eye className="h-4 w-4 text-violet-400" />
+                    Stage 1: SAM 3.1 4px-Eroded Masks
+                  </h2>
+                  <span className="text-[10px] font-mono text-emerald-400">Zero Flying Pixels</span>
                 </div>
-                {liveReasoning ? (
-                  <p className="whitespace-pre-wrap text-zinc-300">{liveReasoning}</p>
-                ) : (
-                  <p className="text-zinc-600 italic">
-                    Reasoning stream idle. Click &quot;Forge &amp; Validate Environment&quot; to stream reasoning tokens live from Baseten.
-                  </p>
-                )}
-                <div ref={reasoningEndRef} />
-              </div>
-            )}
-
-            {activeTab === 'scenegraph' && (
-              <pre className="text-emerald-300 whitespace-pre-wrap">
-                {runResult?.scene_graph
-                  ? JSON.stringify(runResult.scene_graph, null, 2)
-                  : '// Pydantic V2 SceneGraph will appear here after Stage 4'}
-              </pre>
-            )}
-
-            {activeTab === 'mjcf' && (
-              <pre className="text-cyan-300 whitespace-pre-wrap">
-                {runResult?.mjcf_xml
-                  ? runResult.mjcf_xml
-                  : '<!-- MuJoCo 3.17 MJCF XML will compile here in Stage 5 -->'}
-              </pre>
-            )}
-
-            {activeTab === 'reward' && (
-              <pre className="text-amber-300 whitespace-pre-wrap">
-                {runResult?.reward_code
-                  ? runResult.reward_code
-                  : '# Dense multi-stage reward function synthesized in Stage 6'}
-              </pre>
-            )}
-          </div>
-        </section>
-
-        {/* ── Right Pane: Validation Gates 1–5 & RL Rollout (4 Cols) ─ */}
-        <section className="lg:col-span-4 p-5 space-y-5 overflow-y-auto bg-zinc-950/50">
-          <div>
-            <div className="flex items-center justify-between mb-2">
-              <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
-                <Video className="h-4 w-4 text-emerald-400" />
-                MuJoCo 3.17 Trained PPO Rollout (MP4)
-              </h2>
-              <span className="text-[10px] font-mono text-emerald-400">Stable-Baselines3 Policy</span>
-            </div>
-            <div className="aspect-video w-full rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative shadow-lg">
-              <video
-                key={runResult?.ppo_results?.video_url || 'default-video'}
-                src={runResult?.ppo_results?.video_url ? `${API_BASE}${runResult.ppo_results.video_url}` : `${API_BASE}/outputs/${selectedSceneId}/rollout.mp4`}
-                controls
-                autoPlay
-                loop
-                muted
-                className="w-full h-full object-cover"
-              />
-            </div>
-          </div>
-
-          {/* Validation Gates 1–5 Checklist */}
-          <div className="space-y-1.5">
-            <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-400 mb-2">
-              5-Gate Validation Pipeline Telemetry
-            </h3>
-            {[
-              { num: 1, name: 'Numerical Stability', desc: '1,000 Steps · Zero NaNs · |qacc| < 1e6' },
-              { num: 2, name: 'Static Equilibrium', desc: '250 Steps · Resting Drift < 2mm' },
-              { num: 3, name: 'Reward Variance', desc: 'σ > 1e-4 · Non-Degenerate Reward' },
-              { num: 4, name: 'Waypoint Oracle', desc: 'Closed-Loop Success Nominal' },
-              { num: 5, name: 'PPO Convergence', desc: 'Eval Mean Beats Random Baseline' },
-            ].map((g) => {
-              const isPassed = runResult ? runResult.gate_results[String(g.num)]?.passed ?? true : true;
-              return (
-                <div
-                  key={g.num}
-                  className="px-3 py-2 rounded-lg bg-zinc-900/80 border border-zinc-800/80 flex items-center justify-between text-xs"
-                >
-                  <div className="flex items-center gap-2">
-                    <CheckCircle2 className={`h-4 w-4 ${isPassed ? 'text-emerald-400' : 'text-red-400'}`} />
-                    <div>
-                      <span className="font-semibold text-zinc-200">Gate {g.num}: {g.name}</span>
-                      <p className="text-[10px] text-zinc-400 font-mono">{g.desc}</p>
-                    </div>
+                <div className="aspect-video w-full rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative group">
+                  <img
+                    src={
+                      runResult?.render_diff?.masks_url
+                        ? `${API_BASE}${runResult.render_diff.masks_url}`
+                        : `${API_BASE}/outputs/${selectedSceneId}/frame0_masks.png`
+                    }
+                    alt="SAM 3.1 Segmentation"
+                    className="w-full h-full object-cover"
+                    onError={(e) => {
+                      (e.target as HTMLImageElement).src =
+                        'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect width="640" height="480" fill="%2318181b"/><text x="50%" y="50%" font-size="14" fill="%2371717a" text-anchor="middle" dominant-baseline="middle">Click Forge to generate SAM 3.1 masks</text></svg>';
+                    }}
+                  />
+                  <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 backdrop-blur text-[10px] font-mono text-zinc-300">
+                    Frame 0 Mask Overlay
                   </div>
-                  <span className="font-mono text-[10px] text-emerald-400 px-1.5 py-0.5 rounded bg-emerald-950/60 border border-emerald-800/40 font-semibold">
-                    NOMINAL
+                </div>
+              </div>
+
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                    <Layers className="h-4 w-4 text-emerald-400" />
+                    Stage 8: Render + Diff Mask IoU
+                  </h2>
+                  <span className="text-[10px] font-mono text-emerald-400 font-bold">
+                    {runResult ? `${Math.round(runResult.render_diff.mean_iou * 1000) / 10}% IoU` : '87.8% IoU'}
                   </span>
                 </div>
-              );
-            })}
-          </div>
-
-          {/* Interactive Recharts Learning Curve */}
-          <div className="p-3 rounded-xl bg-zinc-900 border border-zinc-800">
-            <div className="flex items-center justify-between text-xs mb-2">
-              <span className="font-semibold text-zinc-300">PPO Learning Curve (Timesteps vs Return)</span>
-              <span className="text-[10px] font-mono text-emerald-400">Mean: +48.2</span>
-            </div>
-            <div className="h-32 w-full">
-              <ResponsiveContainer width="100%" height="100%">
-                <AreaChart
-                  data={
-                    runResult?.ppo_results?.learning_curve?.length
-                      ? runResult.ppo_results.learning_curve
-                      : [
-                          { timesteps: 0, mean_reward: 2.1 },
-                          { timesteps: 1024, mean_reward: 14.8 },
-                          { timesteps: 2048, mean_reward: 31.4 },
-                          { timesteps: 3072, mean_reward: 42.6 },
-                          { timesteps: 4096, mean_reward: 52.3 },
-                        ]
-                  }
-                  margin={{ top: 5, right: 10, left: -20, bottom: 0 }}
-                >
-                  <defs>
-                    <linearGradient id="curveGrad" x1="0" y1="0" x2="0" y2="1">
-                      <stop offset="5%" stopColor="#10b981" stopOpacity={0.4} />
-                      <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
-                    </linearGradient>
-                  </defs>
-                  <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
-                  <XAxis dataKey="timesteps" stroke="#71717a" fontSize={10} />
-                  <YAxis stroke="#71717a" fontSize={10} />
-                  <Tooltip
-                    contentStyle={{ backgroundColor: '#18181b', borderColor: '#27272a', fontSize: '11px' }}
-                    labelStyle={{ color: '#a1a1aa' }}
+                <div className="aspect-video w-full rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative">
+                  <img
+                    src={
+                      runResult?.render_diff?.overlay_url
+                        ? `${API_BASE}${runResult.render_diff.overlay_url}`
+                        : `${API_BASE}/outputs/${selectedSceneId}/diff_overlay.png`
+                    }
+                    alt="Render Diff Overlay"
+                    className="w-full h-full object-cover"
+                    onError={(e) => {
+                      (e.target as HTMLImageElement).src =
+                        'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="640" height="480" viewBox="0 0 640 480"><rect width="640" height="480" fill="%2318181b"/><text x="50%" y="50%" font-size="14" fill="%2371717a" text-anchor="middle" dominant-baseline="middle">Render+Diff Green/Red Composite</text></svg>';
+                    }}
                   />
-                  <Area type="monotone" dataKey="mean_reward" stroke="#10b981" fillOpacity={1} fill="url(#curveGrad)" />
-                </AreaChart>
-              </ResponsiveContainer>
-            </div>
-          </div>
-        </section>
-      </main>
+                  <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 backdrop-blur text-[10px] font-mono text-zinc-300 flex items-center gap-2">
+                    <span className="h-2 w-2 rounded-full bg-emerald-500 inline-block" /> Overlap
+                    <span className="h-2 w-2 rounded-full bg-red-500 inline-block ml-1" /> Mismatch
+                  </div>
+                </div>
+              </div>
+
+              {/* 3D Lifting Telemetry */}
+              <div className="p-3.5 rounded-xl bg-zinc-900/60 border border-zinc-800 text-xs space-y-2">
+                <span className="font-semibold text-zinc-300 flex items-center gap-1.5">
+                  <Cpu className="h-3.5 w-3.5 text-violet-400" />
+                  Stage 2: 3D Lift Metric Invariants
+                </span>
+                <div className="grid grid-cols-2 gap-2 text-[11px] font-mono text-zinc-400">
+                  <div>
+                    Table Height: <span className="text-zinc-200">z = 0.000m</span>
+                  </div>
+                  <div>
+                    Grounding: <span className="text-emerald-400">z + h/2 + 0.001m</span>
+                  </div>
+                  <div>
+                    Plane Normal: <span className="text-zinc-200">[0, 0, 1]</span>
+                  </div>
+                  <div>
+                    Integrator: <span className="text-violet-300">implicitfast</span>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            {/* ── Center Pane: Tabbed Inspector & Live Reasoning (4 Cols) ─ */}
+            <section className="lg:col-span-4 p-5 flex flex-col bg-zinc-950">
+              <div className="flex items-center justify-between border-b border-zinc-800 pb-2 mb-3">
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => setActiveTab('reasoning')}
+                    className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
+                      activeTab === 'reasoning'
+                        ? 'bg-violet-950 text-violet-300 border border-violet-800/80'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    Spark Reasoning
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('scenegraph')}
+                    className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
+                      activeTab === 'scenegraph'
+                        ? 'bg-emerald-950 text-emerald-300 border border-emerald-800/80'
+                        : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    SceneGraph
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('mjcf')}
+                    className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer ${
+                      activeTab === 'mjcf' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    MJCF XML
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('reward')}
+                    className={`px-2.5 py-1 text-xs rounded-md font-medium transition-colors cursor-pointer relative ${
+                      activeTab === 'reward' ? 'bg-zinc-800 text-white' : 'text-zinc-400 hover:text-zinc-200'
+                    }`}
+                  >
+                    Reward Code
+                    {repairDiff && (
+                      <span className="absolute -top-1 -right-1 h-2 w-2 rounded-full bg-amber-400 animate-pulse" />
+                    )}
+                  </button>
+                </div>
+
+                <button
+                  onClick={() => {
+                    const text =
+                      activeTab === 'reasoning'
+                        ? liveReasoning
+                        : activeTab === 'scenegraph'
+                        ? JSON.stringify(runResult?.scene_graph, null, 2)
+                        : activeTab === 'mjcf'
+                        ? runResult?.mjcf_xml || ''
+                        : repairDiff
+                        ? `${repairDiff}\n\n${runResult?.reward_code || ''}`
+                        : runResult?.reward_code || '';
+                    handleCopy(text);
+                  }}
+                  className="p-1 rounded text-zinc-400 hover:text-white cursor-pointer transition-colors"
+                  title="Copy to clipboard"
+                >
+                  {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
+                </button>
+              </div>
+
+              <div className="flex-1 rounded-xl bg-zinc-900 border border-zinc-800 p-3 font-mono text-[11px] overflow-y-auto max-h-[560px] leading-relaxed">
+                {activeTab === 'reasoning' && (
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-violet-400 text-xs font-semibold mb-2">
+                      <Terminal className="h-3.5 w-3.5" />
+                      meta-models/muse-spark-open-1026 Reasoning Stream:
+                    </div>
+                    {liveReasoning ? (
+                      <p className="whitespace-pre-wrap text-zinc-300">{liveReasoning}</p>
+                    ) : (
+                      <p className="text-zinc-600 italic">
+                        Reasoning stream idle. Click &quot;Forge &amp; Validate Environment&quot; to stream
+                        reasoning tokens live from Baseten.
+                      </p>
+                    )}
+                    <div ref={reasoningEndRef} />
+                  </div>
+                )}
+
+                {activeTab === 'scenegraph' && (
+                  <pre className="text-emerald-300 whitespace-pre-wrap">
+                    {runResult?.scene_graph
+                      ? JSON.stringify(runResult.scene_graph, null, 2)
+                      : '// Pydantic V2 SceneGraph will appear here after Stage 4'}
+                  </pre>
+                )}
+
+                {activeTab === 'mjcf' && (
+                  <pre className="text-cyan-300 whitespace-pre-wrap">
+                    {runResult?.mjcf_xml
+                      ? runResult.mjcf_xml
+                      : '<!-- MuJoCo 3.17 MJCF XML will compile here in Stage 5 -->'}
+                  </pre>
+                )}
+
+                {activeTab === 'reward' && (
+                  <div className="space-y-3">
+                    {repairDiff && (
+                      <div className="p-2.5 rounded-lg bg-amber-950/60 border border-amber-600/70 shadow-sm">
+                        <div className="text-amber-300 text-xs font-semibold flex items-center gap-1.5 mb-1.5">
+                          <RefreshCw className="h-3.5 w-3.5 text-amber-400 animate-spin" />
+                          Muse Spark Automated Self-Healing Patch Diff:
+                        </div>
+                        <pre className="text-emerald-300 whitespace-pre-wrap font-mono text-[10.5px]">
+                          {repairDiff}
+                        </pre>
+                      </div>
+                    )}
+                    <pre className="text-amber-300 whitespace-pre-wrap font-mono text-[11px]">
+                      {runResult?.reward_code
+                        ? runResult.reward_code
+                        : '# Dense multi-stage reward function synthesized in Stage 6'}
+                    </pre>
+                  </div>
+                )}
+              </div>
+            </section>
+
+            {/* ── Right Pane: Validation Gates 1–5 & RL Rollout (4 Cols) ─ */}
+            <section className="lg:col-span-4 p-5 space-y-5 overflow-y-auto bg-zinc-950/50">
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                    <Video className="h-4 w-4 text-emerald-400" />
+                    MuJoCo 3.17 Physics Rollout
+                  </h2>
+                  {/* Video View Mode Selector */}
+                  <div className="flex items-center rounded-lg bg-zinc-900 border border-zinc-800 p-0.5 text-[10px] font-mono">
+                    <button
+                      onClick={() => setVideoMode('ppo')}
+                      className={`px-2 py-0.5 rounded transition-colors cursor-pointer ${
+                        videoMode === 'ppo'
+                          ? 'bg-emerald-600 text-white font-bold'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                      title="4.0s PPO Policy Rollout"
+                    >
+                      PPO Policy
+                    </button>
+                    <button
+                      onClick={() => setVideoMode('oracle')}
+                      className={`px-2 py-0.5 rounded transition-colors cursor-pointer ${
+                        videoMode === 'oracle'
+                          ? 'bg-cyan-600 text-white font-bold'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                      title="4.0s Waypoint Oracle Baseline"
+                    >
+                      Oracle Baseline
+                    </button>
+                    <button
+                      onClick={() => setVideoMode('raw')}
+                      className={`px-2 py-0.5 rounded transition-colors cursor-pointer ${
+                        videoMode === 'raw'
+                          ? 'bg-violet-600 text-white font-bold'
+                          : 'text-zinc-400 hover:text-zinc-200'
+                      }`}
+                      title="Perception Frame 0 Overlay"
+                    >
+                      Perception
+                    </button>
+                  </div>
+                </div>
+
+                <div className="aspect-video w-full rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative shadow-lg">
+                  {videoMode === 'raw' ? (
+                    <img
+                      src={
+                        runResult?.render_diff?.masks_url
+                          ? `${API_BASE}${runResult.render_diff.masks_url}`
+                          : `${API_BASE}/outputs/${selectedSceneId}/frame0_masks.png`
+                      }
+                      alt="Perception Frame 0"
+                      className="w-full h-full object-cover"
+                    />
+                  ) : (
+                    <video
+                      key={`${videoMode}-${selectedSceneId}-${runResult?.ppo_results?.video_url}`}
+                      src={
+                        videoMode === 'oracle'
+                          ? runResult?.ppo_results?.oracle_video_url
+                            ? `${API_BASE}${runResult.ppo_results.oracle_video_url}`
+                            : `${API_BASE}/outputs/${selectedSceneId}/oracle_rollout.mp4`
+                          : runResult?.ppo_results?.video_url
+                          ? `${API_BASE}${runResult.ppo_results.video_url}`
+                          : `${API_BASE}/outputs/${selectedSceneId}/rollout.mp4`
+                      }
+                      controls
+                      autoPlay
+                      loop
+                      muted
+                      className="w-full h-full object-cover"
+                    />
+                  )}
+                  <div className="absolute bottom-2 left-2 px-2 py-0.5 rounded bg-black/70 backdrop-blur text-[10px] font-mono text-zinc-300">
+                    {videoMode === 'oracle'
+                      ? '🎯 Pure Waypoint Oracle (4.0s @ 30 FPS)'
+                      : videoMode === 'raw'
+                      ? '👁️ SAM 3.1 4px Boundary Perception'
+                      : '⚡ Residual PPO Policy (4.0s @ 30 FPS)'}
+                  </div>
+                </div>
+              </div>
+
+              {/* Validation Gates 1–5 Checklist */}
+              <div className="space-y-1.5">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-zinc-400 mb-2">
+                  5-Gate Validation Pipeline Telemetry
+                </h3>
+                {[
+                  { num: 1, name: 'Numerical Stability', desc: '1,000 Steps · Zero NaNs · |qacc| < 1e6' },
+                  { num: 2, name: 'Static Equilibrium', desc: '250 Steps · Resting Drift < 2mm' },
+                  { num: 3, name: 'Reward Variance', desc: 'σ > 1e-4 · Non-Degenerate Reward' },
+                  { num: 4, name: 'Waypoint Oracle', desc: 'Closed-Loop Success Nominal' },
+                  { num: 5, name: 'PPO Convergence', desc: 'Eval Mean Beats Random Baseline' },
+                ].map((g) => {
+                  const gateInfo = liveGateResults[String(g.num)] ?? runResult?.gate_results?.[String(g.num)];
+                  const isPassed = gateInfo?.passed ?? true;
+                  const isFailed = gateInfo?.passed === false;
+
+                  return (
+                    <div
+                      key={g.num}
+                      className={`px-3 py-2 rounded-lg border transition-all text-xs flex items-center justify-between ${
+                        isFailed
+                          ? 'bg-red-950/60 border-red-700/80 text-red-200 ring-1 ring-red-500/40'
+                          : 'bg-zinc-900/80 border-zinc-800/80'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2">
+                        {isFailed ? (
+                          <AlertTriangle className="h-4 w-4 text-red-400 shrink-0 animate-pulse" />
+                        ) : (
+                          <CheckCircle2 className="h-4 w-4 text-emerald-400 shrink-0" />
+                        )}
+                        <div>
+                          <span className={`font-semibold ${isFailed ? 'text-red-300' : 'text-zinc-200'}`}>
+                            Gate {g.num}: {g.name}
+                          </span>
+                          <p className="text-[10px] text-zinc-400 font-mono">
+                            {isFailed && gateInfo?.reason ? gateInfo.reason : g.desc}
+                          </p>
+                        </div>
+                      </div>
+                      <span
+                        className={`font-mono text-[10px] px-1.5 py-0.5 rounded border font-semibold ${
+                          isFailed
+                            ? 'bg-red-900/60 text-red-300 border-red-700/80 animate-pulse'
+                            : 'bg-emerald-950/60 text-emerald-400 border-emerald-800/40'
+                        }`}
+                      >
+                        {isFailed ? 'FAILED' : 'NOMINAL'}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+
+              {/* Interactive Recharts Learning Curve */}
+              <div className="p-3 rounded-xl bg-zinc-900 border border-zinc-800">
+                <div className="flex items-center justify-between text-xs mb-2">
+                  <span className="font-semibold text-zinc-300">PPO Learning Curve (Timesteps vs Return)</span>
+                  <span className="text-[10px] font-mono text-emerald-400">
+                    Mean: +{runResult ? runResult.ppo_results.eval_mean_return.toFixed(1) : '48.2'}
+                  </span>
+                </div>
+                <div className="h-32 w-full">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <AreaChart
+                      data={
+                        runResult?.ppo_results?.learning_curve?.length
+                          ? runResult.ppo_results.learning_curve
+                          : [
+                              { timesteps: 0, mean_reward: 2.1 },
+                              { timesteps: 1024, mean_reward: 14.8 },
+                              { timesteps: 2048, mean_reward: 31.4 },
+                              { timesteps: 3072, mean_reward: 42.6 },
+                              { timesteps: 4096, mean_reward: 52.3 },
+                            ]
+                      }
+                      margin={{ top: 5, right: 10, left: -20, bottom: 0 }}
+                    >
+                      <defs>
+                        <linearGradient id="curveGrad" x1="0" y1="0" x2="0" y2="1">
+                          <stop offset="5%" stopColor="#10b981" stopOpacity={0.4} />
+                          <stop offset="95%" stopColor="#10b981" stopOpacity={0.0} />
+                        </linearGradient>
+                      </defs>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#27272a" />
+                      <XAxis dataKey="timesteps" stroke="#71717a" fontSize={10} />
+                      <YAxis stroke="#71717a" fontSize={10} />
+                      <Tooltip
+                        contentStyle={{
+                          backgroundColor: '#18181b',
+                          borderColor: '#27272a',
+                          fontSize: '11px',
+                        }}
+                        labelStyle={{ color: '#a1a1aa' }}
+                      />
+                      <Area
+                        type="monotone"
+                        dataKey="mean_reward"
+                        stroke="#10b981"
+                        fillOpacity={1}
+                        fill="url(#curveGrad)"
+                      />
+                    </AreaChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            </section>
+          </main>
+        </>
+      )}
     </div>
   );
 }
