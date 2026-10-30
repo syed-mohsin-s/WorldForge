@@ -10,26 +10,28 @@ Provides REST and Server-Sent Event (SSE) endpoints for:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import shutil
 import threading
+import zipfile
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-import src.compat  # noqa: F401
 import mujoco
 import numpy as np
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.generated_reward import compute_reward
+from src.compiler.mjcf_builder import SceneCompiler
 from src.pipeline import OUTPUTS_ROOT, SCENES_DIR, run_worldforge_pipeline, stream_worldforge_pipeline
 from src.schema.scene_graph import SceneGraph
 from src.validation.ppo_runner import OracleController
@@ -413,6 +415,8 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             inject_fault=req.inject_fault,
             provider=req.provider,
             quick_ppo=req.quick_ppo,
+            video_path=req.video_path,
+            task_prompt=req.task_prompt,
         )
         return result
     except Exception as exc:
@@ -426,6 +430,8 @@ def stream_pipeline_get(
     inject_fault: bool = Query(False),
     provider: str = Query("auto"),
     quick_ppo: bool = Query(True),
+    task_prompt: str | None = Query(None),
+    video_path: str | None = Query(None),
 ):
     """Stream the 8-stage pipeline as Server-Sent Events (SSE)."""
     return StreamingResponse(
@@ -434,6 +440,8 @@ def stream_pipeline_get(
             inject_fault=inject_fault,
             provider=provider,
             quick_ppo=quick_ppo,
+            video_path=video_path,
+            task_prompt=task_prompt,
         ),
         media_type="text/event-stream",
         headers={
@@ -453,12 +461,70 @@ def stream_pipeline_post(req: RunRequest):
             inject_fault=req.inject_fault,
             provider=req.provider,
             quick_ppo=req.quick_ppo,
+            video_path=req.video_path,
+            task_prompt=req.task_prompt,
         ),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/export/{scene_id}")
+def export_gym_package(scene_id: str) -> Response:
+    """Export a self-contained Gymnasium + MuJoCo 3.17 environment ZIP package."""
+    clean_id = scene_id.replace(".json", "")
+    sg = _load_scene_graph(clean_id)
+    out_dir = OUTPUTS_ROOT / clean_id
+
+    mjcf_path = out_dir / "environment.xml"
+    if mjcf_path.exists():
+        mjcf_xml = mjcf_path.read_text(encoding="utf-8")
+    else:
+        mjcf_xml = SceneCompiler(sg).compile()
+
+    reward_src_path = Path(__file__).resolve().parents[1] / "compiler" / "generated_reward.py"
+    reward_code = reward_src_path.read_text(encoding="utf-8") if reward_src_path.exists() else ""
+
+    standalone_runner = f'''"""Standalone WorldForge-RL Gymnasium Environment Runner ({sg.scene_id})."""
+import json
+from pathlib import Path
+import mujoco
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+MODEL = mujoco.MjModel.from_xml_path(str(HERE / "environment.xml"))
+DATA = mujoco.MjData(MODEL)
+
+if __name__ == "__main__":
+    mujoco.mj_resetData(MODEL, DATA)
+    for step in range(250):
+        mujoco.mj_step(MODEL, DATA)
+    print(f"Successfully simulated 250 steps of {sg.scene_id} in MuJoCo {{mujoco.__version__}}!")
+'''
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{clean_id}/environment.xml", mjcf_xml)
+        zf.writestr(f"{clean_id}/scene_graph.json", json.dumps(sg.model_dump(), indent=2))
+        zf.writestr(f"{clean_id}/reward_code.py", reward_code)
+        zf.writestr(f"{clean_id}/run_standalone.py", standalone_runner)
+        if (out_dir / "frame0_masks.png").exists():
+            zf.write(out_dir / "frame0_masks.png", arcname=f"{clean_id}/frame0_masks.png")
+        if (out_dir / "diff_overlay.png").exists():
+            zf.write(out_dir / "diff_overlay.png", arcname=f"{clean_id}/diff_overlay.png")
+        if (out_dir / "rollout.mp4").exists():
+            zf.write(out_dir / "rollout.mp4", arcname=f"{clean_id}/rollout.mp4")
+
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="worldforge_{clean_id}_gym_pkg.zip"'
         },
     )
 
@@ -477,6 +543,7 @@ async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
     return {
         "status": "success",
         "filename": safe_name,
+        "video_path": str(dest_path),
         "video_url": f"/outputs/uploads/{safe_name}",
         "size_bytes": dest_path.stat().st_size,
     }

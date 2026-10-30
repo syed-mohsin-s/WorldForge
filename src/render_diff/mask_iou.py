@@ -65,6 +65,46 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return float(intersection / union)
 
 
+@dataclass
+class SceneIoUReport:
+    """Per-scene mask IoU report."""
+
+    per_object_iou: dict[str, float]
+    mean_iou: float
+    passed: bool
+
+
+def compute_scene_mask_iou(
+    ref_masks: dict[str, np.ndarray],
+    sim_masks: dict[str, np.ndarray],
+    threshold: float = 0.60,
+) -> SceneIoUReport:
+    """Compute per-object and mean Mask IoU between reference and simulated masks."""
+    per_object: dict[str, float] = {}
+    all_keys = set(ref_masks.keys()) | set(sim_masks.keys())
+
+    if not all_keys:
+        return SceneIoUReport(per_object_iou={}, mean_iou=1.0, passed=True)
+
+    for k in all_keys:
+        ref_m = ref_masks.get(k)
+        sim_m = sim_masks.get(k)
+        if ref_m is None or sim_m is None:
+            per_object[k] = 0.0
+        else:
+            per_object[k] = compute_mask_iou(ref_m, sim_m)
+
+    mean_iou = float(np.mean(list(per_object.values()))) if per_object else 1.0
+    passed = mean_iou >= threshold
+
+    return SceneIoUReport(
+        per_object_iou=per_object,
+        mean_iou=mean_iou,
+        passed=passed,
+    )
+
+
+
 # ---------------------------------------------------------------------------
 # Evaluate & Align Pipeline
 # ---------------------------------------------------------------------------
