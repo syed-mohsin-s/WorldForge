@@ -1,0 +1,31 @@
+# Git and IDE
+.git
+.gitignore
+.antigravity
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Python
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+htmlcov
+
+# Node / Frontend
+node_modules
+frontend/node_modules
+frontend/dist
+
+# Local outputs / secrets
+.env
+outputs/uploads/*
+!outputs/scene1_pick_place
+!outputs/scene2_push_obstacle
+!outputs/scene3_articulated_drawer

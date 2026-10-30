@@ -469,6 +469,14 @@ async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
     }
 
 
+# ---------------------------------------------------------------------------
+# Static Frontend Serving (Container / Production Mode)
+# ---------------------------------------------------------------------------
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+if FRONTEND_DIST.exists():
+    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("src.api.server:app", host="0.0.0.0", port=8000, reload=True)

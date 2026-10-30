@@ -17,7 +17,12 @@
  * --------------------------------------------------------------------------
  */
 
-export const API_BASE = "http://localhost:8000";
+export const API_BASE =
+  import.meta.env.VITE_API_BASE !== undefined
+    ? import.meta.env.VITE_API_BASE
+    : typeof window !== "undefined" && window.location.port !== "5173"
+      ? ""
+      : "http://localhost:8000";
 
 export interface CameraSpec {
   pos: [number, number, number];
