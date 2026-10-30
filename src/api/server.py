@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import shutil
+import threading
 from pathlib import Path
 from typing import Any, Literal
 
@@ -24,6 +25,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+import src.compat  # noqa: F401
 import mujoco
 import numpy as np
 from src.compiler.base_env import WorldForgeEnv
@@ -41,7 +43,6 @@ app = FastAPI(
     description="Studio-Grade MuJoCo 3.17 + Baseten / Meta RL Environment Synthesis API",
 )
 
-# Enable CORS for frontend UI running on any port (e.g. 5173, 3000, 8080)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,7 +51,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount outputs directory for static files (rollout.mp4, frame0_masks.png, diff_overlay.png)
 OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_ROOT)), name="outputs")
 
@@ -84,7 +84,9 @@ class RunRequest(BaseModel):
     scene_id: str = Field(default="scene1_pick_place", description="Golden scene ID or custom scene")
     inject_fault: bool = Field(default=False, description="Whether to inject Gate 3 zero-reward fault to demo self-healing")
     provider: Literal["auto", "baseten", "meta", "local"] = Field(default="auto", description="LLM provider")
-    quick_ppo: bool = Field(default=True, description="Use 4096 timesteps for rapid interactive training")
+    quick_ppo: bool = Field(default=True, description="Use rapid interactive training horizon")
+    task_prompt: str | None = Field(default=None, description="Optional custom natural-language manipulation prompt")
+    video_path: str | None = Field(default=None, description="Optional uploaded tabletop MP4 path")
 
 
 class SimActionRequest(BaseModel):
@@ -101,7 +103,6 @@ class SimResetRequest(BaseModel):
     scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
 
 
-# Active in-memory simulation sessions per scene
 active_sim_sessions: dict[str, dict[str, Any]] = {}
 
 
@@ -306,17 +307,26 @@ def sim_reset(req: SimResetRequest) -> dict[str, Any]:
     """Reset the live MuJoCo 3.17 simulation environment and return ground-truth state."""
     clean_id = req.scene_id.replace(".json", "")
     sg = _load_scene_graph(clean_id)
-    env = WorldForgeEnv(sg)
-    env.reset(seed=42)
-    ctrl = OracleController(sg.task.waypoints)
-    active_sim_sessions[clean_id] = {
-        "env": env,
-        "sg": sg,
-        "ctrl": ctrl,
-        "step": 0,
-        "grip_cmd": 1.0,
-    }
-    return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
+    prev = active_sim_sessions.get(clean_id)
+    lock = prev["lock"] if (prev and "lock" in prev) else threading.Lock()
+    with lock:
+        if prev and "env" in prev:
+            try:
+                prev["env"].close()
+            except Exception:
+                pass
+        env = WorldForgeEnv(sg)
+        env.reset(seed=42)
+        ctrl = OracleController(sg.task.waypoints)
+        active_sim_sessions[clean_id] = {
+            "env": env,
+            "sg": sg,
+            "ctrl": ctrl,
+            "step": 0,
+            "grip_cmd": 1.0,
+            "lock": lock,
+        }
+        return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
 
 
 @app.post("/api/sim/step")
@@ -327,15 +337,16 @@ def sim_step(req: SimActionRequest) -> dict[str, Any]:
         sim_reset(SimResetRequest(scene_id=clean_id))
 
     session = active_sim_sessions[clean_id]
-    env: WorldForgeEnv = session["env"]
-    sg: SceneGraph = session["sg"]
+    with session["lock"]:
+        env: WorldForgeEnv = session["env"]
+        sg: SceneGraph = session["sg"]
 
-    action_arr = np.array(req.action, dtype=np.float32)
-    obs, r, term, trunc, info = env.step(action_arr)
-    session["step"] += 1
-    session["grip_cmd"] = float(req.action[3])
+        action_arr = np.array(req.action, dtype=np.float32)
+        obs, r, term, trunc, info = env.step(action_arr)
+        session["step"] += 1
+        session["grip_cmd"] = float(req.action[3])
 
-    return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
+        return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
 
 
 @app.post("/api/sim/oracle-step")
@@ -346,16 +357,17 @@ def sim_oracle_step(req: SimResetRequest) -> dict[str, Any]:
         sim_reset(SimResetRequest(scene_id=clean_id))
 
     session = active_sim_sessions[clean_id]
-    env: WorldForgeEnv = session["env"]
-    sg: SceneGraph = session["sg"]
-    ctrl: OracleController = session["ctrl"]
+    with session["lock"]:
+        env: WorldForgeEnv = session["env"]
+        sg: SceneGraph = session["sg"]
+        ctrl: OracleController = session["ctrl"]
 
-    action = ctrl.get_action(env)
-    obs, r, term, trunc, info = env.step(action)
-    session["step"] += 1
-    session["grip_cmd"] = float(action[3])
+        action = ctrl.get_action(env)
+        obs, r, term, trunc, info = env.step(action)
+        session["step"] += 1
+        session["grip_cmd"] = float(action[3])
 
-    return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
+        return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
 
 
 @app.get("/api/sim/trajectory")
@@ -457,24 +469,17 @@ async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
     uploads_dir = OUTPUTS_ROOT / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    dest_path = uploads_dir / file.filename
+    safe_name = Path(file.filename or "uploaded_tabletop.mp4").name
+    dest_path = uploads_dir / safe_name
     with open(dest_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     return {
         "status": "success",
-        "filename": file.filename,
-        "video_url": f"/outputs/uploads/{file.filename}",
+        "filename": safe_name,
+        "video_url": f"/outputs/uploads/{safe_name}",
         "size_bytes": dest_path.stat().st_size,
     }
-
-
-# ---------------------------------------------------------------------------
-# Static Frontend Serving (Container / Production Mode)
-# ---------------------------------------------------------------------------
-FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-if FRONTEND_DIST.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="frontend")
 
 
 if __name__ == "__main__":

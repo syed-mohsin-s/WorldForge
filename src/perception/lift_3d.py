@@ -208,27 +208,7 @@ def lift_scene_to_3d(
     mode: Literal["depth_ransac", "vlm_fallback"] = "depth_ransac",
     scene_id: str = "lifted_scene",
 ) -> LiftedSceneGeometry:
-    """Lift 2D tracks and depth into full metric 3D scene geometry.
-
-    Parameters
-    ----------
-    tracking_result:
-        SAM 3.1 tracking output across video frames.
-    camera:
-        Estimated or calibrated pinhole camera spec.
-    frame0_depth:
-        Float depth map (meters) for Frame 0. Required if mode="depth_ransac".
-    frame0_rgb:
-        RGB image for Frame 0 (used for VLM visualization fallback).
-    mode:
-        "depth_ransac" for metric depth lifting, or "vlm_fallback".
-    scene_id:
-        Identifier string for the scene.
-
-    Returns
-    -------
-    LiftedSceneGeometry
-    """
+    """Lift 2D tracks and depth into full metric 3D scene geometry."""
     if mode == "vlm_fallback" or frame0_depth is None:
         return _lift_scene_vlm_fallback(
             tracking_result, camera, frame0_rgb, scene_id
@@ -321,7 +301,6 @@ def lift_scene_to_3d(
         traj_3d: list[tuple[float, float, float]] = []
         z_plane = cz_3d
         for c2d in track.centroids_2d:
-            # Ray direction in OpenGL camera frame
             ray_cam = np.array([
                 (c2d[0] - cam_cx) / fx,
                 -(c2d[1] - cam_cy) / fy,
@@ -332,7 +311,6 @@ def lift_scene_to_3d(
             if ray_norm > 1e-6:
                 ray_world = ray_world / ray_norm
 
-            # Intersect ray with horizontal plane at z = z_plane
             if abs(ray_world[2]) > 1e-4:
                 s = (z_plane - t_cam[2]) / ray_world[2]
                 pt3d = t_cam + s * ray_world
@@ -354,7 +332,6 @@ def lift_scene_to_3d(
         elif "handle" in track.label.lower():
             joint_type = "fixed"
         elif total_displacement > 0.02:
-            # SVD linear axis fit
             Pc = P - np.mean(P, axis=0)
             _, S, Vt = np.linalg.svd(Pc)
             axis = Vt[0]
@@ -364,7 +341,6 @@ def lift_scene_to_3d(
             collinearity = S[1] / max(S[0], 1e-6) if len(S) > 1 else 0.0
 
             if collinearity < 0.35:
-                # High collinearity -> slide joint or linear push
                 if "drawer" in track.label.lower() or "slide" in track.label.lower():
                     joint_type = "slide"
                     joint_axis = (float(axis[0]), float(axis[1]), float(axis[2]))
@@ -372,14 +348,12 @@ def lift_scene_to_3d(
                 else:
                     joint_type = "free"
             else:
-                # Curved motion -> hinge joint
                 joint_type = "hinge"
                 normal = np.cross(Vt[0], Vt[1])
                 normal = normal / max(np.linalg.norm(normal), 1e-6)
                 joint_axis = (float(normal[0]), float(normal[1]), float(normal[2]))
                 joint_range = (0.0, math.pi / 2.0)
         else:
-            # Static or unmoved
             if "drawer" in track.label.lower() or "door" in track.label.lower():
                 joint_type = "slide"
                 joint_axis = (0.0, -1.0, 0.0)
@@ -404,7 +378,6 @@ def lift_scene_to_3d(
             )
         )
 
-    # Establish parent-child hierarchies (e.g. handle -> drawer -> cabinet)
     _infer_hierarchies(lifted_objects)
 
     return LiftedSceneGeometry(
@@ -420,28 +393,58 @@ def lift_scene_to_3d(
 # ---------------------------------------------------------------------------
 
 def _infer_hierarchies(objects: list[LiftedObject]) -> None:
-    """Infer articulated parent-child relationships from spatial nesting & labels."""
+    """Infer articulated parent-child relationships and relative transforms geometrically."""
     cabinet = next((o for o in objects if "cabinet" in o.label.lower() or "base" in o.label.lower()), None)
     drawer = next((o for o in objects if "drawer" in o.label.lower() and "handle" not in o.label.lower()), None)
     handle = next((o for o in objects if "handle" in o.label.lower()), None)
 
     if cabinet and drawer:
-        # Align cabinet and drawer dimensions:
-        # Cabinet is the structural enclosure containing the slide drawer
         cabinet.is_static = True
         cabinet.joint_type = "fixed"
         cabinet.parent_id = None
-        cabinet.position = (0.0, 0.0, 0.081)
-        cabinet.size = [0.12, 0.1, 0.08]
+
+        cab_pos = np.array(cabinet.position, dtype=np.float64)
+        drw_pos = np.array(drawer.position, dtype=np.float64)
+        cab_size = np.array(cabinet.size, dtype=np.float64)
+        drw_size = np.array(drawer.size, dtype=np.float64)
+
+        min_xy = np.minimum(cab_pos[:2] - cab_size[:2], drw_pos[:2] - drw_size[:2])
+        max_xy = np.maximum(cab_pos[:2] + cab_size[:2], drw_pos[:2] + drw_size[:2])
+        enclosure_center_xy = (min_xy + max_xy) / 2.0
+        enclosure_half_xy = np.maximum((max_xy - min_xy) / 2.0, [0.12, 0.10])
+
+        if abs(enclosure_center_xy[0]) < 0.03 and abs(enclosure_center_xy[1]) < 0.04:
+            enclosure_center_xy = np.array([0.0, 0.0])
+
+        cabinet.size = [
+            round(float(enclosure_half_xy[0]), 4),
+            round(float(enclosure_half_xy[1]), 4),
+            round(max(float(cabinet.size[2]), 0.08), 4),
+        ]
+        cabinet.position = (
+            round(float(enclosure_center_xy[0]), 4),
+            round(float(enclosure_center_xy[1]), 4),
+            0.081,
+        )
 
         drawer.parent_id = cabinet.id
         drawer.is_static = False
         drawer.joint_type = "slide"
-        drawer.joint_axis = (0.0, -1.0, 0.0)
+        if np.linalg.norm(drawer.joint_axis) < 1e-4 or drawer.joint_axis == (0.0, 0.0, 1.0):
+            drawer.joint_axis = (0.0, -1.0, 0.0)
         drawer.joint_range = (0.0, 0.12)
         drawer.primitive = "box"
-        drawer.size = [0.10, 0.005, 0.06]
-        drawer.position = (0.0, -0.105, 0.0)
+        drawer.size = [
+            round(float(cabinet.size[0]) * (0.10 / 0.12), 4),
+            0.005,
+            round(float(cabinet.size[2]) * (0.06 / 0.08), 4),
+        ]
+        rel_drw_y = -float(cabinet.size[1]) - float(drawer.size[1])
+        drawer.position = (
+            round(float(drw_pos[0] - cabinet.position[0]) if abs(drw_pos[0] - cabinet.position[0]) > 0.02 else 0.0, 4),
+            round(rel_drw_y, 4),
+            0.0,
+        )
     elif cabinet:
         cabinet.is_static = True
         cabinet.joint_type = "fixed"
@@ -454,7 +457,7 @@ def _infer_hierarchies(objects: list[LiftedObject]) -> None:
         handle.primitive = "cylinder"
         handle.quaternion = (0.7071068, 0.7071068, 0.0, 0.0)
         handle.size = [0.008, 0.03]
-        handle.position = (0.0, -0.01, 0.0)
+        handle.position = (0.0, round(-float(drawer.size[1]) - 0.010, 4), 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -471,14 +474,12 @@ def _lift_scene_vlm_fallback(
     w, h = tracking_result.resolution
     canvas = frame0_rgb.copy() if frame0_rgb is not None else np.zeros((h, w, 3), dtype=np.uint8)
 
-    # Draw metric reference grid (A4 paper scale reference: 210mm x 297mm)
-    grid_size = 50  # 50px grid
+    grid_size = 50
     for x in range(0, w, grid_size):
         cv2.line(canvas, (x, 0), (x, h), (70, 70, 70), 1)
     for y in range(0, h, grid_size):
         cv2.line(canvas, (0, y), (w, y), (70, 70, 70), 1)
 
-    # Overlay A4 sheet watermark in corner
     cv2.putText(
         canvas,
         "Scale Ref: A4 Sheet (210mm x 297mm)",
@@ -497,16 +498,13 @@ def _lift_scene_vlm_fallback(
         color = colors[idx % len(colors)]
         xmin, ymin, xmax, ymax = track.bbox_2d
 
-        # Draw bbox
         cv2.rectangle(canvas, (xmin, ymin), (xmax, ymax), color, 2)
 
-        # Draw mask contour
         contours, _ = cv2.findContours(
             track.frame0_mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         cv2.drawContours(canvas, contours, -1, color, 1)
 
-        # Draw label
         cv2.putText(
             canvas,
             f"{track.object_id}: {track.label}",
@@ -518,7 +516,6 @@ def _lift_scene_vlm_fallback(
             cv2.LINE_AA,
         )
 
-        # Estimated default positions
         lifted_objects.append(
             LiftedObject(
                 id=track.object_id,

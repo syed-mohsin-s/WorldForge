@@ -135,29 +135,7 @@ def train_and_evaluate_ppo(
     eval_steps: int = 120,
     render_stride: int = 2,
 ) -> PPOResult:
-    """Train PPO on a WorldForge scene and evaluate.
-
-    Parameters
-    ----------
-    scene:
-        The scene graph to train on.
-    total_timesteps:
-        Total environment steps for PPO training.
-    n_envs:
-        Number of parallel envs in DummyVecEnv.
-    rollout_video_path:
-        If provided, record an MP4/GIF rollout here.
-    eval_episodes:
-        Number of evaluation episodes.
-    eval_steps:
-        Max steps per evaluation episode (defaults to 120 for a 4s video at 30 fps).
-
-    Returns
-    -------
-    PPOResult
-        Training and evaluation metrics.
-    """
-    # Lazy imports to keep module importable without SB3
+    """Train PPO on a WorldForge scene and evaluate."""
     import gymnasium as gym
     import torch
     torch.set_num_threads(2)
@@ -170,7 +148,7 @@ def train_and_evaluate_ppo(
         def _init():
             base_e = WorldForgeEnv(scene, render_mode=None)
             res_e = ResidualOracleEnv(base_e, scene.task.waypoints, residual_weight=0.15)
-            return gym.wrappers.TimeLimit(res_e, max_episode_steps=60)
+            return gym.wrappers.TimeLimit(res_e, max_episode_steps=eval_steps)
         return _init
 
     vec_env = DummyVecEnv([_make_env(i) for i in range(n_envs)])
@@ -245,10 +223,8 @@ def train_and_evaluate_ppo(
                 obs, reward, terminated, truncated, info = eval_env.step(action)
                 ep_return += reward
             elif ep == 0 and rollout_video_path:
-                # Settle physics with idle action to complete the 120-frame (4s) recording
                 eval_base_env.step(np.array([0.0, 0.0, 0.0, last_grip], dtype=np.float32))
 
-            # Record frames for video on first episode only (strided for 2x faster export)
             if ep == 0 and rollout_video_path and (step_i % render_stride == 0):
                 try:
                     frame = eval_base_env.render_camera()

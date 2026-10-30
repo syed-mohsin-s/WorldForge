@@ -9,7 +9,7 @@ Interfaces with:
 Features:
 - Live streaming reasoning traces (`reasoning_content` and `<think>...</think>`).
 - Strict material priors assignment from ``configs/materials.yaml``.
-- Joint hierarchy & oracle waypoint synthesis.
+- Joint hierarchy & oracle waypoint synthesis with schema-grounded JSON parsing.
 - Validated Pydantic V2 ``SceneGraph`` emission.
 - Accurate API token and compute tracking in ``CostTracker``.
 """
@@ -112,7 +112,7 @@ class MuseSparkReasoner:
         prompt: str | None,
         task_type: str | None,
     ) -> SceneGraph:
-        """Call Baseten's meta-models/muse-spark-open-1026 endpoint with live reasoning trace."""
+        """Call Baseten's meta-models/muse-spark-open-1026 endpoint with schema-grounded JSON."""
         from openai import OpenAI
 
         client = OpenAI(
@@ -120,26 +120,21 @@ class MuseSparkReasoner:
             api_key=self.baseten_api_key,
         )
 
-        objects_summary = [
-            {
-                "id": o.id,
-                "label": o.label,
-                "size": [round(s, 4) for s in o.size],
-                "position": [round(p, 4) for p in o.position],
-                "joint_type": o.joint_type,
-                "is_static": o.is_static,
-            }
-            for o in geometry.objects
-        ]
+        local_sg = self._synthesize_local(geometry, prompt, task_type)
+        baseline_json = local_sg.model_dump()
+        schema_json = SceneGraph.model_json_schema()
 
         user_content = (
             f"Scene ID: {geometry.scene_id}\n"
             f"Table height z_table: {geometry.table_z:.3f}m\n"
-            f"Task prompt: {prompt or 'Synthesize physical manipulation task'}\n"
-            f"Lifted 3D Objects:\n{json.dumps(objects_summary, indent=2)}\n\n"
-            f"Allowed materials: {self._materials}\n"
-            "Analyze the scene, infer physical materials, joint damping/hierarchy, and oracle keyframe waypoints. "
-            "Output your reasoning and final SceneGraph JSON."
+            f"Task prompt: {prompt or local_sg.task.description}\n"
+            f"Allowed materials: {self._materials}\n\n"
+            f"Initial Lifted SceneGraph Candidate:\n{json.dumps(baseline_json, indent=2)}\n\n"
+            f"Pydantic V2 SceneGraph JSON Schema:\n{json.dumps(schema_json)}\n\n"
+            "Instructions:\n"
+            "1. Reason step-by-step about object materials, masses/densities, joint damping, "
+            "parent-child kinematic chains, and collision-free 4-DoF oracle waypoints [x, y, z, grip_cmd].\n"
+            "2. Emit the final refined SceneGraph JSON strictly conforming to the schema above."
         )
 
         reasoning_acc: list[str] = []
@@ -152,13 +147,13 @@ class MuseSparkReasoner:
                     "role": "system",
                     "content": (
                         "You are Muse Spark, an expert robot manipulation and physical scene reasoning model. "
-                        "Analyze the lifted 3D tabletop scene geometry, infer materials, joint hierarchies, and "
-                        "synthesize a valid SceneGraph JSON with oracle waypoints."
+                        "Analyze the lifted 3D tabletop scene geometry, refine materials, joint hierarchies, and "
+                        "oracle waypoints, and return a schema-valid SceneGraph JSON."
                     ),
                 },
                 {"role": "user", "content": user_content},
             ],
-            max_tokens=1024,
+            max_tokens=1536,
             temperature=0.2,
             stream=True,
         )
@@ -178,7 +173,6 @@ class MuseSparkReasoner:
         full_reasoning = "".join(reasoning_acc)
         full_content = "".join(content_acc)
 
-        # Parse <think>...</think> if model placed reasoning in content
         if "<think>" in full_content and "</think>" in full_content:
             think_match = re.search(r"<think>(.*?)</think>", full_content, re.DOTALL)
             if think_match:
@@ -187,9 +181,8 @@ class MuseSparkReasoner:
                     full_reasoning = extracted_think
                 full_content = re.sub(r"<think>.*?</think>", "", full_content, flags=re.DOTALL).strip()
 
-        self.last_reasoning_trace = full_reasoning.strip()
+        self.last_reasoning_trace = full_reasoning.strip() or full_content.strip()
 
-        # Log tokens in CostTracker
         in_tokens = max(len(user_content) // 4, 300)
         out_tokens = max((len(full_reasoning) + len(full_content)) // 4, 150)
         self.cost_tracker.log_api_call(
@@ -199,18 +192,15 @@ class MuseSparkReasoner:
             purpose=f"baseten_reasoning_{geometry.scene_id}",
         )
 
-        # Build baseline deterministic scene graph and enrich it
-        local_sg = self._synthesize_local(geometry, prompt, task_type)
-
-        # Attempt to parse json from full_content
         try:
             json_start = full_content.find("{")
             json_end = full_content.rfind("}")
-            if json_start != -1 and json_end != -1:
-                parsed_data = json.loads(full_content[json_start : json_end + 1])
+            raw_json = full_content[json_start : json_end + 1] if (json_start != -1 and json_end != -1) else ""
+            if raw_json:
+                parsed_data = json.loads(raw_json)
                 return SceneGraph.model_validate(parsed_data)
-        except Exception:
-            pass
+        except Exception as parse_exc:
+            logger.debug("Direct SceneGraph parse fallback (%s); retaining geometrically grounded graph.", parse_exc)
 
         return local_sg
 
@@ -225,7 +215,6 @@ class MuseSparkReasoner:
         task_type: str | None,
     ) -> SceneGraph:
         """Deterministic rule-based synthesis for offline testing and fallback."""
-        # 1. Infer materials and build ObjectNodes
         object_nodes: list[ObjectNode] = []
         for obj in geom.objects:
             mat = self._infer_material(obj.label, obj.id)
@@ -251,7 +240,6 @@ class MuseSparkReasoner:
                 )
             )
 
-        # 2. Infer TaskSpec and Waypoints
         inferred_task_type = task_type or self._infer_task_type(geom, task_prompt)
         task_spec = self._synthesize_task_spec(geom, inferred_task_type, task_prompt)
 
@@ -264,7 +252,6 @@ class MuseSparkReasoner:
                 f"Synthesized {len(task_spec.waypoints)} oracle keyframes ensuring kinematic clearance and weld stability."
             )
 
-        # Log simulated local compute tokens
         self.cost_tracker.log_api_call(
             input_tokens=350,
             output_tokens=220,
