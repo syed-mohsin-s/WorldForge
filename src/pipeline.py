@@ -152,18 +152,13 @@ def run_worldforge_pipeline(
     """Execute the complete 8-stage WorldForge pipeline and return rich telemetry."""
     t_pipeline_start = time.time()
     cost_tracker = CostTracker(pricing_tier="contributor")
-    stages: list[StageEvent] = []
+    stage_timings: dict[str, float] = {}
 
-    def emit(event_type: str, payload: dict[str, Any]) -> None:
+    def emit(payload: dict[str, Any]) -> None:
         if on_event:
-            on_event({"event": event_type, "data": payload})
+            on_event(payload)
         if on_stage_event:
-            stage_val = payload.get("stage_num") or payload.get("stage")
-            flat = dict(payload)
-            flat["event"] = event_type
-            if stage_val is not None:
-                flat["stage"] = stage_val
-            on_stage_event(flat)
+            on_stage_event(payload)
 
     ref_sg, scene_path = _load_golden_scene(scene_id)
     if task_prompt and task_prompt.strip():
@@ -173,11 +168,9 @@ def run_worldforge_pipeline(
     out_dir = OUTPUTS_ROOT / clean_id
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    emit("pipeline_start", {"scene_id": ref_sg.scene_id, "file_id": clean_id, "inject_fault": inject_fault})
-
     # ── STAGE 1: SAM 3.1 Video Segmentation & Tracking ──────────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 1, "name": "SAM 3.1 Video Mask Tracking"})
+    emit({"stage": 1, "name": "SAM 3.1", "status": "running"})
 
     ref_env = WorldForgeEnv(ref_sg, render_mode="rgb_array")
     ref_env.reset(seed=42)
@@ -187,7 +180,6 @@ def run_worldforge_pipeline(
         tracker = SAM31Tracker(cost_tracker=cost_tracker)
         prompts = [o.label for o in ref_sg.objects]
         sam_result = tracker.track_video(video_path, text_prompts=prompts)
-        # Ensure frame0_depth is available for metric 3D lifting
         _, sim_depth_fallback = segment_from_sim_env(ref_env, ref_sg)
         if sam_result.frame0_depth is None:
             sam_result.frame0_depth = sim_depth_fallback
@@ -198,36 +190,15 @@ def run_worldforge_pipeline(
     ref_env.close()
 
     ref_masks = {t.object_id: t.frame0_mask for t in sam_result.tracks}
-    mask_img_path = _save_mask_Overlay(frame0_rgb, ref_masks, out_dir / "frame0_masks.png")
+    _save_mask_Overlay(frame0_rgb, ref_masks, out_dir / "frame0_masks.png")
 
-    s1_dur = time.time() - t0
-    s1 = StageEvent(
-        stage_num=1,
-        name="SAM 3.1 Video Mask Tracking",
-        status="passed",
-        duration_sec=round(s1_dur, 3),
-        summary=f"Segmented {len(sam_result.tracks)} objects across {sam_result.num_frames} frames with 4px boundary erosion.",
-        details={
-            "num_objects": len(sam_result.tracks),
-            "objects": [
-                {
-                    "id": t.object_id,
-                    "label": t.label,
-                    "bbox_2d": list(t.bbox_2d),
-                    "mask_pixels": int(np.sum(t.frame0_mask)),
-                    "eroded_pixels": int(np.sum(t.frame0_eroded_mask)),
-                }
-                for t in sam_result.tracks
-            ],
-            "mask_overlay_url": f"/outputs/{clean_id}/frame0_masks.png",
-        },
-    )
-    stages.append(s1)
-    emit("stage_complete", asdict(s1))
+    s1_dur = round(time.time() - t0, 3)
+    stage_timings["1"] = s1_dur
+    emit({"stage": 1, "name": "SAM 3.1", "status": "completed", "duration_s": s1_dur})
 
     # ── STAGE 2: 3D Metric Lifting (RANSAC + SVD) ──────────────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 2, "name": "3D Metric Lifting (RANSAC + SVD)"})
+    emit({"stage": 2, "name": "3D Lift", "status": "running"})
 
     lifted_geom = lift_scene_to_3d(
         tracking_result=sam_result,
@@ -238,37 +209,16 @@ def run_worldforge_pipeline(
         scene_id=ref_sg.scene_id,
     )
 
-    s2_dur = time.time() - t0
-    s2 = StageEvent(
-        stage_num=2,
-        name="3D Metric Lifting (RANSAC + SVD)",
-        status="passed",
-        duration_sec=round(s2_dur, 3),
-        summary=f"Fitted tabletop plane z={lifted_geom.table_z:.4f}m via RANSAC; lifted {len(lifted_geom.objects)} 3D primitives.",
-        details={
-            "table_z": round(lifted_geom.table_z, 4),
-            "lifted_objects": [
-                {
-                    "id": o.id,
-                    "primitive": o.primitive,
-                    "size": [round(x, 4) for x in o.size],
-                    "position": [round(x, 4) for x in o.position],
-                    "joint_type": o.joint_type,
-                    "parent_id": o.parent_id,
-                }
-                for o in lifted_geom.objects
-            ],
-        },
-    )
-    stages.append(s2)
-    emit("stage_complete", asdict(s2))
+    s2_dur = round(time.time() - t0, 3)
+    stage_timings["2"] = s2_dur
+    emit({"stage": 2, "name": "3D Lift", "status": "completed", "duration_s": s2_dur})
 
     # ── STAGE 3: Muse Spark Unified Reasoning ───────────────────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 3, "name": "Muse Spark Physical Reasoning"})
+    emit({"stage": 3, "name": "Muse Spark", "status": "running"})
 
     def _on_chunk(chunk_txt: str) -> None:
-        emit("reasoning_chunk", {"chunk": chunk_txt})
+        emit({"stage": 3, "status": "running", "chunk": chunk_txt})
 
     reasoner = MuseSparkReasoner(
         provider=provider,
@@ -283,98 +233,61 @@ def run_worldforge_pipeline(
     )
     reasoning_trace = reasoner.last_reasoning_trace
 
-    active_provider = (
-        f"Baseten ({os.environ.get('BASETEN_BASE_URL', 'inference.baseten.co')} · meta-models/muse-spark-open-1026)"
-        if reasoner.baseten_api_key and provider in ("auto", "baseten")
-        else "Muse Spark Local Physical Synthesis"
-    )
-
-    s3_dur = time.time() - t0
-    s3 = StageEvent(
-        stage_num=3,
-        name="Muse Spark Physical Reasoning",
-        status="passed",
-        duration_sec=round(s3_dur, 3),
-        summary=f"Synthesized materials, joint hierarchy & {len(synthesized_sg.task.waypoints)} oracle waypoints via {active_provider}.",
-        details={
-            "provider": active_provider,
-            "reasoning_trace": reasoning_trace,
-            "task_type": synthesized_sg.task.task_type,
-            "waypoints_count": len(synthesized_sg.task.waypoints),
-        },
-    )
-    stages.append(s3)
-    emit("stage_complete", asdict(s3))
+    s3_dur = round(time.time() - t0, 3)
+    stage_timings["3"] = s3_dur
+    emit({
+        "stage": 3,
+        "name": "Muse Spark",
+        "status": "completed",
+        "duration_s": s3_dur,
+        "reasoning_trace": reasoning_trace,
+    })
 
     # ── STAGE 4: Pydantic V2 Schema & Physical Grounding ────────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 4, "name": "Pydantic V2 Schema & Auto-Snap"})
+    emit({"stage": 4, "name": "Scene Graph", "status": "running"})
 
-    validated_sg = SceneGraph.model_validate(ref_sg.model_dump())
-    s4_dur = time.time() - t0
-    s4 = StageEvent(
-        stage_num=4,
-        name="Pydantic V2 Schema & Auto-Snap",
-        status="passed",
-        duration_sec=round(s4_dur, 3),
-        summary=f"Validated SceneGraph contract; snapped {len(validated_sg.objects)} bodies to z_table + half_h + 1mm.",
-        details={
-            "scene_graph": validated_sg.model_dump(),
-        },
-    )
-    stages.append(s4)
-    emit("stage_complete", asdict(s4))
+    # Merge Muse Spark reasoned task description and material priors into the grounded scene graph
+    merged_dump = ref_sg.model_dump()
+    if synthesized_sg and synthesized_sg.task.description:
+        merged_dump["task"]["description"] = synthesized_sg.task.description
+    synth_mats = {o.id: o.material for o in synthesized_sg.objects} if synthesized_sg else {}
+    for obj_dict in merged_dump.get("objects", []):
+        if obj_dict["id"] in synth_mats:
+            obj_dict["material"] = synth_mats[obj_dict["id"]]
+
+    validated_sg = SceneGraph.model_validate(merged_dump)
+    s4_dur = round(time.time() - t0, 3)
+    stage_timings["4"] = s4_dur
+    emit({"stage": 4, "name": "Scene Graph", "status": "completed", "duration_s": s4_dur})
 
     # ── STAGE 5: Deterministic MJCF Compiler ────────────────────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 5, "name": "Deterministic MJCF Compiler"})
+    emit({"stage": 5, "name": "MJCF Builder", "status": "running"})
 
     compiler = SceneCompiler(validated_sg, randomize=False)
     mjcf_xml = compiler.compile()
     mjcf_path = out_dir / "environment.xml"
     mjcf_path.write_text(mjcf_xml, encoding="utf-8")
 
-    s5_dur = time.time() - t0
-    s5 = StageEvent(
-        stage_num=5,
-        name="Deterministic MJCF Compiler",
-        status="passed",
-        duration_sec=round(s5_dur, 3),
-        summary=f"Compiled {len(mjcf_xml.splitlines())} lines of MuJoCo 3.17 MJCF XML with elliptic friction cones & mocap weld.",
-        details={
-            "xml_lines": len(mjcf_xml.splitlines()),
-            "mjcf_xml": mjcf_xml,
-            "mjcf_path": str(mjcf_path),
-        },
-    )
-    stages.append(s5)
-    emit("stage_complete", asdict(s5))
+    s5_dur = round(time.time() - t0, 3)
+    stage_timings["5"] = s5_dur
+    emit({"stage": 5, "name": "MJCF Builder", "status": "completed", "duration_s": s5_dur})
 
     # ── STAGE 6: Dense Multi-Stage Reward Synthesis ─────────────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 6, "name": "Dense Multi-Stage Reward Synthesis"})
+    emit({"stage": 6, "name": "Muse Code", "status": "running"})
 
     reward_file = PROJECT_ROOT / "src" / "compiler" / "generated_reward.py"
     reward_source = reward_file.read_text(encoding="utf-8")
 
-    s6_dur = time.time() - t0
-    s6 = StageEvent(
-        stage_num=6,
-        name="Dense Multi-Stage Reward Synthesis",
-        status="passed",
-        duration_sec=round(s6_dur, 3),
-        summary=f"Synthesized smooth tanh-shaped dense reward for '{validated_sg.task.task_type}'.",
-        details={
-            "task_type": validated_sg.task.task_type,
-            "reward_code": reward_source,
-        },
-    )
-    stages.append(s6)
-    emit("stage_complete", asdict(s6))
+    s6_dur = round(time.time() - t0, 3)
+    stage_timings["6"] = s6_dur
+    emit({"stage": 6, "name": "Muse Code", "status": "completed", "duration_s": s6_dur})
 
     # ── STAGE 7: 5-Gate Verification + Self-Healing Loop ────────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 7, "name": "5-Gate Verification & Self-Healing"})
+    emit({"stage": 7, "name": "Validation & PPO", "status": "running"})
 
     faulty_override = None
     if inject_fault:
@@ -417,7 +330,15 @@ def run_worldforge_pipeline(
             "+    return reward, d_place < 0.04, {'d_reach': d_reach, 'd_place': d_place}\n"
         )
 
-    # Run Gate 5 (Residual PPO Policy Training + Rollout Video Export)
+    if inject_fault:
+        emit({
+            "stage": 7,
+            "name": "Validation & PPO",
+            "status": "self_healing",
+            "repair_attempt": repair_result.attempts,
+            "repair_diff": repair_diff,
+        })
+
     rollout_mp4_path = out_dir / "rollout.mp4"
     oracle_mp4_path = out_dir / "oracle_rollout.mp4"
 
@@ -439,9 +360,11 @@ def run_worldforge_pipeline(
             fps=30,
         )
 
-    gate_results = dict(repair_result.final_report.gate_results)
-    gate4_return = gate_results.get(4, {}).get("total_return", 0.0)
-    gate_results[5] = {
+    gate_results: dict[str, Any] = {
+        str(k): v for k, v in repair_result.final_report.gate_results.items()
+    }
+    gate4_return = gate_results.get("4", {}).get("total_return", 0.0)
+    gate_results["5"] = {
         "passed": True,
         "gate": 5,
         "name": "Short PPO Training (Residual + Oracle)",
@@ -451,34 +374,21 @@ def run_worldforge_pipeline(
         "learning_curve": ppo_res.learning_curve,
     }
 
-    s7_dur = time.time() - t0
-    s7_status: Literal["passed", "repaired", "failed"] = (
-        "repaired" if repair_result.attempts > 1 and repair_result.success else ("passed" if repair_result.success else "failed")
-    )
-    s7 = StageEvent(
-        stage_num=7,
-        name="5-Gate Verification & Self-Healing",
-        status=s7_status,
-        duration_sec=round(s7_dur, 3),
-        summary=(
-            f"All 5 verification gates passed in {repair_result.attempts} attempt(s). "
-            f"Oracle Return: {gate4_return:.1f} | PPO Return: {ppo_res.eval_mean_return:.1f}."
-        ),
-        details={
-            "attempts": repair_result.attempts,
-            "repairs_applied": repair_result.repairs_applied,
-            "repair_diff": repair_diff,
-            "gates": gate_results,
-            "rollout_video_url": f"/outputs/{clean_id}/rollout.mp4",
-            "oracle_video_url": f"/outputs/{clean_id}/oracle_rollout.mp4",
-        },
-    )
-    stages.append(s7)
-    emit("stage_complete", asdict(s7))
+    s7_dur = round(time.time() - t0, 3)
+    stage_timings["7"] = s7_dur
+    emit({
+        "stage": 7,
+        "name": "Validation & PPO",
+        "status": "completed",
+        "duration_s": s7_dur,
+        "gate_results": gate_results,
+        "repair_attempts": repair_result.attempts,
+        "repair_diff": repair_diff,
+    })
 
     # ── STAGE 8: Render + Diff Visual Alignment (Mask IoU) ──────────────
     t0 = time.time()
-    emit("stage_start", {"stage_num": 8, "name": "Render + Diff Visual Alignment"})
+    emit({"stage": 8, "name": "Render + Diff", "status": "running"})
 
     sim_env = WorldForgeEnv(validated_sg, render_mode="rgb_array")
     sim_env.reset(seed=42)
@@ -487,80 +397,49 @@ def run_worldforge_pipeline(
 
     sim_masks = {t.object_id: t.frame0_mask for t in sim_sam_res.tracks}
     iou_report = compute_scene_mask_iou(ref_masks, sim_masks, threshold=0.60)
-    diff_img_path = _save_diff_overlay(ref_masks, sim_masks, out_dir / "diff_overlay.png")
+    _save_diff_overlay(ref_masks, sim_masks, out_dir / "diff_overlay.png")
 
-    s8_dur = time.time() - t0
-    s8 = StageEvent(
-        stage_num=8,
-        name="Render + Diff Visual Alignment",
-        status="passed" if iou_report.passed else "repaired",
-        duration_sec=round(s8_dur, 3),
-        summary=f"Frame 0 Visual Alignment Mean Mask IoU: {iou_report.mean_iou * 100:.1f}% (threshold 60.0%).",
-        details={
-            "mean_iou": round(iou_report.mean_iou, 4),
-            "per_object_iou": {k: round(v, 4) for k, v in iou_report.per_object_iou.items()},
-            "passed": iou_report.passed,
-            "diff_overlay_url": f"/outputs/{clean_id}/diff_overlay.png",
-        },
-    )
-    stages.append(s8)
-    emit("stage_complete", asdict(s8))
+    s8_dur = round(time.time() - t0, 3)
+    stage_timings["8"] = s8_dur
+    emit({"stage": 8, "name": "Render + Diff", "status": "completed", "duration_s": s8_dur})
 
     total_duration = round(time.time() - t_pipeline_start, 2)
-    cost_data = {
-        "input_tokens": cost_tracker.total_input_tokens,
-        "output_tokens": cost_tracker.total_output_tokens,
-        "cpu_core_seconds": round(cost_tracker.total_cpu_core_seconds, 2),
-        "total_cost_usd": round(cost_tracker.total_cost_usd, 5),
-        "pricing_tier": cost_tracker.pricing_tier,
-    }
-    render_diff_data = {
-        "mean_iou": round(iou_report.mean_iou, 4),
-        "per_object_iou": {k: round(v, 4) for k, v in iou_report.per_object_iou.items()},
-        "passed": iou_report.passed,
-        "diff_overlay_url": f"/outputs/{clean_id}/diff_overlay.png",
-    }
-    ppo_results_data = {
-        "mean_return": round(ppo_res.eval_mean_return, 2),
-        "oracle_return": round(gate4_return, 2),
-        "learning_curve": ppo_res.learning_curve,
-        "video_url": f"/outputs/{clean_id}/rollout.mp4",
-    }
-
-    final_payload = {
+    final_payload: dict[str, Any] = {
         "scene_id": clean_id,
-        "raw_scene_id": validated_sg.scene_id,
-        "file_id": clean_id,
-        "task_type": validated_sg.task.task_type,
-        "task_description": validated_sg.task.description,
-        "status": "repaired" if inject_fault else "passed",
-        "total_duration_sec": total_duration,
         "total_duration_s": total_duration,
-        "self_healing_applied": bool(repair_result.attempts > 1 or len(repair_result.repairs_applied) > 0),
-        "stages": [asdict(st) for st in stages],
+        "stage_timings": stage_timings,
+        "reasoning_trace": reasoning_trace,
         "scene_graph": validated_sg.model_dump(),
         "mjcf_xml": mjcf_xml,
         "reward_code": reward_source,
-        "reasoning_trace": reasoning_trace,
-        "gates": gate_results,
+        "gate_results": gate_results,
+        "self_healing_applied": bool(repair_result.attempts > 1),
         "repair_attempts": repair_result.attempts,
         "repairs_applied": repair_result.repairs_applied,
         "repair_diff": repair_diff,
-        "render_diff": render_diff_data,
-        "mask_iou": render_diff_data,
-        "ppo_results": ppo_results_data,
-        "media": {
-            "mask_overlay_url": f"/outputs/{clean_id}/frame0_masks.png",
-            "diff_overlay_url": f"/outputs/{clean_id}/diff_overlay.png",
-            "rollout_video_url": f"/outputs/{clean_id}/rollout.mp4",
+        "ppo_results": {
+            "eval_mean_return": round(ppo_res.eval_mean_return, 2),
+            "eval_std_return": round(ppo_res.eval_std_return, 2),
+            "learning_curve": ppo_res.learning_curve,
+            "video_url": f"/outputs/{clean_id}/rollout.mp4",
             "oracle_video_url": f"/outputs/{clean_id}/oracle_rollout.mp4",
-            "export_zip_url": f"/api/export/{clean_id}",
         },
-        "cost": cost_data,
-        "cost_telemetry": cost_data,
+        "render_diff": {
+            "mean_iou": round(iou_report.mean_iou, 4),
+            "per_object_iou": {k: round(v, 4) for k, v in iou_report.per_object_iou.items()},
+            "passed": iou_report.passed,
+            "overlay_url": f"/outputs/{clean_id}/diff_overlay.png",
+            "masks_url": f"/outputs/{clean_id}/frame0_masks.png",
+        },
+        "cost_telemetry": {
+            "input_tokens": cost_tracker.total_input_tokens,
+            "output_tokens": cost_tracker.total_output_tokens,
+            "cpu_core_seconds": round(cost_tracker.total_cpu_core_seconds, 2),
+            "total_cost_usd": round(cost_tracker.total_cost_usd, 5),
+        },
     }
 
-    emit("pipeline_complete", final_payload)
+    emit({"stage": "complete", "summary": final_payload})
     return final_payload
 
 
@@ -591,7 +470,7 @@ def stream_worldforge_pipeline(
             )
         except Exception as exc:
             logger.exception("Pipeline error: %s", exc)
-            q.put({"event": "error", "data": {"message": str(exc)}})
+            q.put({"stage": "error", "error": str(exc)})
         finally:
             q.put(None)
 
@@ -603,3 +482,4 @@ def stream_worldforge_pipeline(
         if item is None:
             break
         yield f"data: {json.dumps(item)}\n\n"
+
