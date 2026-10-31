@@ -147,7 +147,8 @@ WorldForge-RL/
 │   └── generate_previews.py            # Offline asset regeneration for all 3 golden scenes
 ├── Dockerfile                          # Multi-stage production container (Node 20 build + Python 3.12 MuJoCo runtime)
 ├── docker-compose.yml                  # Docker Compose stack with volume persistence & healthchecks
-├── requirements.txt                    # Python dependencies pinned for MuJoCo 3.17 & Stable-Baselines3
+├── requirements.txt                    # Human-maintained Python dependency inputs
+├── requirements.lock                   # Resolved CPU-only Docker dependency graph
 ├── run_demo.py                         # Single-command launcher for FastAPI backend + Vite frontend
 ├── start_studio.ps1                    # Native Windows PowerShell launcher
 └── tests/
@@ -244,6 +245,14 @@ Once running:
 ## 🐳 Running with Docker & Containerization
 
 WorldForge includes a production-grade multi-stage container build powered by **Astral `uv`** (for ultra-fast, resilient dependency resolution with parallel chunk streaming and BuildKit layer caching). It compiles the React 19 frontend and runs the Python MuJoCo 3.17 physics backend together from a single lightweight container with headless off-screen rendering support.
+
+The image installs from `requirements.lock`, so a source-only edit reuses the
+expensive Python dependency layer. After intentionally changing
+`requirements.txt`, regenerate the lock before building:
+
+```bash
+uv pip compile --torch-backend cpu --python 3.12 requirements.txt -o requirements.lock
+```
 
 ### Option A: Docker Compose (Recommended)
 

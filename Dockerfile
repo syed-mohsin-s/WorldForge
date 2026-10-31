@@ -1,3 +1,4 @@
+# syntax=docker/dockerfile:1.7
 # =============================================================================
 # WorldForge-RL Multi-Stage Production Container
 # MuJoCo 3.17 Physics + Stable-Baselines3 + FastAPI + React Studio Frontend
@@ -10,8 +11,9 @@
 FROM node:20-slim AS frontend-builder
 WORKDIR /app/frontend
 
-COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci || npm install --legacy-peer-deps
+COPY frontend/package.json frontend/package-lock.json ./
+RUN --mount=type=cache,target=/root/.npm,sharing=locked \
+    npm ci --cache=/root/.npm --prefer-offline
 
 COPY frontend/ ./
 RUN npm run build
@@ -22,13 +24,16 @@ RUN npm run build
 FROM python:3.12-slim-bookworm AS runtime
 
 # Copy Astral uv binary (10-100x faster than pip, multiplexed parallel downloads)
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+# Pin uv so a new upstream "latest" image cannot invalidate every downstream
+# layer or change dependency-resolution behavior unexpectedly.
+COPY --from=ghcr.io/astral-sh/uv:0.13.6 /uv /uvx /bin/
 
 WORKDIR /app
 
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_SYSTEM_PYTHON=1 \
     UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
     UV_TORCH_BACKEND=cpu \
     UV_HTTP_TIMEOUT=120 \
     PYTHONUNBUFFERED=1 \
@@ -42,19 +47,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
-    libxrender-dev \
     libegl1 \
     libgles2 \
     libosmesa6 \
-    libosmesa6-dev \
-    ffmpeg \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install all Python dependencies using uv with BuildKit cache mount and native CPU torch backend
-COPY requirements.txt ./
+# The lock contains the complete, CPU-only Linux dependency graph.  Copy it by
+# itself so application edits never invalidate this expensive layer.
+COPY requirements.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install -r requirements.txt
+    uv pip sync --system --torch-backend cpu --no-progress requirements.lock
 
 # Copy Python codebase, configs, scripts, and pre-rendered preview assets
 COPY src/ ./src/

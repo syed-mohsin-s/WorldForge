@@ -23,7 +23,7 @@ from typing import Any, Literal
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -55,6 +55,14 @@ app.add_middleware(
 
 OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_ROOT)), name="outputs")
+
+# The production image contains the Vite build at /app/frontend/dist.  Keep
+# this optional so native API development still works before the frontend has
+# been built locally.
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+FRONTEND_ASSETS = FRONTEND_DIST / "assets"
+if FRONTEND_ASSETS.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS)), name="frontend-assets")
 
 
 def ensure_preview_assets():
@@ -547,6 +555,16 @@ async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
         "video_url": f"/outputs/uploads/{safe_name}",
         "size_bytes": dest_path.stat().st_size,
     }
+
+
+@app.get("/", include_in_schema=False)
+def serve_frontend() -> Response:
+    """Serve the image's compiled Studio entry point when it is available."""
+    index_html = FRONTEND_DIST / "index.html"
+    if not index_html.is_file():
+        raise HTTPException(status_code=404, detail="Frontend build is not available.")
+    # Keep the HTML fresh so a rebuilt image references its latest hashed assets.
+    return FileResponse(index_html, headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":

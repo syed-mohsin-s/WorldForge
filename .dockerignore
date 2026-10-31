@@ -25,7 +25,11 @@ frontend/dist
 
 # Local outputs / secrets
 .env
-outputs/uploads/*
+outputs/*
+*.mp4
 !outputs/scene1_pick_place
+!outputs/scene1_pick_place/**
 !outputs/scene2_push_obstacle
+!outputs/scene2_push_obstacle/**
 !outputs/scene3_articulated_drawer
+!outputs/scene3_articulated_drawer/**
