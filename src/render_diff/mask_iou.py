@@ -138,9 +138,15 @@ def evaluate_and_align_sim(
         if use_sam_resegment:
             from src.perception.sam_tracker import SAM31Tracker
             tracker = SAM31Tracker(cost_tracker=cost_tracker)
-            res, _ = tracker.segment_from_sim_env(env, num_frames=1, execute_oracle=False)
-            for track in res.tracks:
-                masks[track.object_id] = track.frame0_mask
+            if tracker.has_configured_backend():
+                prompts = [o.label for o in current_scene.objects]
+                res = tracker.segment_image(rgb, text_prompts=prompts)
+                for track in res.tracks:
+                    masks[track.object_id] = track.frame0_mask
+            else:
+                res, _ = tracker.segment_from_sim_env(env, num_frames=1, execute_oracle=False)
+                for track in res.tracks:
+                    masks[track.object_id] = track.frame0_mask
         else:
             # Fast MuJoCo geom segmentation buffer
             renderer = mujoco.Renderer(env.model, height=h, width=w)

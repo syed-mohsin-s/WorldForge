@@ -149,6 +149,7 @@ export interface SystemStatus {
 
 export interface PipelineRunResult {
   scene_id: string;
+  sam_provider_used?: string;
   total_duration_s: number;
   stage_timings: Record<string, number>;
   reasoning_trace: string;
@@ -185,6 +186,7 @@ export interface PipelineRunResult {
 export interface PipelineStageEvent {
   stage: number | 'complete' | 'error';
   name?: string;
+  sam_provider_used?: string;
   status?: 'running' | 'completed' | 'self_healing';
   duration_s?: number;
   chunk?: string;
@@ -1376,6 +1378,7 @@ export function App() {
   const [stageTimings, setStageTimings] = useState<Record<string, number>>({});
   const [liveReasoning, setLiveReasoning] = useState<string>('');
   const [runResult, setRunResult] = useState<PipelineRunResult | null>(null);
+  const [liveSamProvider, setLiveSamProvider] = useState<string>('');
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
   // Self-Healing Telemetry State
@@ -1481,6 +1484,7 @@ export function App() {
   const handleRunPipeline = () => {
     setIsRunning(true);
     setRunResult(null);
+    setLiveSamProvider('');
     setActiveStage(1);
     setCompletedStages([]);
     setStageTimings({});
@@ -1511,6 +1515,9 @@ export function App() {
             setCompletedStages((prev) => Array.from(new Set([...prev, ev.stage as number])));
             if (ev.duration_s) {
               setStageTimings((prev) => ({ ...prev, [String(ev.stage)]: ev.duration_s! }));
+            }
+            if (ev.sam_provider_used) {
+              setLiveSamProvider(ev.sam_provider_used);
             }
           }
           if (ev.chunk) {
@@ -2001,12 +2008,28 @@ export function App() {
             <section className="lg:col-span-4 p-5 space-y-5 overflow-y-auto bg-zinc-950/50">
               <div>
                 <div className="flex items-center justify-between mb-2">
-                  <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
-                    <Eye className="h-4 w-4 text-violet-400" />
-                    Stage 1: SAM 3.1 4px-Eroded Masks
-                  </h2>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h2 className="text-xs font-bold uppercase tracking-wider text-zinc-400 flex items-center gap-2">
+                      <Eye className="h-4 w-4 text-violet-400" />
+                      Stage 1: SAM 3.1
+                    </h2>
+                    <span
+                      title="Active SAM 3.1 Inference Engine"
+                      className={`text-[9px] px-2 py-0.5 rounded font-mono font-semibold border ${
+                        (runResult?.sam_provider_used || liveSamProvider || 'sim-depth-seg (offline)').includes('GPU')
+                          ? 'bg-cyan-950/60 text-cyan-300 border-cyan-700/60'
+                          : (runResult?.sam_provider_used || liveSamProvider || 'sim-depth-seg (offline)').includes('CPU')
+                          ? 'bg-violet-950/60 text-violet-300 border-violet-700/60'
+                          : (runResult?.sam_provider_used || liveSamProvider || 'sim-depth-seg (offline)').includes('meta-api')
+                          ? 'bg-emerald-950/60 text-emerald-300 border-emerald-700/60'
+                          : 'bg-zinc-800/80 text-zinc-300 border-zinc-700'
+                      }`}
+                    >
+                      {runResult?.sam_provider_used || liveSamProvider || 'sim-depth-seg (offline)'}
+                    </span>
+                  </div>
                   <span className="text-[10px] font-mono text-emerald-400">
-                    {uploadedVideoName ? `Video: ${uploadedVideoName}` : 'Zero Flying Pixels'}
+                    {uploadedVideoName ? `Video: ${uploadedVideoName}` : '4px-Eroded (Zero Flying Pixels)'}
                   </span>
                 </div>
                 <div key={`masks-box-${selectedSceneId}`} className="aspect-video w-full rounded-xl bg-zinc-900 border border-zinc-800 overflow-hidden relative group">

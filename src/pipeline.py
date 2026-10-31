@@ -176,25 +176,33 @@ def run_worldforge_pipeline(
     ref_env.reset(seed=42)
     frame0_rgb = ref_env.render_camera()
 
+    tracker = SAM31Tracker(cost_tracker=cost_tracker)
     if video_path and Path(video_path).exists():
-        tracker = SAM31Tracker(cost_tracker=cost_tracker)
         prompts = [o.label for o in ref_sg.objects]
         sam_result = tracker.track_video(video_path, text_prompts=prompts)
-        _, sim_depth_fallback = segment_from_sim_env(ref_env, ref_sg)
+        _, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
         if sam_result.frame0_depth is None:
             sam_result.frame0_depth = sim_depth_fallback
     else:
-        sam_result, frame0_depth = segment_from_sim_env(ref_env, ref_sg)
+        sam_result, frame0_depth = tracker.segment_from_sim_env(ref_env, ref_sg)
 
     frame0_depth = sam_result.frame0_depth
     ref_env.close()
+
+    sam_provider_used = getattr(sam_result, "sam_provider_used", "sim-depth-seg (offline)")
 
     ref_masks = {t.object_id: t.frame0_mask for t in sam_result.tracks}
     _save_mask_Overlay(frame0_rgb, ref_masks, out_dir / "frame0_masks.png")
 
     s1_dur = round(time.time() - t0, 3)
     stage_timings["1"] = s1_dur
-    emit({"stage": 1, "name": "SAM 3.1", "status": "completed", "duration_s": s1_dur})
+    emit({
+        "stage": 1,
+        "name": "SAM 3.1",
+        "status": "completed",
+        "duration_s": s1_dur,
+        "sam_provider_used": sam_provider_used,
+    })
 
     # ── STAGE 2: 3D Metric Lifting (RANSAC + SVD) ──────────────────────
     t0 = time.time()
@@ -406,6 +414,7 @@ def run_worldforge_pipeline(
     total_duration = round(time.time() - t_pipeline_start, 2)
     final_payload: dict[str, Any] = {
         "scene_id": clean_id,
+        "sam_provider_used": sam_provider_used,
         "total_duration_s": total_duration,
         "stage_timings": stage_timings,
         "reasoning_trace": reasoning_trace,
