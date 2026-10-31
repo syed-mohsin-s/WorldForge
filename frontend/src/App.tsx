@@ -2134,15 +2134,6 @@ export function App() {
 
                 <div className="flex items-center gap-2">
                   <button
-                    onClick={() => setCurrentView('workbench')}
-                    className="text-[11px] px-2.5 py-1 rounded bg-zinc-900 hover:bg-zinc-800 text-emerald-300 hover:text-emerald-200 border border-emerald-900/60 hover:border-emerald-700/80 flex items-center gap-1.5 font-medium transition-colors cursor-pointer"
-                    title="Switch to full-screen 3D PBR Workbench"
-                  >
-                    <Box className="h-3.5 w-3.5 text-emerald-400" />
-                    <span>3D Workbench ↗</span>
-                  </button>
-
-                  <button
                     onClick={() => {
                       const text =
                         activeTab === 'reasoning'
