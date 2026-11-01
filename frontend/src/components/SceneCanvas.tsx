@@ -20,12 +20,89 @@ import React, { useEffect, useRef, useState } from 'react';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import {
-  MATERIAL_DB,
-  SceneGraph,
-  SimState,
-  computeHalfHeight,
-} from '../engine/worldforge';
+
+export interface MaterialSpec {
+  rgba: [number, number, number, number];
+  density: number;
+  friction: [number, number, number];
+}
+
+export const MATERIAL_DB: Record<string, MaterialSpec> = {
+  plastic: { rgba: [0.2, 0.5, 0.9, 1.0], density: 1200, friction: [0.6, 0.005, 0.0001] },
+  metal: { rgba: [0.75, 0.78, 0.82, 1.0], density: 7800, friction: [0.8, 0.005, 0.0001] },
+  wood: { rgba: [0.65, 0.45, 0.25, 1.0], density: 700, friction: [0.7, 0.005, 0.0001] },
+  rubber: { rgba: [0.15, 0.8, 0.45, 1.0], density: 1100, friction: [1.2, 0.01, 0.001] },
+  ceramic: { rgba: [0.92, 0.92, 0.95, 1.0], density: 2400, friction: [0.5, 0.002, 0.0001] },
+  cardboard: { rgba: [0.76, 0.6, 0.42, 1.0], density: 300, friction: [0.65, 0.005, 0.0001] },
+};
+
+export interface SceneObject {
+  id: string;
+  label: string;
+  primitive: 'box' | 'cylinder' | 'sphere';
+  size: number[];
+  position: [number, number, number];
+  quaternion: [number, number, number, number];
+  material: string;
+  is_static: boolean;
+  parent_id: string | null;
+  joint: {
+    type: 'free' | 'hinge' | 'slide' | 'fixed';
+    axis: [number, number, number];
+    range: [number, number] | null;
+    damping: number;
+    is_prior_guess: boolean;
+  };
+}
+
+export interface SceneGraph {
+  scene_id: string;
+  table_z: number;
+  camera: {
+    pos: [number, number, number];
+    lookat: [number, number, number];
+    fovy: number;
+    resolution: [number, number];
+  };
+  objects: SceneObject[];
+  task: {
+    task_type: 'pick_and_place' | 'push_to_target' | 'articulate_joint';
+    description: string;
+    manipulated_object_id: string;
+    target_position: [number, number, number] | null;
+    target_joint_delta: number | null;
+    waypoints: [number, number, number, number][];
+  };
+}
+
+export interface SimState {
+  step: number;
+  gripperPos: [number, number, number];
+  gripperCmd: number;
+  fingerAperture: number;
+  isGrasped: boolean;
+  objectPositions: Record<string, [number, number, number]>;
+  objectQuaternions?: Record<string, [number, number, number, number]>;
+  diagnostics: {
+    dReach: number;
+    dGoal: number;
+  };
+  reward: number;
+  terminated: boolean;
+  stageBreakdown: {
+    reach: number;
+    graspOrClearance: number;
+    liftOrProgress: number;
+    placeOrGoal: number;
+    terminalBonus: number;
+  };
+}
+
+export function computeHalfHeight(obj: SceneObject): number {
+  if (obj.primitive === 'box') return obj.size[2] ?? 0.025;
+  if (obj.primitive === 'cylinder') return obj.size[1] ?? 0.025;
+  return obj.size[0] ?? 0.025;
+}
 
 interface SceneCanvasProps {
   scene: SceneGraph;
@@ -46,17 +123,14 @@ function createOpticalTableTexture(): THREE.CanvasTexture {
   canvas.height = 512;
   const ctx = canvas.getContext('2d')!;
 
-  // Anodized optical breadboard dark slate finish
   ctx.fillStyle = '#141923';
   ctx.fillRect(0, 0, 512, 512);
 
-  // Subtle brushed micro-lines
   ctx.fillStyle = 'rgba(255,255,255,0.015)';
   for (let y = 0; y < 512; y += 3) {
     ctx.fillRect(0, y, 512, 1);
   }
 
-  // Metric 5cm sub-grid & M6 tapped hole pattern
   ctx.strokeStyle = 'rgba(148, 163, 184, 0.14)';
   ctx.lineWidth = 1;
   const step = 64;
@@ -72,7 +146,6 @@ function createOpticalTableTexture(): THREE.CanvasTexture {
     ctx.stroke();
   }
 
-  // Major axis crosshairs
   ctx.strokeStyle = 'rgba(6, 182, 212, 0.28)';
   ctx.lineWidth = 2;
   ctx.beginPath();
@@ -82,7 +155,6 @@ function createOpticalTableTexture(): THREE.CanvasTexture {
   ctx.lineTo(512, 256);
   ctx.stroke();
 
-  // M6 mounting bore holes
   ctx.fillStyle = '#090c12';
   for (let x = 32; x < 512; x += 32) {
     for (let y = 32; y < 512; y += 32) {
@@ -114,13 +186,12 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
   const [showWaypoints, setShowWaypoints] = useState<boolean>(true);
   const [showContactShadows, setShowContactShadows] = useState<boolean>(true);
 
-  // Store latest props in refs so WebGL context never tears down on state updates
   const scenePropRef = useRef<SceneGraph>(scene);
   const simStateRef = useRef<SimState>(simState);
   const showWaypointsRef = useRef<boolean>(showWaypoints);
   const showShadowsRef = useRef<boolean>(showContactShadows);
-  const requestRenderRef = useRef<() => void>(() => {});
-  const applyCamPresetRef = useRef<(preset: CameraPreset) => void>(() => {});
+  const requestRenderRef = useRef<() => void>(() => { });
+  const applyCamPresetRef = useRef<(preset: CameraPreset) => void>(() => { });
 
   scenePropRef.current = scene;
   simStateRef.current = simState;
@@ -131,7 +202,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     const container = mountRef.current;
     if (!container) return;
 
-    // 1. Software-WebGL detection per Three.js skill
     const isSoftwareGl = (() => {
       const probeCanvas = document.createElement('canvas');
       const gl = probeCanvas.getContext('webgl2') || probeCanvas.getContext('webgl');
@@ -168,12 +238,10 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     threeScene.background = new THREE.Color(0x07090e);
     threeScene.fog = new THREE.FogExp2(0x07090e, 0.95);
 
-    // Studio PBR environment reflection via RoomEnvironment
     const pmremGenerator = new THREE.PMREMGenerator(renderer);
     threeScene.environment = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
     pmremGenerator.dispose();
 
-    // Note: MuJoCo uses Z-up; we configure Three.js camera with Z-up so world coordinates match [x, y, z] 1:1
     THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
     const camera = new THREE.PerspectiveCamera(42, width / height, 0.01, 10);
     camera.up.set(0, 0, 1);
@@ -187,7 +255,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     controls.minDistance = 0.18;
     controls.update();
 
-    // Three-point warm/cool studio lighting
     const hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x1e293b, 0.85);
     hemiLight.position.set(0, 0, 1.5);
     threeScene.add(hemiLight);
@@ -212,7 +279,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     rimLight.position.set(-0.7, 0.8, 0.65);
     threeScene.add(rimLight);
 
-    // ── Static Tabletop Optical Breadboard Assembly (Composite Group) ──
     const tableGroup = new THREE.Group();
     const tableTex = createOpticalTableTexture();
     const tableTopMat = new THREE.MeshStandardMaterial({
@@ -241,7 +307,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     chassisBase.position.set(0, 0, -0.05);
     tableGroup.add(chassisBase);
 
-    // 4 Anodized corner bumper rails
     const railOffsets: [number, number][] = [
       [0.322, 0],
       [-0.322, 0],
@@ -258,7 +323,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
       tableGroup.add(rail);
     });
 
-    // Coordinate Triad at World Origin (0, 0, 0.001)
     const originTriad = new THREE.Group();
     originTriad.position.set(-0.28, -0.28, 0.002);
     const arrowX = new THREE.ArrowHelper(
@@ -289,7 +353,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     tableGroup.add(originTriad);
     threeScene.add(tableGroup);
 
-    // ── Composite Parallel-Jaw Robotic End-Effector (7-part THREE.Group) ──
     const gripperGroup = new THREE.Group();
     const housingMat = new THREE.MeshStandardMaterial({
       color: 0x1e293b,
@@ -313,7 +376,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
       roughness: 0.2,
     });
 
-    // 1. Wrist flange cylinder
     const wristFlange = new THREE.Mesh(
       new THREE.CylinderGeometry(0.022, 0.026, 0.018, 24),
       alloyMat,
@@ -322,17 +384,14 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     wristFlange.position.set(0, 0, 0.028);
     gripperGroup.add(wristFlange);
 
-    // 2. Servo actuator body
     const servoBody = new THREE.Mesh(new THREE.BoxGeometry(0.056, 0.078, 0.028), housingMat);
     servoBody.position.set(0, 0, 0.006);
     gripperGroup.add(servoBody);
 
-    // 3. Linear guide rail bar
     const guideRail = new THREE.Mesh(new THREE.BoxGeometry(0.018, 0.088, 0.008), alloyMat);
     guideRail.position.set(0, 0, -0.01);
     gripperGroup.add(guideRail);
 
-    // 4. ee_mocap optical tracking beacon ring
     const mocapBeacon = new THREE.Mesh(
       new THREE.TorusGeometry(0.016, 0.003, 12, 24),
       mocapBeaconMat,
@@ -340,7 +399,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     mocapBeacon.position.set(0, 0, 0.039);
     gripperGroup.add(mocapBeacon);
 
-    // 5. Left & Right articulated finger assemblies (each has carriage + jaw + high-friction pad)
     const buildFingerAssembly = (sign: number) => {
       const fGroup = new THREE.Group();
       const carriage = new THREE.Mesh(new THREE.BoxGeometry(0.022, 0.012, 0.014), alloyMat);
@@ -361,7 +419,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     const rightFingerGroup = buildFingerAssembly(1);
     gripperGroup.add(leftFingerGroup, rightFingerGroup);
 
-    // Vertical laser alignment beam from gripper to table
     const laserGeo = new THREE.BufferGeometry().setFromPoints([
       new THREE.Vector3(0, 0, -0.05),
       new THREE.Vector3(0, 0, -0.35),
@@ -379,19 +436,16 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
 
     threeScene.add(gripperGroup);
 
-    // Dynamic containers for SceneGraph objects, target zone, and oracle trajectory
     const dynamicObjectsGroup = new THREE.Group();
     const trajectoryGroup = new THREE.Group();
     threeScene.add(dynamicObjectsGroup, trajectoryGroup);
 
-    // Rebuild / sync scene geometry from current SceneGraph & SimState
     const syncSceneGeometry = () => {
       const sg = scenePropRef.current;
       const st = simStateRef.current;
 
       tableGroup.position.z = sg.table_z;
 
-      // Clear previous dynamic meshes cleanly
       while (dynamicObjectsGroup.children.length > 0) {
         dynamicObjectsGroup.remove(dynamicObjectsGroup.children[0]);
       }
@@ -399,7 +453,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
         trajectoryGroup.remove(trajectoryGroup.children[0]);
       }
 
-      // Position Gripper
       const [gx, gy, gz] = st.gripperPos;
       gripperGroup.position.set(gx, gy, gz + 0.032);
       const halfSpread = Math.max(0.008, (st.fingerAperture / 0.08) * 0.034);
@@ -408,14 +461,12 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
       mocapBeaconMat.color.setHex(st.isGrasped ? 0x10b981 : 0xf43f5e);
       mocapBeaconMat.emissive.setHex(st.isGrasped ? 0x059669 : 0xe11d48);
 
-      // Update laser line to terminate on tabletop
       const laserPositions = laserLine.geometry.attributes.position as THREE.BufferAttribute;
       laserPositions.setXYZ(0, 0, 0, -0.055);
       laserPositions.setXYZ(1, 0, 0, -(gz - sg.table_z + 0.03));
       laserPositions.needsUpdate = true;
       laserLine.computeLineDistances();
 
-      // Target Site Beacon (Composite ring + center pad + vertical glow ring)
       if (sg.task.target_position) {
         const [tx, ty, tz] = sg.task.target_position;
         const targetGroup = new THREE.Group();
@@ -443,7 +494,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
         dynamicObjectsGroup.add(targetGroup);
       }
 
-      // Oracle Waypoint 3D Trajectory Spline & Keyframe Spheres
       if (showWaypointsRef.current && sg.task.waypoints.length > 1) {
         const wpPoints = sg.task.waypoints.map(
           ([wx, wy, wz]) => new THREE.Vector3(wx, wy, wz),
@@ -474,7 +524,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
         });
       }
 
-      // SceneGraph Objects (Composite multi-part meshes per Three.js directives)
       for (const obj of sg.objects) {
         const pos = st.objectPositions[obj.id] ?? obj.position;
         const matSpec = MATERIAL_DB[obj.material] ?? MATERIAL_DB.plastic;
@@ -502,21 +551,22 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
           metalness: Math.min(1, metalness + 0.15),
         });
 
+        const quat = st.objectQuaternions?.[obj.id] ?? obj.quaternion ?? [1, 0, 0, 0];
         const objGroup = new THREE.Group();
         objGroup.position.set(pos[0], pos[1], pos[2]);
+        // MuJoCo stores quaternions as [w, x, y, z]; Three.js Quaternion.set expects (x, y, z, w)
+        objGroup.quaternion.set(quat[1], quat[2], quat[3], quat[0]);
 
         if (obj.primitive === 'box') {
           const hx = (obj.size[0] ?? 0.025) * 2;
           const hy = (obj.size[1] ?? 0.025) * 2;
           const hz = (obj.size[2] ?? 0.025) * 2;
 
-          // Primary body
           const coreMesh = new THREE.Mesh(new THREE.BoxGeometry(hx, hy, hz), primaryMat);
           coreMesh.castShadow = !isSoftwareGl;
           coreMesh.receiveShadow = !isSoftwareGl;
           objGroup.add(coreMesh);
 
-          // Secondary recessed top bezel & corner framing
           const bezelMesh = new THREE.Mesh(
             new THREE.BoxGeometry(hx * 0.82, hy * 0.82, hz * 1.02),
             trimMat,
@@ -535,21 +585,16 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
           const radius = obj.size[0] ?? 0.025;
           const halfLen = obj.size[1] ?? 0.02;
           const cylGeo = new THREE.CylinderGeometry(radius, radius, halfLen * 2, 28);
-          cylGeo.rotateX(Math.PI / 2); // Align cylinder along Z-up
+          cylGeo.rotateX(Math.PI / 2);
           const cylMesh = new THREE.Mesh(cylGeo, primaryMat);
           cylMesh.castShadow = !isSoftwareGl;
           cylMesh.receiveShadow = !isSoftwareGl;
           objGroup.add(cylMesh);
 
-          // Secondary machined rim ring
           const rimGeo = new THREE.TorusGeometry(radius * 0.96, Math.min(0.0025, halfLen * 0.3), 12, 28);
           const topRim = new THREE.Mesh(rimGeo, trimMat);
           topRim.position.z = halfLen;
           objGroup.add(topRim);
-
-          if (obj.id.includes('handle')) {
-            cylMesh.rotation.x = Math.PI / 2;
-          }
         } else {
           const radius = obj.size[0] ?? 0.025;
           const spMesh = new THREE.Mesh(new THREE.SphereGeometry(radius, 24, 24), primaryMat);
@@ -557,7 +602,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
           objGroup.add(spMesh);
         }
 
-        // Soft contact shadow disc on tabletop (Disjoint depth y/z offset per games_3d.md)
         if (showShadowsRef.current && obj.parent_id === null) {
           const shadowRadius = Math.max(obj.size[0] ?? 0.025, obj.size[1] ?? 0.025) * 1.35;
           const contactDisc = new THREE.Mesh(
@@ -578,7 +622,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
       }
     };
 
-    // On-demand render & software-WebGL fenceSync pacing per Three.js skill
     let frameId = 0;
     let timeoutId = 0;
     let renderBusy = false;
@@ -660,7 +703,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     };
     window.addEventListener('resize', handleResize);
 
-    // Initial render
     syncSceneGeometry();
     requestRender();
 
@@ -674,7 +716,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
     };
   }, []);
 
-  // Trigger on-demand render whenever scene, simState, or visual toggles change
   useEffect(() => {
     requestRenderRef.current();
   }, [scene, simState, showWaypoints, showContactShadows]);
@@ -686,7 +727,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
 
   const gripClosed = simState.gripperCmd < 0;
 
-  // Build SVG polyline points for live Multi-Stage Reward Waveform
   const historySlice = rewardHistory.slice(-40);
   const svgW = 540;
   const svgH = 110;
@@ -736,11 +776,10 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
               key={key}
               type="button"
               onClick={() => handleSelectPreset(key)}
-              className={`px-2.5 py-1 text-xs font-mono rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-                camPreset === key
+              className={`px-2.5 py-1 text-xs font-mono rounded transition-colors whitespace-nowrap shrink-0 cursor-pointer ${camPreset === key
                   ? 'bg-cyan-500 text-slate-950 font-semibold'
                   : 'bg-[#111827] text-slate-300 hover:text-white border border-[#1E293B]'
-              }`}
+                }`}
             >
               {label}
             </button>
@@ -749,11 +788,10 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
           <button
             type="button"
             onClick={() => setShowWaypoints((w) => !w)}
-            className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              showWaypoints
+            className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${showWaypoints
                 ? 'bg-[#111827] text-cyan-300 border-cyan-500/40'
                 : 'bg-[#0B0E17] text-slate-500 border-[#1E293B]'
-            }`}
+              }`}
           >
             Spline Waypoints: {showWaypoints ? 'ON' : 'OFF'}
           </button>
@@ -761,18 +799,17 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
           <button
             type="button"
             onClick={() => setShowContactShadows((s) => !s)}
-            className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
-              showContactShadows
+            className={`px-2.5 py-1 text-xs font-mono rounded border transition-colors whitespace-nowrap shrink-0 cursor-pointer ${showContactShadows
                 ? 'bg-[#111827] text-slate-200 border-[#1E293B]'
                 : 'bg-[#0B0E17] text-slate-500 border-[#1E293B]'
-            }`}
+              }`}
           >
             Shadows
           </button>
         </div>
       </div>
 
-      {/* Main 3D WebGL Stage + Semantic DOM Overlays (Zero backdrop-blur over WebGL per games_3d.md) */}
+      {/* Main 3D WebGL Stage + Semantic DOM Overlays */}
       <div className="relative w-full h-[430px] bg-[#07090E] overflow-hidden">
         <div ref={mountRef} className="w-full h-full" />
 
@@ -849,7 +886,7 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
         </div>
       </div>
 
-      {/* Bottom Time-Series & Telemetry Tray (Asymmetric Split Console Zone 4) */}
+      {/* Bottom Time-Series & Telemetry Tray */}
       <div className="grid grid-cols-1 lg:grid-cols-12 border-t border-[#1E293B] bg-[#0B0E17]">
         {/* 4-DoF Cartesian Mocap Stepping Matrix */}
         <div className="lg:col-span-5 p-4 border-b lg:border-b-0 lg:border-r border-[#1E293B] flex flex-col justify-between">
@@ -957,7 +994,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
             viewBox={`0 0 ${svgW} ${svgH}`}
             className="w-full h-[104px] bg-[#07090E] border border-[#1E293B] rounded"
           >
-            {/* Horizontal calibration grid lines */}
             {[20, 50, 80].map((gy) => (
               <line
                 key={gy}
@@ -971,7 +1007,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
               />
             ))}
 
-            {/* Reach curve */}
             {historySlice.length > 1 && (
               <polyline
                 fill="none"
@@ -982,7 +1017,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
               />
             )}
 
-            {/* Place / Progress curve */}
             {historySlice.length > 1 && (
               <polyline
                 fill="none"
@@ -996,7 +1030,6 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
               />
             )}
 
-            {/* Total non-terminal shaped reward curve */}
             {historySlice.length > 1 && (
               <polyline
                 fill="none"
@@ -1012,4 +1045,134 @@ export const SceneCanvas: React.FC<SceneCanvasProps> = ({
   );
 };
 
-export default SceneCanvas;
+// Default Demo Wrapper so SceneCanvas can also be previewed standalone in the editor
+const DEFAULT_DEMO_SCENE: SceneGraph = {
+  scene_id: 'scene1_pick_place',
+  table_z: 0.0,
+  camera: {
+    pos: [0.0, -0.55, 0.42],
+    lookat: [0.0, 0.0, 0.05],
+    fovy: 45,
+    resolution: [640, 480],
+  },
+  objects: [
+    {
+      id: 'red_cube',
+      label: 'Red Plastic Cube',
+      primitive: 'box',
+      size: [0.025, 0.025, 0.025],
+      position: [0.12, -0.05, 0.026],
+      quaternion: [1, 0, 0, 0],
+      material: 'plastic',
+      is_static: false,
+      parent_id: null,
+      joint: { type: 'free', axis: [0, 0, 1], range: null, damping: 0.5, is_prior_guess: false },
+    },
+    {
+      id: 'goal_coaster',
+      label: 'Target Wood Coaster',
+      primitive: 'cylinder',
+      size: [0.045, 0.004],
+      position: [-0.14, 0.08, 0.005],
+      quaternion: [1, 0, 0, 0],
+      material: 'wood',
+      is_static: true,
+      parent_id: null,
+      joint: { type: 'fixed', axis: [0, 0, 1], range: null, damping: 0.5, is_prior_guess: false },
+    },
+  ],
+  task: {
+    task_type: 'pick_and_place',
+    description: 'Pick up the red cube and place it on the wooden coaster.',
+    manipulated_object_id: 'red_cube',
+    target_position: [-0.14, 0.08, 0.035],
+    target_joint_delta: null,
+    waypoints: [
+      [0.12, -0.05, 0.12, 1.0],
+      [0.12, -0.05, 0.03, 1.0],
+      [0.12, -0.05, 0.03, -1.0],
+      [0.12, -0.05, 0.12, -1.0],
+      [-0.14, 0.08, 0.12, -1.0],
+      [-0.14, 0.08, 0.035, -1.0],
+      [-0.14, 0.08, 0.035, 1.0],
+    ],
+  },
+};
+
+const DEFAULT_DEMO_STATE: SimState = {
+  step: 0,
+  gripperPos: [0.12, -0.05, 0.12],
+  gripperCmd: 1.0,
+  fingerAperture: 0.075,
+  isGrasped: false,
+  objectPositions: {
+    red_cube: [0.12, -0.05, 0.026],
+    goal_coaster: [-0.14, 0.08, 0.005],
+  },
+  objectQuaternions: {
+    red_cube: [1, 0, 0, 0],
+    goal_coaster: [1, 0, 0, 0],
+  },
+  diagnostics: { dReach: 0.094, dGoal: 0.291 },
+  reward: 0.342,
+  terminated: false,
+  stageBreakdown: {
+    reach: 0.642,
+    graspOrClearance: 0.0,
+    liftOrProgress: 0.0,
+    placeOrGoal: 0.181,
+    terminalBonus: 0.0,
+  },
+};
+
+export default function App(props: Partial<SceneCanvasProps>) {
+  const [simState, setSimState] = useState<SimState>(props.simState ?? DEFAULT_DEMO_STATE);
+  const [history, setHistory] = useState<SimState[]>(props.rewardHistory ?? [DEFAULT_DEMO_STATE]);
+  const [isPlaying, setIsPlaying] = useState<boolean>(props.isPlaying ?? false);
+
+  const activeScene = props.scene ?? DEFAULT_DEMO_SCENE;
+  const activeSimState = props.simState ?? simState;
+  const activeHistory = props.rewardHistory ?? history;
+
+  const handleManualAction = (action: [number, number, number, number]) => {
+    if (props.onManualAction) {
+      props.onManualAction(action);
+      return;
+    }
+    setSimState((prev) => {
+      const nextPos: [number, number, number] = [
+        prev.gripperPos[0] + action[0] * 0.02,
+        prev.gripperPos[1] + action[1] * 0.02,
+        Math.max(0.02, prev.gripperPos[2] + action[2] * 0.02),
+      ];
+      const nextState: SimState = {
+        ...prev,
+        step: prev.step + 1,
+        gripperPos: nextPos,
+        gripperCmd: action[3],
+        fingerAperture: action[3] < 0 ? 0.018 : 0.075,
+      };
+      setHistory((h) => [...h, nextState]);
+      return nextState;
+    });
+  };
+
+  return (
+    <SceneCanvas
+      scene={activeScene}
+      simState={activeSimState}
+      rewardHistory={activeHistory}
+      isPlaying={props.isPlaying ?? isPlaying}
+      onTogglePlay={props.onTogglePlay ?? (() => setIsPlaying((p) => !p))}
+      onResetSim={
+        props.onResetSim ??
+        (() => {
+          setSimState(DEFAULT_DEMO_STATE);
+          setHistory([DEFAULT_DEMO_STATE]);
+        })
+      }
+      onStepOracleEnd={props.onStepOracleEnd ?? (() => { })}
+      onManualAction={handleManualAction}
+    />
+  );
+}

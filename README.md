@@ -2,11 +2,12 @@
 
 > **Autonomous Synthesis of Validated, Trainable MuJoCo 3.x Gymnasium Environments from Monocular Video & 3D Scene Graphs**
 
-[![CI Tests](https://img.shields.io/badge/tests-86%20passed%20(100%25)-brightgreen.svg)]()
+[![CI Tests](https://img.shields.io/badge/tests-88%20passed%20(100%25)-brightgreen.svg)]()
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)]()
 [![MuJoCo 3.x](https://img.shields.io/badge/mujoco-3.17.0-orange.svg)]()
 [![Baseten](https://img.shields.io/badge/Baseten-meta--models%2Fmuse--spark--open--1026-violet.svg)]()
-[![React 18](https://img.shields.io/badge/frontend-React%2018%20%2B%20Three.js-cyan.svg)]()
+[![React 19](https://img.shields.io/badge/frontend-React%2019%20%2B%20Three.js-cyan.svg)]()
+[![Docker](https://img.shields.io/badge/docker-ready-blue.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
@@ -20,8 +21,9 @@
 - **Baseten Hackathon Integration**: Native live streaming reasoning powered by `meta-models/muse-spark-open-1026` via OpenAI-compatible endpoints at `https://inference.baseten.co/v1`.
 - **Automated Self-Healing Loop**: If physics gates fail (e.g. zero-reward variance, static drift, or pen-explosion), the Muse Spark reasoner diagnoses the runtime failure, generates an automated AST patch diff, hot-reloads the reward module, and re-validates.
 - **5-Gate Quality Pipeline**: Zero-flakiness automated validation ensuring numerical stability, static equilibrium, non-degenerate dense rewards, closed-loop waypoint oracle solvability, and residual PPO policy learning.
-- **Render + Diff Visual Alignment**: Validates MuJoCo Frame 0 against the source video via SAM 3.1 mask IoU with automated coordinate refinement.
-- **Dual-Cockpit Studio UI**: A professional React 18 + Vite dashboard combining an **8-Stage Autonomous Pipeline Studio** with an interactive **Full-Fidelity 3D Three.js PBR Workbench**.
+- **Render + Diff Visual Alignment**: Validates MuJoCo Frame 0 against the source video via SAM 3.1 mask IoU with automated coordinate refinement (achieving up to **100% IoU**).
+- **Dual-Cockpit Studio UI**: A professional React 19 + Vite dashboard combining an **8-Stage Autonomous Pipeline Studio** with an interactive **Full-Fidelity 3D Three.js PBR Workbench**.
+- **One-Command Containerization**: Ready-to-ship multi-stage `Dockerfile` and `docker-compose.yml` with headless OpenGL/OSMesa rendering for CPU and GPU cloud deployments.
 
 ---
 
@@ -49,7 +51,7 @@ MJCF Builder ── MuJoCo 3.17 XML with Mocap Welds, Elliptic Friction Cones, c
 Modular Reward Engine ── Reach → Grasp/Push → Lift/Progress → Place/Displace → Terminal Success
         │
         ▼ (Stage 7: 5-Gate Validation & Residual PPO Training)
-Validation Suite ── Gate 1: Stability (1,000 steps, zero NaNs, |qacc| < 1e6)
+Validation Suite ── Gate 1: Stability (500 steps, zero NaNs, |qacc| < 1e6)
                  ── Gate 2: Equilibrium (250 steps, drift < 2mm h, < 1mm v)
                  ── Gate 3: Non-Degenerate Reward Variance (σ > 1e-4)
                  ── Gate 4: Closed-Loop Waypoint Oracle (120 frames @ 30 FPS)
@@ -60,7 +62,7 @@ Validation Suite ── Gate 1: Stability (1,000 steps, zero NaNs, |qacc| < 1e6)
 Render + Diff Alignment ── Mask IoU evaluation against video Frame 0 + Coordinate Refinement
         │
         ▼
-4.0-Second 120-Frame Rollout MP4 & Deployable MuJoCo Gymnasium Environment
+4.0-Second Rollout MP4 & Deployable MuJoCo Gymnasium Environment
 ```
 
 ---
@@ -71,9 +73,9 @@ WorldForge ships with 3 pre-configured golden validation benchmarks covering fun
 
 | Scene Preset | Task Type | Manipulated Object | Distractors / Articulation | Waypoints | Target Goal |
 |---|---|---|---|---|---|
-| **Scene 1: Red Cube Pick & Place** | `pick_and_place` | 3cm Red Plastic Cube | Optical table, blue coaster target | 5 Waypoints | Pick cube, lift 15cm, place precisely on coaster |
-| **Scene 2: Push Around Obstacle** | `push_to_target` | Yellow Wood Cylinder | Heavy metal tall obstacle block, goal marker | 7 Waypoints | Pre-pose, navigate around obstacle, push to goal |
-| **Scene 3: Articulated Slide Drawer** | `articulate_joint` | Sliding Drawer Box | Cabinet base, prismatic slide joint (range: `[0, 0.12]m`) | 5 Waypoints | Approach handle, hook gripper, pull drawer open 10cm |
+| **Scene 1: Red Cube Pick & Place** | `pick_and_place` | 3cm Red Plastic Cube | Optical table, blue coaster target | 7 Waypoints | Pick cube, lift 15cm, place precisely on coaster |
+| **Scene 2: Push Around Obstacle** | `push_to_target` | Yellow Wood Cylinder | Heavy metal tall obstacle block, goal marker | 5 Waypoints | Pre-pose, navigate around obstacle, push to goal |
+| **Scene 3: Articulated Slide Drawer** | `articulate_joint` | Sliding Drawer Box | Cabinet base, prismatic slide joint (range: `[0, 0.12]m`) | 4 Waypoints | Approach handle, hook gripper, pull drawer open 10cm |
 
 ---
 
@@ -82,16 +84,16 @@ WorldForge ships with 3 pre-configured golden validation benchmarks covering fun
 Every synthesized environment must pass five strict, objective physics and learning gates before deployment:
 
 1. **Gate 1: Numerical Stability & Integration Health**
-   - Simulates 1,000 physics steps (`timestep=0.002`, `implicitfast` integrator).
+   - Simulates 500 physics steps (`timestep=0.002`, `implicitfast` integrator).
    - Enforces **zero NaNs / Infs** in `qpos`, `qvel`, and generalized accelerations (`|qacc| < 1e6`).
 2. **Gate 2: Static Equilibrium & Penetration Check**
    - Settles objects for 250 steps without actuation.
    - Enforces resting drift **< 2.0 mm horizontally** and **< 1.0 mm vertically**.
    - Eliminates explosive contact forces from interpenetrating geoms.
 3. **Gate 3: Non-Degenerate Reward Variance**
-   - Steps 20 random exploratory actions.
+   - Evaluates 3 random exploratory episodes of 30 steps each.
    - Requires reward standard deviation $\sigma > 10^{-4}$ to ensure the RL policy receives a rich learning signal.
-   - Automatically triggers the **Self-Healing Loop** if broken reward logic is detected.
+   - Automatically triggers the **Self-Healing Loop** if broken reward logic is detected (resuming Retry #2 from Gate 3 via Incremental Gate Resume).
 4. **Gate 4: Closed-Loop Waypoint Oracle Solvability**
    - Executes deterministic proportional cartesian control along estimated 3D waypoints.
    - Enforces task completion and terminal goal attainment within 120 steps.
@@ -133,7 +135,7 @@ WorldForge-RL/
 │   │   └── mask_iou.py                 # Mask IoU, coordinate refinement & green/red diff overlays
 │   └── sandbox/
 │       └── modal_executor.py           # Modal Sandbox cloud runner & micro-budget cap enforcement
-├── frontend/                           # Studio-Grade React 18 + Vite + Tailwind CSS + Three.js
+├── frontend/                           # Studio-Grade React 19 + Vite + Tailwind CSS + Three.js
 │   ├── src/
 │   │   ├── App.tsx                     # 3-Pane Studio 2.0 dashboard + full-screen view switcher
 │   │   ├── components/
@@ -143,12 +145,16 @@ WorldForge-RL/
 ├── outputs/                            # Static asset repository (rollout MP4s, masks, diff overlays)
 ├── scripts/
 │   └── generate_previews.py            # Offline asset regeneration for all 3 golden scenes
+├── Dockerfile                          # Multi-stage container (Node 20 build + Python 3.12 + Astral uv:0.13.6 runtime)
+├── docker-compose.yml                  # Docker Compose stack with volume persistence & healthchecks
+├── requirements.txt                    # Top-level human-maintained Python dependency manifest
+├── requirements.lock                   # Hermetic, deterministic Linux CPU dependency lockfile (compiled via uv)
 ├── run_demo.py                         # Single-command launcher for FastAPI backend + Vite frontend
 ├── start_studio.ps1                    # Native Windows PowerShell launcher
 └── tests/
     ├── test_phase1.py                  # 25 Phase 1 tests (Schema, MJCF Builder, Base Env)
     ├── test_phase2.py                  # 27 Phase 2 tests (Dense Rewards, Gates 1–5, Self-Healing)
-    ├── test_phase3.py                  # 9 Phase 3 tests (SAM 3.1, 3D Lift, SVD Axis, Muse Spark)
+    ├── test_phase3.py                  # 11 Phase 3 tests (SAM 3.1 4-Tier Hierarchy, 4px Erosion, 3D Lift, SVD Axis)
     ├── test_phase4.py                  # 14 Phase 4 tests (Render+Diff IoU, Modal Sandbox)
     └── test_phase5.py                  # 11 Phase 5 tests (Baseten, SSE Streaming, API Endpoints)
 ```
@@ -168,18 +174,24 @@ WorldForge-RL/
 git clone https://github.com/syed-mohsin-s/WorldForge.git
 cd WorldForge
 
-# Create virtual environment
-python -m venv .venv
-
-# Activate virtual environment
+# Option A: Fast Setup with Astral uv (Recommended — 10–100× faster):
+uv venv .venv
 # Windows (PowerShell):
 .\.venv\Scripts\Activate.ps1
 # Linux / macOS:
 source .venv/bin/activate
 
-# Install Python backend dependencies
+# Option A1: Install locked deterministic dependency graph (identical to production Docker container):
+uv pip sync --torch-backend cpu requirements.lock
+
+# Option A2: Or install direct from top-level requirements.txt:
+uv pip install --torch-backend cpu -r requirements.txt
+
+# Option B: Standard Python venv & pip:
+python -m venv .venv
+# Windows: .\.venv\Scripts\Activate.ps1 | Linux/macOS: source .venv/bin/activate
 pip install --upgrade pip
-pip install mujoco gymnasium pydantic pyyaml numpy scipy pytest stable-baselines3 "imageio[ffmpeg]" opencv-python-headless httpx openai fastapi "uvicorn[standard]" python-dotenv python-multipart
+pip install -r requirements.txt
 ```
 
 ### 2. Configure Environment Variables
@@ -200,7 +212,7 @@ BASETEN_BASE_URL="https://inference.baseten.co/v1"
 # Meta Model API $150 Grant
 META_API_KEY="your_meta_api_key_here"
 
-# Modal Cloud Sandbox $130 Grant
+# Modal Cloud Sandbox $30 Grant
 MODAL_TOKEN_ID=""
 MODAL_TOKEN_SECRET=""
 ```
@@ -234,29 +246,171 @@ Once running:
 
 ---
 
+## 🐳 Running with Docker & Containerization
+
+WorldForge provides an enterprise-ready, multi-stage production container build powered by **Astral `uv:0.13.6`** for ultra-fast, deterministic dependency resolution with parallel chunk streaming and BuildKit layer caching. It packages both the React 19 + Vite frontend and the Python MuJoCo 3.17 physics backend into a single, unified container with headless off-screen rendering support (`osmesa` CPU software rasterization or `egl` NVIDIA GPU acceleration).
+
+### Architecture & Build Optimizations
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Stage 1: frontend-builder (node:20-slim)                                    │
+│   ├── Mounts BuildKit npm cache (/root/.npm)                                │
+│   ├── npm ci --prefer-offline                                               │
+│   └── npm run build ──► Produces /app/frontend/dist (Vite + Tailwind CSS)   │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ Copies /app/frontend/dist
+┌──────────────────────────────────────▼──────────────────────────────────────┐
+│ Stage 2: runtime (python:3.12-slim-bookworm)                                │
+│   ├── Copies pinned Astral uv binary (ghcr.io/astral-sh/uv:0.13.6)          │
+│   ├── Headless Rendering: libgl1, libegl1, libgles2, libosmesa6, curl       │
+│   ├── Layer Cache: COPY requirements.lock (CPU Linux dependency graph)      │
+│   ├── uv pip sync --system --torch-backend cpu requirements.lock            │
+│   │     └── Sub-second rebuilds; application edits never bust package cache │
+│   ├── COPY src/, configs/, scripts/, outputs/                               │
+│   ├── Serves React 19 Studio at '/' & FastAPI endpoints on port 8000        │
+│   └── HEALTHCHECK: curl -f http://localhost:8000/api/status                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Dual-Tier Dependency Management (`requirements.txt` vs `requirements.lock`)
+
+WorldForge maintains a strict separation between high-level package declarations and hermetic lockfiles:
+
+1. **`requirements.txt` (Developer Manifest)**: Human-maintained file specifying top-level libraries and permissible version bounds (`mujoco==3.17.0`, `torch>=2.2.0`, `stable-baselines3>=2.3.0`, `gymnasium>=0.29.0`, `fastapi>=0.110.0`, `pydantic>=2.7.0`).
+2. **`requirements.lock` (Hermetic Linux Graph)**: Fully-resolved, pinned dependency lockfile generated by `uv` specifically for Linux x86_64 with native CPU PyTorch (`torch==2.15.0+cpu`). This prevents Docker from pulling 2GB+ CUDA wheels and ensures 100% byte-for-byte reproducibility across CI, Docker, and production deployments.
+
+Whenever you update `requirements.txt`, recompile the deterministic lockfile before building the container:
+
+```bash
+uv pip compile --torch-backend cpu --python 3.12 requirements.txt -o requirements.lock
+```
+
+---
+
+### Option A: Docker Compose (Recommended)
+
+WorldForge ships with a pre-configured `docker-compose.yml` supporting persistent volume mounts for synthesized rollouts, mask images, and gym exports:
+
+```bash
+# 1. Build and launch the all-in-one production container:
+docker compose up --build
+
+# 2. Or run detached in the background:
+docker compose up -d --build
+```
+
+#### Decoupled Frontend Hot-Reloading (`--profile dev`)
+For rapid UI iteration with Vite Hot Module Replacement (HMR) alongside the containerized MuJoCo backend:
+
+```bash
+docker compose --profile dev up
+```
+This boots the `worldforge` backend on port `8000` and launches a live `frontend-dev` Vite server on port `5173` with volume-mounted source code.
+
+---
+
+### Option B: Direct Docker Build & Run (CLI)
+
+#### 1. Build the Production Container
+Enable Docker BuildKit for cache mounts and parallel stage execution:
+
+```bash
+# Linux / macOS:
+DOCKER_BUILDKIT=1 docker build -t worldforge:latest .
+
+# Windows (PowerShell):
+$env:DOCKER_BUILDKIT=1; docker build -t worldforge:latest .
+```
+
+#### 2. Run with CPU Headless Rendering (Default OSMesa)
+```bash
+docker run -d -p 8000:8000 \
+  --env-file .env \
+  -v ${PWD}/outputs:/app/outputs \
+  --name worldforge-studio \
+  worldforge:latest
+```
+
+#### 3. Run with NVIDIA GPU Acceleration (EGL)
+For cloud instances with NVIDIA GPUs (AWS g4dn/g5, GCP A100/T4, or local Linux workstations with NVIDIA Container Toolkit installed):
+
+```bash
+docker run -d --gpus all -p 8000:8000 \
+  -e MUJOCO_GL=egl \
+  --env-file .env \
+  -v ${PWD}/outputs:/app/outputs \
+  --name worldforge-studio \
+  worldforge:latest
+```
+
+#### Container Telemetry & Status
+```bash
+# Check container status and healthcheck:
+docker ps --filter "name=worldforge-studio"
+
+# Follow live FastAPI and MuJoCo simulation logs:
+docker logs -f worldforge-studio
+```
+
+Once running:
+- **WorldForge Studio 2.0 (Unified React + MuJoCo)**: [http://localhost:8000](http://localhost:8000)
+- **FastAPI OpenAPI Interactive Documentation**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **System Health Endpoint**: [http://localhost:8000/api/status](http://localhost:8000/api/status)
+
+---
+
 ## Studio 2.0 Interface Walkthrough
 
-```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ WorldForge Studio 2.0  [⚡ 8-Stage Pipeline Studio]  [🎮 3D PBR Workbench]  $0.0088   │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│ 8-STAGE AUTONOMOUS PIPELINE:                                                           │
-│ [1. SAM 3.1] [2. 3D LIFT] [3. MUSE SPARK] [4. SCENEGRAPH] [5. MJCF] [6. REWARD] ...   │
-├───────────────────────┬────────────────────────────────┬───────────────────────────────┤
-│ LEFT: PERCEPTION      │ CENTER: SYNTHESIS ARTIFACTS    │ RIGHT: VALIDATION & ROLLOUT   │
-│ • SAM 3.1 4px Masks   │ • Spark Reasoning Token Stream │ • 4.0s Trained PPO MP4 (30fps)│
-│ • Zero Flying Pixels  │ • Pydantic V2 SceneGraph JSON  │ • Pure Waypoint Oracle MP4    │
-│ • Stage 8 Render+Diff │ • Compiled MuJoCo 3.17 MJCF    │ • 5-Gate Telemetry Checklist  │
-│   Mask IoU (99.4%)    │ • Dense Reward Code & Diff     │ • Learning Return Curve       │
-│ • Green/Red Overlays  │ • [🎮 Open 3D Workbench ↗]     │ • Self-Healing Retry Badge    │
-└───────────────────────┴────────────────────────────────┴───────────────────────────────┘
-```
+WorldForge Studio 2.0 provides an autonomous dual-cockpit interface: an **8-Stage Autonomous Pipeline Studio** and an interactive **3D PBR Workbench**, backed by real Python MuJoCo 3.17 physics and live token streaming from Baseten's `meta-models/muse-spark-open-1026`.
 
-1. **Scene Preset Selector**: Switch seamlessly between **Red Cube Pick & Place**, **Push Around Obstacle**, and **Articulated Slide Drawer** with automatic cache-busted image and rollout updates.
-2. **Interactive 8-Stage Pipeline Bar**: Displays real-time status and timing badges across Meta AI and Python stages with zero vertical clipping.
-3. **Live Baseten Reasoning Stream**: Watch `meta-models/muse-spark-open-1026` generate chain-of-thought domain reasoning tokens live via Server-Sent Events (SSE).
-4. **Self-Healing Simulation**: Check **"Inject Gate 3 Fault (Demo Self-Healing)"** to watch Gate 3 fail, emit diagnostic logs, synthesize an automated AST patch, and re-validate 100% green.
-5. **Interactive 3D PBR Workbench**: Switch into the full-screen Three.js WebGL workbench with 4-DoF manual jogging controls, waypoint spline trajectories, and real-time multi-channel reward waveforms—all executed directly by MuJoCo 3.17 on the backend.
+### 1. 8-Stage Autonomous Pipeline Studio
+
+![WorldForge Studio 2.0 Interface Walkthrough](docs/assets/studio_walkthrough.png)
+
+The interface is structured into three responsive, synchronized functional zones:
+
+#### A. Top Impact Telemetry & Navigation Bar
+- **Dynamic Speedup Readout**: Benchmarks the end-to-end synthesis duration against human expert baseline (`6.0 hrs Manual MJCF → ~30s WorldForge`, a **>700× speedup**).
+- **Cost & Hackathon Credit Tracker**: Tracks real-time API token consumption and compute cost (`$0.00xx` against `$150 Meta + $100 Baseten` hackathon grants).
+- **Render+Diff IoU Metric**: Displays the visual alignment score (up to **100% IoU**) between MuJoCo renders and the ground-truth video keyframe.
+- **Automated Self-Healing Badge**: Dynamically indicates repair status, transitioning from retry progress to emerald green (`Self-Healing: Patched on Retry 1 / 4 ✓`) upon successful gate remediation.
+- **Cockpit Switcher**: Instant toggling between `⚡ 8-Stage Pipeline Studio` and `🎮 3D PBR Workbench`.
+
+#### B. Interactive 8-Stage Pipeline Progress Header
+Displays live status and execution timings across all stages:
+1. `SAM 3.1` (Meta / B10): Multiplexed object mask segmentation with 4px boundary erosion.
+2. `3D Lift` (Python): Metric depth back-projection, RANSAC tabletop fitting, and SVD joint axis estimation.
+3. `Muse Spark` (Meta / B10): Live reasoning and domain parameter synthesis from Baseten.
+4. `Scene Graph` (Python): Pydantic V2 strict validation with auto-snap height grounding (`z = table_z + h/2 + 0.001m`).
+5. `MJCF Builder` (Python): Deterministic MuJoCo 3.17 XML compilation with Cartesian `<mocap>` weld actuators.
+6. `Muse Code` (Meta / B10): Multi-stage dense reward function synthesis and automated repair patching.
+7. `Validation & PPO` (Python): 5-Gate objective physics verification and Stable-Baselines3 PPO residual policy training.
+8. `Render + Diff` (Python): Closed-loop mask IoU evaluation against video Frame 0.
+
+#### C. Tri-Pane Real-Time Studio Dashboard
+- **Left Pane — Perception & Render+Diff**: Shows 4px boundary-eroded SAM 3.1 masks (eliminating flying depth pixels) and Stage 8 Render+Diff green/red composite overlay.
+- **Center Pane — Live Synthesis Artifacts**: Tabbed inspector with zero mock data:
+  - `Spark Reasoning`: Live token streaming from `meta-models/muse-spark-open-1026`.
+  - `SceneGraph`: Validated Pydantic V2 JSON specification.
+  - `MJCF XML`: Production-ready MuJoCo 3.17 XML code.
+  - `Reward Code`: Python dense reward function and automated AST patch diffs.
+- **Right Pane — MuJoCo 3.17 Rollout & 5-Gate Telemetry**:
+  - Multi-mode 4.0s video player (`PPO Policy`, `Oracle Baseline`, and `Perception Frame 0`).
+  - 5-Gate objective physics checklist (`Gate 1: Numerical Stability`, `Gate 2: Static Equilibrium`, `Gate 3: Reward Variance`, `Gate 4: Waypoint Oracle`, `Gate 5: PPO Convergence`).
+  - Real-time PPO learning return curve chart.
+
+---
+
+### 2. Interactive 3D PBR Workbench
+
+![3D PBR Workbench View](docs/assets/image.png)
+
+Switch to the full-screen **3D PBR Workbench** to interact directly with the compiled MuJoCo 3.17 physics environment:
+- **Real-Time WebGL Three.js Viewport**: Tabletop scene rendering with PBR materials, shadows, and cyan dashed 3D spline waypoint trajectories.
+- **4-DoF Mocap Actuator Jogging**: Directly step the Cartesian gripper in MuJoCo physics using `+X`, `-X`, `+Y`, `-Y`, `+Z`, `-Z`, and `Open / Close Jaws`.
+- **Camera Presets**: Instant viewpoint transitions (`Isometric Rig`, `MuJoCo render_cam`, `Top XY Plane`, and `Front XZ`).
+- **Closed-Loop Waypoint Oracle**: Click **Run Waypoint Oracle** to execute the deterministic proportional controller through all waypoints and observe terminal reward acquisition (`★ TERMINAL GOAL (+10.0)`).
 
 ---
 
@@ -265,15 +419,15 @@ Once running:
 WorldForge includes an exhaustive test suite covering all 5 architectural phases:
 
 ```bash
-# Run all 86 unit and integration tests:
+# Run all 88 unit and integration tests:
 .venv/Scripts/python.exe -m pytest tests/ -v
 ```
 
 ```text
-======================== 86 passed in 70.61s (0:01:10) ========================
+======================= 88 passed in 169.93s (0:02:49) =======================
 - tests/test_phase1.py : 25 PASSED (Schema validation, MJCF compilation, Gymnasium env)
 - tests/test_phase2.py : 27 PASSED (Reward shaping, Gates 1–5, PPO convergence, self-healing)
-- tests/test_phase3.py : 9 PASSED (SAM 3.1 erosion, depth back-projection, SVD joint axis)
+- tests/test_phase3.py : 11 PASSED (SAM 3.1 erosion, depth back-projection, SVD joint axis)
 - tests/test_phase4.py : 14 PASSED (Render+Diff IoU, coordinate refinement, Modal sandbox)
 - tests/test_phase5.py : 11 PASSED (Baseten enforcement, SSE streaming, FastAPI live sim endpoints)
 ```
@@ -298,7 +452,8 @@ The backend exposes native endpoints for real-time MuJoCo 3.17 physics execution
 - **Perception & 3D Math**: SAM 3.1 (Meta Model API), OpenCV, SciPy (RANSAC, SVD)
 - **Generative AI & Reasoning**: Baseten `meta-models/muse-spark-open-1026` (OpenAI-compatible client), Meta Model API
 - **Backend API**: FastAPI, Uvicorn, SSE Starlette, Pydantic V2
-- **Frontend Workbench**: React 18, Vite, Three.js, OrbitControls, Tailwind CSS, Lucide Icons, Recharts
+- **Frontend Workbench**: React 19, Vite, Three.js, OrbitControls, Tailwind CSS, Lucide Icons, Recharts
+- **Containerization & Deployment**: Docker (multi-stage), Docker Compose, OSMesa / EGL Headless Graphics
 - **Testing & Verification**: Pytest, NumPy, ImageIO
 
 ---

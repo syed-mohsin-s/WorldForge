@@ -56,6 +56,8 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     """
     a = mask_a.astype(bool)
     b = mask_b.astype(bool)
+    if a.shape != b.shape:
+        b = cv2.resize(b.astype(np.uint8), (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
 
     intersection = np.logical_and(a, b).sum()
     union = np.logical_or(a, b).sum()
@@ -63,6 +65,46 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     if union == 0:
         return 1.0
     return float(intersection / union)
+
+
+@dataclass
+class SceneIoUReport:
+    """Per-scene mask IoU report."""
+
+    per_object_iou: dict[str, float]
+    mean_iou: float
+    passed: bool
+
+
+def compute_scene_mask_iou(
+    ref_masks: dict[str, np.ndarray],
+    sim_masks: dict[str, np.ndarray],
+    threshold: float = 0.60,
+) -> SceneIoUReport:
+    """Compute per-object and mean Mask IoU between reference and simulated masks."""
+    per_object: dict[str, float] = {}
+    all_keys = set(ref_masks.keys()) | set(sim_masks.keys())
+
+    if not all_keys:
+        return SceneIoUReport(per_object_iou={}, mean_iou=1.0, passed=True)
+
+    for k in all_keys:
+        ref_m = ref_masks.get(k)
+        sim_m = sim_masks.get(k)
+        if ref_m is None or sim_m is None:
+            per_object[k] = 0.0
+        else:
+            per_object[k] = compute_mask_iou(ref_m, sim_m)
+
+    mean_iou = float(np.mean(list(per_object.values()))) if per_object else 1.0
+    passed = mean_iou >= threshold
+
+    return SceneIoUReport(
+        per_object_iou=per_object,
+        mean_iou=mean_iou,
+        passed=passed,
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -98,9 +140,15 @@ def evaluate_and_align_sim(
         if use_sam_resegment:
             from src.perception.sam_tracker import SAM31Tracker
             tracker = SAM31Tracker(cost_tracker=cost_tracker)
-            res, _ = tracker.segment_from_sim_env(env, num_frames=1, execute_oracle=False)
-            for track in res.tracks:
-                masks[track.object_id] = track.frame0_mask
+            if tracker.has_configured_backend():
+                prompts = [o.label for o in current_scene.objects]
+                res = tracker.segment_image(rgb, text_prompts=prompts)
+                for track in res.tracks:
+                    masks[track.object_id] = track.frame0_mask
+            else:
+                res, _ = tracker.segment_from_sim_env(env, num_frames=1, execute_oracle=False)
+                for track in res.tracks:
+                    masks[track.object_id] = track.frame0_mask
         else:
             # Fast MuJoCo geom segmentation buffer
             renderer = mujoco.Renderer(env.model, height=h, width=w)

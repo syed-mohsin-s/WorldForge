@@ -7,7 +7,7 @@ $root = $PSScriptRoot
 $python = "$root\.venv\Scripts\python.exe"
 
 Write-Host "[1/2] Launching FastAPI backend on http://localhost:8000 ..." -ForegroundColor Green
-$backend = Start-Process -FilePath $python -ArgumentList "-m uvicorn src.api.server:app --host 0.0.0.0 --port 8000" -WorkingDirectory $root -PassThru
+$backend = Start-Process -FilePath $python -ArgumentList "-m uvicorn src.api.server:app --host 0.0.0.0 --port 8000 --reload" -WorkingDirectory $root -PassThru
 
 Start-Sleep -Seconds 2
 

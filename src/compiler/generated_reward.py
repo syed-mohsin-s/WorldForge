@@ -112,8 +112,10 @@ def _pick_and_place_reward(
     info: dict[str, Any] = {
         "d_reach": d_reach,
         "d_place": d_place,
+        "reach_reward": reach_reward,
         "grasp_bonus": grasp_bonus,
         "lift_reward": lift_reward,
+        "place_reward": place_reward,
         "obj_pos": obj.tolist(),
     }
     return reward, terminated, info
@@ -156,6 +158,10 @@ def _push_to_target_reward(
     info: dict[str, Any] = {
         "d_reach": d_reach,
         "d_goal": d_goal,
+        "reach_reward": reach_reward,
+        "grasp_bonus": float(max(0.0, 1.0 + height_penalty)),
+        "lift_reward": progress_reward * 0.5,
+        "place_reward": progress_reward,
         "obj_pos": obj.tolist(),
     }
     return reward, terminated, info
@@ -172,6 +178,7 @@ def _articulate_joint_reward(
     target_delta = scene.task.target_joint_delta or 0.0
 
     grip = _gripper_pos(data)
+    aperture = _finger_aperture(model, data)
 
     # Find the joint on the manipulated object
     joint_name = f"{obj_id}_joint"
@@ -179,7 +186,6 @@ def _articulate_joint_reward(
     joint_pos = float(data.qpos[model.jnt_qposadr[jid]])
 
     # Use the handle or object body for reach target
-    # Try handle first, then the object itself
     reach_target_name = obj_id
     for obj_node in scene.objects:
         if obj_node.parent_id == obj_id or (
@@ -189,9 +195,7 @@ def _articulate_joint_reward(
                 for o in scene.objects
             )
         ):
-            # Use the deepest child (likely the handle)
             reach_target_name = obj_node.id
-    # Specifically look for handle children of the manipulated object's children
     for obj_node in scene.objects:
         if obj_node.parent_id is not None:
             parent = next((o for o in scene.objects if o.id == obj_node.parent_id), None)
@@ -213,6 +217,7 @@ def _articulate_joint_reward(
     progress = min(progress, 1.0)
     joint_reward = progress
 
+    grasp_bonus = 1.0 if (d_reach < 0.05 and aperture < 0.025) else 0.0
     reward = 0.3 * reach_reward + 0.7 * joint_reward
 
     # Terminal success: joint reached target threshold (within 20% tolerance)
@@ -222,9 +227,13 @@ def _articulate_joint_reward(
 
     info: dict[str, Any] = {
         "d_reach": d_reach,
+        "d_goal": max(0.0, abs(target_delta) - abs(joint_pos)),
         "joint_pos": joint_pos,
         "target_delta": target_delta,
         "progress": progress,
+        "reach_reward": reach_reward,
+        "grasp_bonus": grasp_bonus,
+        "lift_reward": progress * 0.5,
+        "place_reward": joint_reward,
     }
     return reward, terminated, info
-

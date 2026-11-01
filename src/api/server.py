@@ -10,17 +10,20 @@ Provides REST and Server-Sent Event (SSE) endpoints for:
 
 from __future__ import annotations
 
+import io
 import json
 import logging
 import os
 import shutil
+import threading
+import zipfile
 from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -28,6 +31,7 @@ import mujoco
 import numpy as np
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.generated_reward import compute_reward
+from src.compiler.mjcf_builder import SceneCompiler
 from src.pipeline import OUTPUTS_ROOT, SCENES_DIR, run_worldforge_pipeline, stream_worldforge_pipeline
 from src.schema.scene_graph import SceneGraph
 from src.validation.ppo_runner import OracleController
@@ -41,7 +45,6 @@ app = FastAPI(
     description="Studio-Grade MuJoCo 3.17 + Baseten / Meta RL Environment Synthesis API",
 )
 
-# Enable CORS for frontend UI running on any port (e.g. 5173, 3000, 8080)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -50,9 +53,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount outputs directory for static files (rollout.mp4, frame0_masks.png, diff_overlay.png)
 OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_ROOT)), name="outputs")
+
+# The production image contains the Vite build at /app/frontend/dist.  Keep
+# this optional so native API development still works before the frontend has
+# been built locally.
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+FRONTEND_ASSETS = FRONTEND_DIST / "assets"
+if FRONTEND_ASSETS.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS)), name="frontend-assets")
 
 
 def ensure_preview_assets():
@@ -84,7 +94,9 @@ class RunRequest(BaseModel):
     scene_id: str = Field(default="scene1_pick_place", description="Golden scene ID or custom scene")
     inject_fault: bool = Field(default=False, description="Whether to inject Gate 3 zero-reward fault to demo self-healing")
     provider: Literal["auto", "baseten", "meta", "local"] = Field(default="auto", description="LLM provider")
-    quick_ppo: bool = Field(default=True, description="Use 4096 timesteps for rapid interactive training")
+    quick_ppo: bool = Field(default=True, description="Use rapid interactive training horizon")
+    task_prompt: str | None = Field(default=None, description="Optional custom natural-language manipulation prompt")
+    video_path: str | None = Field(default=None, description="Optional uploaded tabletop MP4 path")
 
 
 class SimActionRequest(BaseModel):
@@ -101,7 +113,6 @@ class SimResetRequest(BaseModel):
     scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
 
 
-# Active in-memory simulation sessions per scene
 active_sim_sessions: dict[str, dict[str, Any]] = {}
 
 
@@ -192,6 +203,15 @@ def get_system_status() -> dict[str, Any]:
     baseten_key = os.environ.get("BASETEN_API_KEY", "")
     meta_key = os.environ.get("META_API_KEY", "")
     modal_token = os.environ.get("MODAL_TOKEN_ID", "")
+    sam_endpoint = os.environ.get("SAM31_ENDPOINT_URL", "")
+
+    sam_provider = "sim-depth-seg (offline)"
+    if sam_endpoint and sam_endpoint.strip():
+        sam_provider = "unsloth/sam3.1 (Colab/Kaggle T4 GPU)"
+    elif meta_key and not meta_key.startswith("your_"):
+        sam_provider = "meta-api/sam-3.1"
+    elif os.environ.get("SAM31_LOCAL_HF", "").lower() in ("true", "1", "yes"):
+        sam_provider = "unsloth/sam3.1 (Snapdragon Oryon CPU)"
 
     return {
         "status": "online",
@@ -211,6 +231,11 @@ def get_system_status() -> dict[str, Any]:
         "modal": {
             "configured": bool(modal_token),
             "grant": "$130 Modal Cloud Credit",
+        },
+        "sam31": {
+            "configured": bool(sam_endpoint or (meta_key and not meta_key.startswith("your_"))),
+            "provider": sam_provider,
+            "endpoint_url": sam_endpoint,
         },
     }
 
@@ -306,17 +331,26 @@ def sim_reset(req: SimResetRequest) -> dict[str, Any]:
     """Reset the live MuJoCo 3.17 simulation environment and return ground-truth state."""
     clean_id = req.scene_id.replace(".json", "")
     sg = _load_scene_graph(clean_id)
-    env = WorldForgeEnv(sg)
-    env.reset(seed=42)
-    ctrl = OracleController(sg.task.waypoints)
-    active_sim_sessions[clean_id] = {
-        "env": env,
-        "sg": sg,
-        "ctrl": ctrl,
-        "step": 0,
-        "grip_cmd": 1.0,
-    }
-    return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
+    prev = active_sim_sessions.get(clean_id)
+    lock = prev["lock"] if (prev and "lock" in prev) else threading.Lock()
+    with lock:
+        if prev and "env" in prev:
+            try:
+                prev["env"].close()
+            except Exception:
+                pass
+        env = WorldForgeEnv(sg)
+        env.reset(seed=42)
+        ctrl = OracleController(sg.task.waypoints)
+        active_sim_sessions[clean_id] = {
+            "env": env,
+            "sg": sg,
+            "ctrl": ctrl,
+            "step": 0,
+            "grip_cmd": 1.0,
+            "lock": lock,
+        }
+        return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
 
 
 @app.post("/api/sim/step")
@@ -327,15 +361,16 @@ def sim_step(req: SimActionRequest) -> dict[str, Any]:
         sim_reset(SimResetRequest(scene_id=clean_id))
 
     session = active_sim_sessions[clean_id]
-    env: WorldForgeEnv = session["env"]
-    sg: SceneGraph = session["sg"]
+    with session["lock"]:
+        env: WorldForgeEnv = session["env"]
+        sg: SceneGraph = session["sg"]
 
-    action_arr = np.array(req.action, dtype=np.float32)
-    obs, r, term, trunc, info = env.step(action_arr)
-    session["step"] += 1
-    session["grip_cmd"] = float(req.action[3])
+        action_arr = np.array(req.action, dtype=np.float32)
+        obs, r, term, trunc, info = env.step(action_arr)
+        session["step"] += 1
+        session["grip_cmd"] = float(req.action[3])
 
-    return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
+        return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
 
 
 @app.post("/api/sim/oracle-step")
@@ -346,16 +381,17 @@ def sim_oracle_step(req: SimResetRequest) -> dict[str, Any]:
         sim_reset(SimResetRequest(scene_id=clean_id))
 
     session = active_sim_sessions[clean_id]
-    env: WorldForgeEnv = session["env"]
-    sg: SceneGraph = session["sg"]
-    ctrl: OracleController = session["ctrl"]
+    with session["lock"]:
+        env: WorldForgeEnv = session["env"]
+        sg: SceneGraph = session["sg"]
+        ctrl: OracleController = session["ctrl"]
 
-    action = ctrl.get_action(env)
-    obs, r, term, trunc, info = env.step(action)
-    session["step"] += 1
-    session["grip_cmd"] = float(action[3])
+        action = ctrl.get_action(env)
+        obs, r, term, trunc, info = env.step(action)
+        session["step"] += 1
+        session["grip_cmd"] = float(action[3])
 
-    return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
+        return _extract_sim_state(env, sg, step=session["step"], grip_cmd=session["grip_cmd"])
 
 
 @app.get("/api/sim/trajectory")
@@ -401,6 +437,8 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             inject_fault=req.inject_fault,
             provider=req.provider,
             quick_ppo=req.quick_ppo,
+            video_path=req.video_path,
+            task_prompt=req.task_prompt,
         )
         return result
     except Exception as exc:
@@ -414,6 +452,8 @@ def stream_pipeline_get(
     inject_fault: bool = Query(False),
     provider: str = Query("auto"),
     quick_ppo: bool = Query(True),
+    task_prompt: str | None = Query(None),
+    video_path: str | None = Query(None),
 ):
     """Stream the 8-stage pipeline as Server-Sent Events (SSE)."""
     return StreamingResponse(
@@ -422,6 +462,8 @@ def stream_pipeline_get(
             inject_fault=inject_fault,
             provider=provider,
             quick_ppo=quick_ppo,
+            video_path=video_path,
+            task_prompt=task_prompt,
         ),
         media_type="text/event-stream",
         headers={
@@ -441,6 +483,8 @@ def stream_pipeline_post(req: RunRequest):
             inject_fault=req.inject_fault,
             provider=req.provider,
             quick_ppo=req.quick_ppo,
+            video_path=req.video_path,
+            task_prompt=req.task_prompt,
         ),
         media_type="text/event-stream",
         headers={
@@ -451,22 +495,90 @@ def stream_pipeline_post(req: RunRequest):
     )
 
 
+@app.get("/api/export/{scene_id}")
+def export_gym_package(scene_id: str) -> Response:
+    """Export a self-contained Gymnasium + MuJoCo 3.17 environment ZIP package."""
+    clean_id = scene_id.replace(".json", "")
+    sg = _load_scene_graph(clean_id)
+    out_dir = OUTPUTS_ROOT / clean_id
+
+    mjcf_path = out_dir / "environment.xml"
+    if mjcf_path.exists():
+        mjcf_xml = mjcf_path.read_text(encoding="utf-8")
+    else:
+        mjcf_xml = SceneCompiler(sg).compile()
+
+    reward_src_path = Path(__file__).resolve().parents[1] / "compiler" / "generated_reward.py"
+    reward_code = reward_src_path.read_text(encoding="utf-8") if reward_src_path.exists() else ""
+
+    standalone_runner = f'''"""Standalone WorldForge-RL Gymnasium Environment Runner ({sg.scene_id})."""
+import json
+from pathlib import Path
+import mujoco
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+MODEL = mujoco.MjModel.from_xml_path(str(HERE / "environment.xml"))
+DATA = mujoco.MjData(MODEL)
+
+if __name__ == "__main__":
+    mujoco.mj_resetData(MODEL, DATA)
+    for step in range(250):
+        mujoco.mj_step(MODEL, DATA)
+    print(f"Successfully simulated 250 steps of {sg.scene_id} in MuJoCo {{mujoco.__version__}}!")
+'''
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(f"{clean_id}/environment.xml", mjcf_xml)
+        zf.writestr(f"{clean_id}/scene_graph.json", json.dumps(sg.model_dump(), indent=2))
+        zf.writestr(f"{clean_id}/reward_code.py", reward_code)
+        zf.writestr(f"{clean_id}/run_standalone.py", standalone_runner)
+        if (out_dir / "frame0_masks.png").exists():
+            zf.write(out_dir / "frame0_masks.png", arcname=f"{clean_id}/frame0_masks.png")
+        if (out_dir / "diff_overlay.png").exists():
+            zf.write(out_dir / "diff_overlay.png", arcname=f"{clean_id}/diff_overlay.png")
+        if (out_dir / "rollout.mp4").exists():
+            zf.write(out_dir / "rollout.mp4", arcname=f"{clean_id}/rollout.mp4")
+
+    buf.seek(0)
+    return Response(
+        content=buf.getvalue(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="worldforge_{clean_id}_gym_pkg.zip"'
+        },
+    )
+
+
 @app.post("/api/upload-video")
 async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
     """Accept an uploaded tabletop MP4 video for perception analysis."""
     uploads_dir = OUTPUTS_ROOT / "uploads"
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    dest_path = uploads_dir / file.filename
+    safe_name = Path(file.filename or "uploaded_tabletop.mp4").name
+    dest_path = uploads_dir / safe_name
     with open(dest_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     return {
         "status": "success",
-        "filename": file.filename,
-        "video_url": f"/outputs/uploads/{file.filename}",
+        "filename": safe_name,
+        "video_path": str(dest_path),
+        "video_url": f"/outputs/uploads/{safe_name}",
         "size_bytes": dest_path.stat().st_size,
     }
+
+
+@app.get("/", include_in_schema=False)
+def serve_frontend() -> Response:
+    """Serve the image's compiled Studio entry point when it is available."""
+    index_html = FRONTEND_DIST / "index.html"
+    if not index_html.is_file():
+        raise HTTPException(status_code=404, detail="Frontend build is not available.")
+    # Keep the HTML fresh so a rebuilt image references its latest hashed assets.
+    return FileResponse(index_html, headers={"Cache-Control": "no-cache"})
 
 
 if __name__ == "__main__":

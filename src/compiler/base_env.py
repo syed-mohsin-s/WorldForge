@@ -208,7 +208,14 @@ class WorldForgeEnv(gym.Env):
             if sys.platform == "linux" and "DISPLAY" not in os.environ:
                 if "MUJOCO_GL" not in os.environ:
                     os.environ["MUJOCO_GL"] = "egl"
-            self._renderer = mujoco.Renderer(self.model, height=h, width=w)
+            try:
+                self._renderer = mujoco.Renderer(self.model, height=h, width=w)
+            except Exception:
+                if sys.platform == "linux" and os.environ.get("MUJOCO_GL") != "osmesa":
+                    os.environ["MUJOCO_GL"] = "osmesa"
+                    self._renderer = mujoco.Renderer(self.model, height=h, width=w)
+                else:
+                    raise
         self._renderer.update_scene(self.data, camera=self._cam_id)
         return self._renderer.render()
 

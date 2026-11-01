@@ -471,3 +471,26 @@ def _camera_xyaxes(
 
     return f"{rx} {ry} {rz} {tux} {tuy} {tuz}"
 
+
+class SceneCompiler:
+    """Convenience class wrapper around compile_scene_to_mjcf."""
+
+    def __init__(
+        self,
+        scene: "SceneGraph",
+        randomize: bool = False,
+        seed: int | None = None,
+    ) -> None:
+        self.scene = scene
+        self.randomize = randomize
+        self.seed = seed
+
+    def compile(self) -> str:
+        """Compile the scene to a MuJoCo 3.x MJCF XML string."""
+        return compile_scene_to_mjcf(
+            self.scene,
+            randomize=self.randomize,
+            seed=self.seed,
+        )
+
+

@@ -15,9 +15,13 @@ Test matrix
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import cv2
 
 import mujoco
 import numpy as np
@@ -118,6 +122,92 @@ class TestSAMTracker:
             assert np.any(t.frame0_mask)
             assert len(t.centroids_2d) == 5
         env.close()
+
+    def test_sam31_self_hosted_endpoint_tier2(self, tmp_path: Path) -> None:
+        """Verify SAM31Tracker parses /segment from unsloth/sam3.1, erodes 4px, and feeds lift_3d cleanly."""
+        # 1. Create a synthetic 5-frame MP4 video
+        vid_path = tmp_path / "sample_stage1.mp4"
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(str(vid_path), fourcc, 10.0, (640, 480))
+        for _ in range(5):
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+            frame[180:280, 240:340] = [200, 30, 30]  # synthetic red box
+            writer.write(frame)
+        writer.release()
+
+        # 2. Generate a synthetic 100x100 binary mask and encode to base64 PNG
+        raw_mask = np.zeros((480, 640), dtype=np.uint8)
+        raw_mask[180:280, 240:340] = 255
+        ok, buf = cv2.imencode(".png", raw_mask)
+        assert ok, "Failed to encode mock PNG"
+        mask_b64 = base64.b64encode(buf.tobytes()).decode("ascii")
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "tracks": [
+                {
+                    "object_id": "red_cube",
+                    "label": "red cube",
+                    "mask_png_b64": mask_b64,
+                    "bbox_2d": [240, 180, 340, 280],
+                    "centroids_2d": [[290.0, 230.0] for _ in range(5)],
+                }
+            ]
+        }
+        mock_resp.raise_for_status.return_value = None
+
+        tracker = SAM31Tracker(endpoint_url="https://mock-unsloth-sam31.trycloudflare.com")
+
+        with patch("httpx.Client.post", return_value=mock_resp) as mock_post:
+            result = tracker.track_video(str(vid_path), text_prompts=["red cube"])
+
+            mock_post.assert_called_once()
+            called_url = mock_post.call_args[0][0] if mock_post.call_args[0] else mock_post.call_args[1].get("url")
+            assert called_url == "https://mock-unsloth-sam31.trycloudflare.com/segment"
+
+            called_payload = mock_post.call_args[1].get("json")
+            assert called_payload is not None
+            assert "image_b64" in called_payload
+            assert called_payload["prompts"] == ["red cube"]
+            assert called_payload["max_frames"] == 5
+
+        # 3. Verify provider telemetry and erosion
+        assert result.sam_provider_used == "unsloth/sam3.1 (Colab/Kaggle T4 GPU)"
+        assert len(result.tracks) == 1
+        t = result.tracks[0]
+        assert t.object_id == "red_cube"
+        assert t.label == "red cube"
+        assert t.bbox_2d == (240, 180, 340, 280)
+        assert len(t.centroids_2d) == 5
+
+        # 4px erosion check: eroded mask perimeter should be shrunk
+        raw_count = int(np.sum(t.frame0_mask))
+        eroded_count = int(np.sum(t.frame0_eroded_mask))
+        assert raw_count == 100 * 100
+        assert eroded_count < raw_count
+        # (100 - 8) * (100 - 8) = 92 * 92 = 8464
+        assert eroded_count == 92 * 92
+
+        # 4. Feed tracking result directly into lift_scene_to_3d
+        scene = _load_scene("scene1_pick_place.json")
+        depth = np.ones((480, 640), dtype=np.float32) * 1.2
+        lifted = lift_scene_to_3d(result, scene.camera, frame0_depth=depth, scene_id="mock_unsloth_scene")
+
+        assert len(lifted.objects) == 1
+        lifted_obj = lifted.objects[0]
+        assert lifted_obj.id == "red_cube"
+        assert lifted_obj.label == "red cube"
+        assert lifted_obj.primitive in ("box", "cylinder", "sphere", "capsule")
+
+    def test_sam31_local_hf_tier3_and_fallback(self) -> None:
+        """Verify Tier 3 local HF CPU inference executes when enabled or falls back transparently."""
+        # When local_hf=True without valid HF weights locally, it falls back to Tier 4 without crashing
+        tracker = SAM31Tracker(local_hf=True, endpoint_url=None, api_key=None)
+        img = np.zeros((480, 640, 3), dtype=np.uint8)
+        img[100:200, 100:200] = [200, 200, 200]
+        res = tracker.segment_image(img, text_prompts=["test_object"])
+        assert res.sam_provider_used in ("unsloth/sam3.1 (Snapdragon Oryon CPU)", "sim-depth-seg (offline)")
 
 
 # =====================================================================
