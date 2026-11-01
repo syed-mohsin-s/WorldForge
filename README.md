@@ -326,7 +326,7 @@ Displays live status and execution timings across all stages:
 
 ### 2. Interactive 3D PBR Workbench
 
-![3D PBR Workbench View](docs/assets/workbench_walkthrough.png)
+![3D PBR Workbench View](docs/assets/image.png)
 
 Switch to the full-screen **3D PBR Workbench** to interact directly with the compiled MuJoCo 3.17 physics environment:
 - **Real-Time WebGL Three.js Viewport**: Tabletop scene rendering with PBR materials, shadows, and cyan dashed 3D spline waypoint trajectories.
