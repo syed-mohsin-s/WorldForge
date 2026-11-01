@@ -145,16 +145,16 @@ WorldForge-RL/
 ├── outputs/                            # Static asset repository (rollout MP4s, masks, diff overlays)
 ├── scripts/
 │   └── generate_previews.py            # Offline asset regeneration for all 3 golden scenes
-├── Dockerfile                          # Multi-stage production container (Node 20 build + Python 3.12 MuJoCo runtime)
+├── Dockerfile                          # Multi-stage container (Node 20 build + Python 3.12 + Astral uv:0.13.6 runtime)
 ├── docker-compose.yml                  # Docker Compose stack with volume persistence & healthchecks
-├── requirements.txt                    # Human-maintained Python dependency inputs
-├── requirements.lock                   # Resolved CPU-only Docker dependency graph
+├── requirements.txt                    # Top-level human-maintained Python dependency manifest
+├── requirements.lock                   # Hermetic, deterministic Linux CPU dependency lockfile (compiled via uv)
 ├── run_demo.py                         # Single-command launcher for FastAPI backend + Vite frontend
 ├── start_studio.ps1                    # Native Windows PowerShell launcher
 └── tests/
     ├── test_phase1.py                  # 25 Phase 1 tests (Schema, MJCF Builder, Base Env)
     ├── test_phase2.py                  # 27 Phase 2 tests (Dense Rewards, Gates 1–5, Self-Healing)
-    ├── test_phase3.py                  # 9 Phase 3 tests (SAM 3.1, 3D Lift, SVD Axis, Muse Spark)
+    ├── test_phase3.py                  # 11 Phase 3 tests (SAM 3.1 4-Tier Hierarchy, 4px Erosion, 3D Lift, SVD Axis)
     ├── test_phase4.py                  # 14 Phase 4 tests (Render+Diff IoU, Modal Sandbox)
     └── test_phase5.py                  # 11 Phase 5 tests (Baseten, SSE Streaming, API Endpoints)
 ```
@@ -174,13 +174,17 @@ WorldForge-RL/
 git clone https://github.com/syed-mohsin-s/WorldForge.git
 cd WorldForge
 
-# Option A: Fast Setup with uv (Recommended, 10-100x faster):
+# Option A: Fast Setup with Astral uv (Recommended — 10–100× faster):
 uv venv .venv
 # Windows (PowerShell):
 .\.venv\Scripts\Activate.ps1
 # Linux / macOS:
 source .venv/bin/activate
-# Install with native PyTorch CPU backend:
+
+# Option A1: Install locked deterministic dependency graph (identical to production Docker container):
+uv pip sync --torch-backend cpu requirements.lock
+
+# Option A2: Or install direct from top-level requirements.txt:
 uv pip install --torch-backend cpu -r requirements.txt
 
 # Option B: Standard Python venv & pip:
@@ -244,41 +248,115 @@ Once running:
 
 ## 🐳 Running with Docker & Containerization
 
-WorldForge includes a production-grade multi-stage container build powered by **Astral `uv`** (for ultra-fast, resilient dependency resolution with parallel chunk streaming and BuildKit layer caching). It compiles the React 19 frontend and runs the Python MuJoCo 3.17 physics backend together from a single lightweight container with headless off-screen rendering support.
+WorldForge provides an enterprise-ready, multi-stage production container build powered by **Astral `uv:0.13.6`** for ultra-fast, deterministic dependency resolution with parallel chunk streaming and BuildKit layer caching. It packages both the React 19 + Vite frontend and the Python MuJoCo 3.17 physics backend into a single, unified container with headless off-screen rendering support (`osmesa` CPU software rasterization or `egl` NVIDIA GPU acceleration).
 
-The image installs from `requirements.lock`, so a source-only edit reuses the
-expensive Python dependency layer. After intentionally changing
-`requirements.txt`, regenerate the lock before building:
+### Architecture & Build Optimizations
+
+```text
+┌─────────────────────────────────────────────────────────────────────────────┐
+│ Stage 1: frontend-builder (node:20-slim)                                    │
+│   ├── Mounts BuildKit npm cache (/root/.npm)                                │
+│   ├── npm ci --prefer-offline                                               │
+│   └── npm run build ──► Produces /app/frontend/dist (Vite + Tailwind CSS)   │
+└──────────────────────────────────────┬──────────────────────────────────────┘
+                                       │ Copies /app/frontend/dist
+┌──────────────────────────────────────▼──────────────────────────────────────┐
+│ Stage 2: runtime (python:3.12-slim-bookworm)                                │
+│   ├── Copies pinned Astral uv binary (ghcr.io/astral-sh/uv:0.13.6)          │
+│   ├── Headless Rendering: libgl1, libegl1, libgles2, libosmesa6, curl       │
+│   ├── Layer Cache: COPY requirements.lock (CPU Linux dependency graph)      │
+│   ├── uv pip sync --system --torch-backend cpu requirements.lock            │
+│   │     └── Sub-second rebuilds; application edits never bust package cache │
+│   ├── COPY src/, configs/, scripts/, outputs/                               │
+│   ├── Serves React 19 Studio at '/' & FastAPI endpoints on port 8000        │
+│   └── HEALTHCHECK: curl -f http://localhost:8000/api/status                 │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Dual-Tier Dependency Management (`requirements.txt` vs `requirements.lock`)
+
+WorldForge maintains a strict separation between high-level package declarations and hermetic lockfiles:
+
+1. **`requirements.txt` (Developer Manifest)**: Human-maintained file specifying top-level libraries and permissible version bounds (`mujoco==3.17.0`, `torch>=2.2.0`, `stable-baselines3>=2.3.0`, `gymnasium>=0.29.0`, `fastapi>=0.110.0`, `pydantic>=2.7.0`).
+2. **`requirements.lock` (Hermetic Linux Graph)**: Fully-resolved, pinned dependency lockfile generated by `uv` specifically for Linux x86_64 with native CPU PyTorch (`torch==2.15.0+cpu`). This prevents Docker from pulling 2GB+ CUDA wheels and ensures 100% byte-for-byte reproducibility across CI, Docker, and production deployments.
+
+Whenever you update `requirements.txt`, recompile the deterministic lockfile before building the container:
 
 ```bash
 uv pip compile --torch-backend cpu --python 3.12 requirements.txt -o requirements.lock
 ```
 
+---
+
 ### Option A: Docker Compose (Recommended)
 
+WorldForge ships with a pre-configured `docker-compose.yml` supporting persistent volume mounts for synthesized rollouts, mask images, and gym exports:
+
 ```bash
-# Build and run the all-in-one container:
+# 1. Build and launch the all-in-one production container:
 docker compose up --build
+
+# 2. Or run detached in the background:
+docker compose up -d --build
 ```
 
-### Option B: Direct Docker Build & Run
+#### Decoupled Frontend Hot-Reloading (`--profile dev`)
+For rapid UI iteration with Vite Hot Module Replacement (HMR) alongside the containerized MuJoCo backend:
 
 ```bash
-# 1. Build the production image:
-docker build -t worldforge:latest .
+docker compose --profile dev up
+```
+This boots the `worldforge` backend on port `8000` and launches a live `frontend-dev` Vite server on port `5173` with volume-mounted source code.
 
-# 2. Run the container:
+---
+
+### Option B: Direct Docker Build & Run (CLI)
+
+#### 1. Build the Production Container
+Enable Docker BuildKit for cache mounts and parallel stage execution:
+
+```bash
+# Linux / macOS:
+DOCKER_BUILDKIT=1 docker build -t worldforge:latest .
+
+# Windows (PowerShell):
+$env:DOCKER_BUILDKIT=1; docker build -t worldforge:latest .
+```
+
+#### 2. Run with CPU Headless Rendering (Default OSMesa)
+```bash
 docker run -d -p 8000:8000 \
-  -e BASETEN_API_KEY="your_baseten_api_key_here" \
+  --env-file .env \
   -v ${PWD}/outputs:/app/outputs \
   --name worldforge-studio \
   worldforge:latest
 ```
 
-Once started:
-- **WorldForge Studio 2.0 (Frontend + Backend)**: [http://localhost:8000](http://localhost:8000)
-- **FastAPI Swagger / OpenAPI Documentation**: [http://localhost:8000/docs](http://localhost:8000/docs)
-- **Headless Physics Rendering**: Pre-configured with `MUJOCO_GL=osmesa` (CPU software rasterization) by default for universal Docker compatibility, and supports `MUJOCO_GL=egl` when passing `--gpus all` on NVIDIA hosts.
+#### 3. Run with NVIDIA GPU Acceleration (EGL)
+For cloud instances with NVIDIA GPUs (AWS g4dn/g5, GCP A100/T4, or local Linux workstations with NVIDIA Container Toolkit installed):
+
+```bash
+docker run -d --gpus all -p 8000:8000 \
+  -e MUJOCO_GL=egl \
+  --env-file .env \
+  -v ${PWD}/outputs:/app/outputs \
+  --name worldforge-studio \
+  worldforge:latest
+```
+
+#### Container Telemetry & Status
+```bash
+# Check container status and healthcheck:
+docker ps --filter "name=worldforge-studio"
+
+# Follow live FastAPI and MuJoCo simulation logs:
+docker logs -f worldforge-studio
+```
+
+Once running:
+- **WorldForge Studio 2.0 (Unified React + MuJoCo)**: [http://localhost:8000](http://localhost:8000)
+- **FastAPI OpenAPI Interactive Documentation**: [http://localhost:8000/docs](http://localhost:8000/docs)
+- **System Health Endpoint**: [http://localhost:8000/api/status](http://localhost:8000/api/status)
 
 ---
 
