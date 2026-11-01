@@ -23,7 +23,7 @@
 - **5-Gate Quality Pipeline**: Zero-flakiness automated validation ensuring numerical stability, static equilibrium, non-degenerate dense rewards, closed-loop waypoint oracle solvability, and residual PPO policy learning.
 - **Render + Diff Visual Alignment**: Validates MuJoCo Frame 0 against the source video via SAM 3.1 mask IoU with automated coordinate refinement (achieving up to **100% IoU**).
 - **Dual-Cockpit Studio UI**: A professional React 19 + Vite dashboard combining an **8-Stage Autonomous Pipeline Studio** with an interactive **Full-Fidelity 3D Three.js PBR Workbench**.
-- **One-Command Containerization**: Ready-to-ship multi-stage `Dockerfile` and `docker-compose.yml` with headless OpenGL/OSMesa rendering for CPU and GPU cloud deployments.
+- **One-Command Containerization**: Ready-to-ship multi-stage `Dockerfile` and `docker-compose.yml` with headless OpenGL/EGL/OSMesa rendering for CPU and GPU cloud deployments.
 
 ---
 
@@ -69,13 +69,13 @@ Render + Diff Alignment ── Mask IoU evaluation against video Frame 0 + Coord
 
 ## Golden Verification Scenes
 
-WorldForge ships with 3 pre-configured golden validation benchmarks covering fundamental manipulation primitives:
+WorldForge ships with 3 pre-configured golden validation benchmarks covering fundamental manipulation primitives (all sizes match `configs/scenes/*.json`):
 
 | Scene Preset | Task Type | Manipulated Object | Distractors / Articulation | Waypoints | Target Goal |
 |---|---|---|---|---|---|
-| **Scene 1: Red Cube Pick & Place** | `pick_and_place` | 3cm Red Plastic Cube | Optical table, blue coaster target | 7 Waypoints | Pick cube, lift 15cm, place precisely on coaster |
-| **Scene 2: Push Around Obstacle** | `push_to_target` | Yellow Wood Cylinder | Heavy metal tall obstacle block, goal marker | 5 Waypoints | Pre-pose, navigate around obstacle, push to goal |
-| **Scene 3: Articulated Slide Drawer** | `articulate_joint` | Sliding Drawer Box | Cabinet base, prismatic slide joint (range: `[0, 0.12]m`) | 4 Waypoints | Approach handle, hook gripper, pull drawer open 10cm |
+| **Scene 1: Red Cube Pick & Place** | `pick_and_place` | 5×5×5 cm Red Plastic Cube | Optical table, Ø8×1 cm wooden coaster target | 7 Waypoints | Pick cube at `(15, 0) cm`, lift 12 cm, place on coaster at `(-15, 10) cm` |
+| **Scene 2: Push Around Obstacle** | `push_to_target` | Ø4×8 cm Blue Plastic Cylinder | 6×6×12 cm heavy metal box obstacle, Ø10×0.4 cm rubber goal marker | 5 Waypoints | Pre-pose, navigate around obstacle, push cylinder to goal marker |
+| **Scene 3: Articulated Slide Drawer** | `articulate_joint` | 20×1×12 cm Sliding Wooden Drawer Panel | 24×20×16 cm wooden cabinet body, metal handle, prismatic slide joint (`[0, 0.12] m`) | 4 Waypoints | Approach handle, hook gripper, pull drawer open 10 cm |
 
 ---
 
@@ -132,7 +132,7 @@ WorldForge-RL/
 │   │   ├── ppo_runner.py               # ResidualOracleEnv, SB3 PPO trainer & 120-frame MP4 recorder
 │   │   └── repair_loop.py              # CostTracker + automated self-healing AST repair loop
 │   ├── render_diff/
-│   │   └── mask_iou.py                 # Mask IoU, coordinate refinement & green/red diff overlays
+│   │   └── mask_iou.py                 # Mask IoU, coordinate refinement & green/red/blue diff overlays
 │   └── sandbox/
 │       └── modal_executor.py           # Modal Sandbox cloud runner & micro-budget cap enforcement
 ├── frontend/                           # Studio-Grade React 19 + Vite + Tailwind CSS + Three.js
@@ -152,11 +152,11 @@ WorldForge-RL/
 ├── run_demo.py                         # Single-command launcher for FastAPI backend + Vite frontend
 ├── start_studio.ps1                    # Native Windows PowerShell launcher
 └── tests/
-    ├── test_phase1.py                  # 25 Phase 1 tests (Schema, MJCF Builder, Base Env)
-    ├── test_phase2.py                  # 27 Phase 2 tests (Dense Rewards, Gates 1–5, Self-Healing)
-    ├── test_phase3.py                  # 11 Phase 3 tests (SAM 3.1 4-Tier Hierarchy, 4px Erosion, 3D Lift, SVD Axis)
-    ├── test_phase4.py                  # 14 Phase 4 tests (Render+Diff IoU, Modal Sandbox)
-    └── test_phase5.py                  # 11 Phase 5 tests (Baseten, SSE Streaming, API Endpoints)
+    ├── test_phase1.py                  # Phase 1 tests (Schema, MJCF Builder, Base Env)
+    ├── test_phase2.py                  # Phase 2 tests (Dense Rewards, Gates 1–5, Self-Healing)
+    ├── test_phase3.py                  # Phase 3 tests (SAM 3.1 4-Tier Hierarchy, 4px Erosion, 3D Lift, SVD Axis)
+    ├── test_phase4.py                  # Phase 4 tests (Render+Diff IoU, Modal Sandbox)
+    └── test_phase5.py                  # Phase 5 tests (Baseten, SSE Streaming, API Endpoints)
 ```
 
 ---
@@ -211,6 +211,7 @@ BASETEN_BASE_URL="https://inference.baseten.co/v1"
 
 # Meta Model API $150 Grant
 META_API_KEY="your_meta_api_key_here"
+META_SAM_API_URL=""
 
 # Modal Cloud Sandbox $30 Grant
 MODAL_TOKEN_ID=""

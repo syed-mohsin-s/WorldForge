@@ -4,7 +4,7 @@ Test matrix
 -----------
 * Gates 1–4 on all 3 golden scenes
 * Gate 5 (PPO short run) end-to-end
-* Self-healing loop with injected broken reward
+* Self-healing loop with injected broken reward, markdown fence parsing, and AST sandbox security
 """
 
 from __future__ import annotations
@@ -20,9 +20,10 @@ import pytest
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.generated_reward import compute_reward
 from src.schema.scene_graph import SceneGraph
-from src.validation.gates import ValidationSuite, ValidationReport
+from src.validation.gates import ValidationSuite
 from src.validation.repair_loop import (
     CostTracker,
+    _compile_safe_reward_fn,
     run_self_healing_loop,
 )
 
@@ -41,10 +42,6 @@ def _load_scene(name: str) -> SceneGraph:
         data = json.load(f)
     return SceneGraph(**data)
 
-
-# =====================================================================
-# Dense Reward Tests
-# =====================================================================
 
 class TestDenseReward:
     """Verify the multi-stage reward functions are well-behaved."""
@@ -79,10 +76,6 @@ class TestDenseReward:
         assert np.std(rewards) > 1e-4, f"Reward std too low: {np.std(rewards)}"
 
 
-# =====================================================================
-# Validation Gate Tests (Gates 1–4 on all 3 scenes)
-# =====================================================================
-
 class TestGate1Stability:
     @pytest.mark.parametrize("scene_file", GOLDEN_SCENES)
     def test_gate1_passes(self, scene_file: str) -> None:
@@ -116,16 +109,13 @@ class TestGate4WaypointOracle:
     def test_gate4_passes(self, scene_file: str) -> None:
         scene = _load_scene(scene_file)
         suite = ValidationSuite(scene)
-        # Run gate 3 first to populate _mean_random_return
         g3 = suite._gate_3()
         assert g3["passed"], f"Gate 3 prerequisite failed: {g3}"
         result = suite._gate_4()
         assert result["passed"], f"Gate 4 failed: {result}"
+        assert result["total_reward"] == result["total_return"]
+        assert result["total_return"] > 0.0
 
-
-# =====================================================================
-# Gate 5: PPO Short Run (single scene for speed)
-# =====================================================================
 
 class TestGate5PPO:
     def test_gate5_ppo_runs_and_beats_random(self) -> None:
@@ -134,13 +124,11 @@ class TestGate5PPO:
 
         scene = _load_scene("scene1_pick_place.json")
 
-        # Get random baseline
         suite = ValidationSuite(scene)
         g3 = suite._gate_3()
         assert g3["passed"]
         random_return = g3["mean_random_return"]
 
-        # Train PPO
         result = train_and_evaluate_ppo(
             scene,
             total_timesteps=8192,
@@ -151,7 +139,6 @@ class TestGate5PPO:
             f"PPO return {result.eval_mean_return:.2f} does not beat "
             f"random {random_return:.2f}"
         )
-        # Verify learning curve was logged
         assert len(result.learning_curve) > 0, "No learning curve data"
 
     def test_gate5_exports_rendered_frame(self) -> None:
@@ -162,15 +149,11 @@ class TestGate5PPO:
         env.step(env.action_space.sample())
         frame = env.render_camera()
         assert isinstance(frame, np.ndarray)
-        assert frame.ndim == 3  # H x W x 3
+        assert frame.ndim == 3
         assert frame.shape[2] == 3
         assert frame.shape[0] > 0 and frame.shape[1] > 0
         env.close()
 
-
-# =====================================================================
-# Self-Healing Repair Loop
-# =====================================================================
 
 class TestRepairLoop:
     def test_cost_tracker_basics(self) -> None:
@@ -178,7 +161,6 @@ class TestRepairLoop:
         ct.log_api_call(1_000_000, 500_000, purpose="test")
         ct.log_compute(100.0)
         cost = ct.total_cost_usd
-        # Standard: 1M * 1.25/1M + 0.5M * 4.25/1M + 100 * 0.00003942
         expected = 1.25 + 2.125 + 0.003942
         assert abs(cost - expected) < 0.01, f"Cost {cost} != expected {expected}"
 
@@ -186,15 +168,35 @@ class TestRepairLoop:
         ct = CostTracker(pricing_tier="contributor")
         ct.log_api_call(1_000_000, 1_000_000, purpose="test")
         cost = ct.total_cost_usd
-        # Contributor: 1M * 0.10/1M + 1M * 0.20/1M
         expected = 0.10 + 0.20
         assert abs(cost - expected) < 0.01
 
+    def test_compile_safe_reward_strips_markdown_and_blocks_rce(self) -> None:
+        fenced_reply = (
+            "Here is the patched reward:\n"
+            "```python\n"
+            "def compute_reward(model, data, scene):\n"
+            "    d = float(np.linalg.norm(data.mocap_pos[0]))\n"
+            "    return 1.0 - math.tanh(d), d < 0.05, {'d': d}\n"
+            "```\n"
+        )
+        fn, clean_src = _compile_safe_reward_fn(fenced_reply)
+        assert callable(fn)
+        assert "```" not in clean_src
+
+        # Reject imports, open(), and dunder attribute access
+        for malicious in [
+            "import os\ndef compute_reward(model, data, scene): return 0.0, False, {}",
+            "def compute_reward(model, data, scene):\n    open('/tmp/pwn', 'w').write('x')\n    return 0.0, False, {}",
+            "def compute_reward(model, data, scene):\n    x = ().__class__.__base__.__subclasses__()\n    return 0.0, False, {}",
+        ]:
+            with pytest.raises(ValueError):
+                _compile_safe_reward_fn(malicious)
+
     def test_self_healing_catches_broken_reward(self) -> None:
-        """Inject a constant-zero reward (fails Gate 3), verify auto-repair."""
+        """Inject a constant-zero reward (fails Gate 3), verify auto-repair and zero offline tokens."""
         scene = _load_scene("scene1_pick_place.json")
 
-        # Broken reward: always returns 0.0
         def broken_reward(model, data, sg):
             return 0.0, False, {}
 
@@ -207,16 +209,11 @@ class TestRepairLoop:
             verbose=False,
         )
 
-        assert result.success, (
-            f"Self-healing failed after {result.attempts} attempts. "
-            f"Repairs: {result.repairs_applied}. "
-            f"Final report: gate {result.final_report.failed_gate}, "
-            f"{result.final_report.diagnostics}"
-        )
-        # Should have been repaired — the broken reward was on attempt 1 only
-        assert result.attempts >= 2, "Should have needed at least 2 attempts"
-        assert len(result.repairs_applied) >= 1, "Should have applied a repair"
-        assert result.cost_tracker.total_cost_usd >= 0
+        assert result.success
+        assert result.attempts >= 2
+        assert len(result.repairs_applied) >= 1
+        assert result.cost_tracker.total_input_tokens == 0
+        assert result.cost_tracker.total_output_tokens == 0
 
     def test_healthy_scene_passes_without_repair(self) -> None:
         """A valid scene should pass on attempt 1 with no repairs."""
@@ -233,10 +230,6 @@ class TestRepairLoop:
         assert len(result.repairs_applied) == 0
 
 
-# =====================================================================
-# Full Suite Run (Gates 1–4, skipping 5 for speed)
-# =====================================================================
-
 class TestFullSuiteGates1to4:
     @pytest.mark.parametrize("scene_file", GOLDEN_SCENES)
     def test_gates_1_through_4_pass(self, scene_file: str) -> None:
@@ -247,4 +240,3 @@ class TestFullSuiteGates1to4:
             f"Validation failed at gate {report.failed_gate}: "
             f"{report.diagnostics}"
         )
-

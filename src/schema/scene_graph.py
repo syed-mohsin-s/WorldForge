@@ -21,7 +21,7 @@ class CameraSpec(BaseModel):
 
     pos: tuple[float, float, float]
     lookat: tuple[float, float, float]
-    fovy: float = 45.0
+    fovy: float = Field(default=45.0, gt=1.0, lt=179.0)
     resolution: tuple[int, int] = (640, 480)
 
 
@@ -39,8 +39,19 @@ class JointSpec(BaseModel):
     type: Literal["free", "hinge", "slide", "fixed"] = "free"
     axis: tuple[float, float, float] = (0, 0, 1)
     range: tuple[float, float] | None = None
-    damping: float = 0.5
+    damping: float = Field(default=0.5, ge=0.0)
     is_prior_guess: bool = False
+
+    @model_validator(mode="after")
+    def _validate_joint(self) -> "JointSpec":
+        ax_norm = math.sqrt(sum(float(a) * float(a) for a in self.axis))
+        if not math.isfinite(ax_norm) or ax_norm < 1e-6:
+            raise ValueError(f"Joint axis {self.axis} must have non-zero norm")
+        if self.range is not None:
+            r0, r1 = float(self.range[0]), float(self.range[1])
+            if not (math.isfinite(r0) and math.isfinite(r1)) or r0 > r1:
+                raise ValueError(f"Invalid joint range {self.range}: min must be <= max")
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -49,8 +60,8 @@ class JointSpec(BaseModel):
 class ObjectNode(BaseModel):
     """One rigid-body primitive on the tabletop."""
 
-    id: str
-    label: str
+    id: str = Field(..., min_length=1)
+    label: str = Field(..., min_length=1)
     primitive: Literal["box", "cylinder", "sphere"]
     size: list[float] = Field(
         ...,
@@ -62,9 +73,34 @@ class ObjectNode(BaseModel):
     position: tuple[float, float, float]
     quaternion: tuple[float, float, float, float] = (1, 0, 0, 0)
     material: str = "plastic"
+    rgba: tuple[float, float, float, float] | None = None
     is_static: bool = False
     joint: JointSpec = Field(default_factory=JointSpec)
     parent_id: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_geometry_and_pose(self) -> "ObjectNode":
+        expected_len = {"box": 3, "cylinder": 2, "sphere": 1}[self.primitive]
+        if len(self.size) != expected_len:
+            raise ValueError(
+                f"Primitive '{self.primitive}' on object '{self.id}' requires "
+                f"exactly {expected_len} size element(s), got {len(self.size)}: {self.size}"
+            )
+        for idx, s in enumerate(self.size):
+            if not math.isfinite(float(s)) or float(s) <= 0.0:
+                raise ValueError(
+                    f"Object '{self.id}' size[{idx}]={s} must be finite and strictly positive (> 0)"
+                )
+
+        if any(not math.isfinite(float(p)) for p in self.position):
+            raise ValueError(f"Object '{self.id}' position {self.position} contains non-finite values")
+
+        q_norm = math.sqrt(sum(float(q) * float(q) for q in self.quaternion))
+        if not math.isfinite(q_norm) or q_norm < 1e-6:
+            raise ValueError(
+                f"Object '{self.id}' quaternion {self.quaternion} has zero or non-finite norm"
+            )
+        return self
 
 
 # ---------------------------------------------------------------------------
@@ -75,7 +111,7 @@ class TaskSpec(BaseModel):
 
     task_type: Literal["pick_and_place", "push_to_target", "articulate_joint"]
     description: str
-    manipulated_object_id: str
+    manipulated_object_id: str = Field(..., min_length=1)
     target_position: tuple[float, float, float] | None = None
     target_joint_delta: float | None = None
     waypoints: list[tuple[float, float, float, float]] = Field(
@@ -90,24 +126,50 @@ class TaskSpec(BaseModel):
 class SceneGraph(BaseModel):
     """Complete scene description consumed by the MJCF compiler."""
 
-    scene_id: str
+    scene_id: str = Field(..., min_length=1)
     table_z: float = 0.0
     camera: CameraSpec
     objects: list[ObjectNode]
     task: TaskSpec
 
-    # -- Auto-snap validator ------------------------------------------------
+    # -- Graph integrity & auto-snap validator -------------------------------
     @model_validator(mode="after")
-    def _snap_objects_to_table(self) -> "SceneGraph":
-        """Ensure every non-child, non-static resting object has its bottom
-        surface at ``table_z + ε`` so MuJoCo's contact solver never starts
-        with deep penetration (which causes step-1 force explosions).
+    def _validate_and_snap_objects(self) -> "SceneGraph":
+        """Validate object IDs, parent hierarchy acyclicity, manipulated object
+        existence, and snap resting objects to ``table_z + ε``."""
+        obj_map: dict[str, ObjectNode] = {}
+        for obj in self.objects:
+            if obj.id in obj_map:
+                raise ValueError(f"Duplicate object id '{obj.id}' in scene '{self.scene_id}'")
+            obj_map[obj.id] = obj
 
-        Half-height computation follows MuJoCo 3.x geom semantics:
-        * ``box``      → size[2]              (half-size along local Z)
-        * ``cylinder`` → size[1]              (half-length along local Z)
-        * ``sphere``   → size[0]              (radius — symmetric)
-        """
+        # Validate parent references and check for cycles
+        for obj in self.objects:
+            if obj.parent_id is not None:
+                if obj.parent_id not in obj_map:
+                    raise ValueError(
+                        f"Object '{obj.id}' references nonexistent parent_id '{obj.parent_id}'"
+                    )
+                if obj.parent_id == obj.id:
+                    raise ValueError(f"Object '{obj.id}' cannot be its own parent")
+
+                visited = {obj.id}
+                curr = obj.parent_id
+                while curr is not None:
+                    if curr in visited:
+                        raise ValueError(
+                            f"Cyclic parent_id hierarchy detected involving object '{obj.id}'"
+                        )
+                    visited.add(curr)
+                    curr = obj_map[curr].parent_id
+
+        # Validate task.manipulated_object_id exists when objects are present
+        if self.objects and self.task.manipulated_object_id not in obj_map:
+            raise ValueError(
+                f"task.manipulated_object_id '{self.task.manipulated_object_id}' "
+                f"not found among scene objects {list(obj_map.keys())}"
+            )
+
         eps = 0.001  # 1 mm clearance
         for obj in self.objects:
             if obj.parent_id is not None:
@@ -125,12 +187,7 @@ class SceneGraph(BaseModel):
 # Helpers
 # ---------------------------------------------------------------------------
 def _half_height(obj: ObjectNode) -> float:
-    """Return the half-height of *obj* along its local Z axis.
-
-    For a rotated object this is an approximation — the full AABB would
-    require quaternion math — but for Frame-0 snapping of axis-aligned
-    primitives on a flat table it is exact and keeps the code simple.
-    """
+    """Return the half-height of *obj* along its local Z axis."""
     prim = obj.primitive
     if prim == "box":
         return obj.size[2]
@@ -139,4 +196,3 @@ def _half_height(obj: ObjectNode) -> float:
     elif prim == "sphere":
         return obj.size[0]
     raise ValueError(f"Unknown primitive {prim!r}")
-

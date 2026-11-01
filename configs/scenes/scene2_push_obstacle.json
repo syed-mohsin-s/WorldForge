@@ -16,6 +16,7 @@
       "position": [0.1, -0.05, 0.0],
       "quaternion": [1, 0, 0, 0],
       "material": "plastic",
+      "rgba": [0.2, 0.45, 0.85, 1.0],
       "is_static": false,
       "joint": {"type": "free", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
       "parent_id": null
@@ -60,4 +61,3 @@
     ]
   }
 }
-

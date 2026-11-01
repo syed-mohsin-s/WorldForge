@@ -45,6 +45,8 @@ def compute_reward(
 
 def _body_pos(model: mujoco.MjModel, data: mujoco.MjData, name: str) -> np.ndarray:
     bid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, name)
+    if bid < 0:
+        raise ValueError(f"Body {name!r} not found in compiled MuJoCo model")
     return data.xpos[bid].copy()
 
 
@@ -75,7 +77,7 @@ def _pick_and_place_reward(
     scene: SceneGraph,
 ) -> tuple[float, bool, dict]:
     obj_id = scene.task.manipulated_object_id
-    target = np.array(scene.task.target_position)
+    target = np.array(scene.task.target_position if scene.task.target_position is not None else (-0.15, 0.1, 0.035))
 
     grip = _gripper_pos(data)
     obj = _body_pos(model, data, obj_id)
@@ -129,7 +131,7 @@ def _push_to_target_reward(
     scene: SceneGraph,
 ) -> tuple[float, bool, dict]:
     obj_id = scene.task.manipulated_object_id
-    target = np.array(scene.task.target_position)
+    target = np.array(scene.task.target_position if scene.task.target_position is not None else (-0.15, 0.1, 0.04))
 
     grip = _gripper_pos(data)
     obj = _body_pos(model, data, obj_id)
@@ -144,7 +146,6 @@ def _push_to_target_reward(
     progress_reward = _tanh_reward(d_goal, scale=6.0)
 
     # Obstacle clearance penalty — penalise gripper being far above table
-    # (encourages staying low for pushing)
     grip_z = float(grip[2])
     height_penalty = -0.1 * max(grip_z - scene.table_z - 0.08, 0.0)
 
@@ -175,7 +176,7 @@ def _articulate_joint_reward(
     scene: SceneGraph,
 ) -> tuple[float, bool, dict]:
     obj_id = scene.task.manipulated_object_id
-    target_delta = scene.task.target_joint_delta or 0.0
+    target_delta = scene.task.target_joint_delta or 0.10
 
     grip = _gripper_pos(data)
     aperture = _finger_aperture(model, data)
@@ -183,6 +184,8 @@ def _articulate_joint_reward(
     # Find the joint on the manipulated object
     joint_name = f"{obj_id}_joint"
     jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, joint_name)
+    if jid < 0:
+        raise ValueError(f"Joint {joint_name!r} not found in compiled MuJoCo model")
     joint_pos = float(data.qpos[model.jnt_qposadr[jid]])
 
     # Use the handle or object body for reach target

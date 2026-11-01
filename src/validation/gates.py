@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 import mujoco
 import numpy as np
@@ -36,9 +36,15 @@ class ValidationReport:
 class ValidationSuite:
     """Run gates 1–5 sequentially; stop on first failure."""
 
-    def __init__(self, scene: SceneGraph, verbose: bool = False) -> None:
+    def __init__(
+        self,
+        scene: SceneGraph,
+        verbose: bool = False,
+        reward_fn: Callable | None = None,
+    ) -> None:
         self.scene = scene
         self.verbose = verbose
+        self.reward_fn = reward_fn
         # Populated by gate 3 for use in gates 4 and 5
         self._mean_random_return: float = 0.0
 
@@ -52,6 +58,8 @@ class ValidationSuite:
         report = ValidationReport(passed=True, failed_gate=None)
         if cached_gate_results:
             report.gate_results.update(cached_gate_results)
+            if 3 in cached_gate_results and "mean_random_return" in cached_gate_results[3]:
+                self._mean_random_return = float(cached_gate_results[3]["mean_random_return"])
 
         for gate_num in range(start_from_gate, 6):
             if gate_num == 5 and not run_gate5:
@@ -82,7 +90,7 @@ class ValidationSuite:
     # Gate 1: Stability / Zero NaNs
     # ------------------------------------------------------------------
     def _gate_1(self) -> dict[str, Any]:
-        env = WorldForgeEnv(self.scene, render_mode=None)
+        env = WorldForgeEnv(self.scene, reward_fn=self.reward_fn, render_mode=None)
         env.reset(seed=42)
 
         max_qacc = 0.0
@@ -116,11 +124,9 @@ class ValidationSuite:
     # Gate 2: Static Equilibrium / No Resting Drift
     # ------------------------------------------------------------------
     def _gate_2(self) -> dict[str, Any]:
-        env = WorldForgeEnv(self.scene, render_mode=None)
+        env = WorldForgeEnv(self.scene, reward_fn=self.reward_fn, render_mode=None)
         env.reset(seed=42)
 
-        # Record initial positions of non-manipulated, non-child,
-        # non-gripper resting objects
         manipulated_id = self.scene.task.manipulated_object_id
         resting_ids: list[str] = []
         for obj in self.scene.objects:
@@ -132,7 +138,6 @@ class ValidationSuite:
                 continue
             resting_ids.append(obj.id)
 
-        # Initial settle: 25 steps holding gripper stationary so resting objects settle
         stationary_action = np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32)
         for _ in range(25):
             env.step(stationary_action)
@@ -142,11 +147,9 @@ class ValidationSuite:
             bid = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, oid)
             initial_pos[oid] = env.data.xpos[bid].copy()
 
-        # Step 250 times with gripper stationary and closed
         for _ in range(250):
             env.step(stationary_action)
 
-        # Check drift
         max_horiz_drift = 0.0
         max_vert_drift = 0.0
         drifters: list[str] = []
@@ -181,7 +184,7 @@ class ValidationSuite:
     # Gate 3: Non-Degenerate Reward Variance
     # ------------------------------------------------------------------
     def _gate_3(self) -> dict[str, Any]:
-        env = WorldForgeEnv(self.scene, render_mode=None)
+        env = WorldForgeEnv(self.scene, reward_fn=self.reward_fn, render_mode=None)
 
         all_rewards: list[float] = []
         episode_returns: list[float] = []
@@ -217,7 +220,6 @@ class ValidationSuite:
                 "mean_random_return": mean_return,
             }
 
-        # Store for gates 4 and 5
         self._mean_random_return = mean_return
 
         return {
@@ -232,9 +234,9 @@ class ValidationSuite:
     def _gate_4(self) -> dict[str, Any]:
         waypoints = self.scene.task.waypoints
         if not waypoints:
-            return {"passed": True, "reason": "No waypoints defined; skipped."}
+            return {"passed": True, "reason": "No waypoints defined; skipped.", "total_reward": 0.0, "total_return": 0.0}
 
-        env = WorldForgeEnv(self.scene, render_mode=None)
+        env = WorldForgeEnv(self.scene, reward_fn=self.reward_fn, render_mode=None)
         obs, _ = env.reset(seed=42)
 
         total_reward = 0.0
@@ -248,7 +250,6 @@ class ValidationSuite:
         for wp_idx, wp in enumerate(waypoints):
             wx, wy, wz, grip_cmd = wp
 
-            # Detect gripper command change → dwell
             if prev_grip_cmd is not None and grip_cmd != prev_grip_cmd:
                 for _ in range(dwell_steps):
                     action = np.array([0.0, 0.0, 0.0, grip_cmd], dtype=np.float32)
@@ -262,7 +263,6 @@ class ValidationSuite:
 
             prev_grip_cmd = grip_cmd
 
-            # Drive toward waypoint with proportional controller
             for step_i in range(max_steps_per_wp):
                 grip = env.data.mocap_pos[0].copy()
                 err = np.array([wx, wy, wz]) - grip
@@ -271,9 +271,7 @@ class ValidationSuite:
                 if dist < tolerance:
                     break
 
-                # Proportional control: normalize error, clamp to [-1,1]
                 direction = err / max(dist, 1e-8)
-                # Scale so that max_delta (0.02m) maps to action=1.0
                 gain = min(dist / env.max_delta, 1.0)
                 action_xyz = direction * gain
                 action = np.array(
@@ -294,7 +292,6 @@ class ValidationSuite:
 
         env.close()
 
-        # Success criteria: terminated OR return > mean_random_return + 10
         threshold = self._mean_random_return + 10.0
         oracle_passed = terminated_flag or (total_reward > threshold)
 
@@ -308,12 +305,14 @@ class ValidationSuite:
                     f"(mean_random={self._mean_random_return:.2f}+10)"
                 ),
                 "total_reward": total_reward,
+                "total_return": total_reward,
                 "terminated": terminated_flag,
             }
 
         return {
             "passed": True,
             "total_reward": total_reward,
+            "total_return": total_reward,
             "terminated": terminated_flag,
             "threshold": threshold,
         }
@@ -328,6 +327,7 @@ class ValidationSuite:
             self.scene,
             total_timesteps=8192,
             n_envs=4,
+            reward_fn=self.reward_fn,
         )
 
         ppo_return = result.eval_mean_return
@@ -363,4 +363,3 @@ class ValidationSuite:
             if k not in ("passed", "reason", "error"):
                 lines.append(f"  {k}: {v}")
         return "\n".join(lines)
-

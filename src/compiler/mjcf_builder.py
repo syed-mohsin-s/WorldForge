@@ -48,23 +48,7 @@ def compile_scene_to_mjcf(
     randomize: bool = False,
     seed: int | None = None,
 ) -> str:
-    """Compile a validated ``SceneGraph`` into a MuJoCo 3.x XML string.
-
-    Parameters
-    ----------
-    scene:
-        Validated scene graph (objects already snapped to table).
-    randomize:
-        If *True*, sample density and friction uniformly from the material
-        ranges in ``configs/materials.yaml``.  Otherwise use range midpoints.
-    seed:
-        RNG seed used when *randomize* is True (for reproducibility).
-
-    Returns
-    -------
-    str
-        A complete, loadable MuJoCo XML document.
-    """
+    """Compile a validated ``SceneGraph`` into a MuJoCo 3.x XML string."""
     if seed is not None:
         random.seed(seed)
 
@@ -179,18 +163,20 @@ def compile_scene_to_mjcf(
     )
 
     # ── scene objects ─────────────────────────────────────────────────
-    _obj_map = {o.id: o for o in scene.objects}
-    # Build children lookup
+    obj_map = {o.id: o for o in scene.objects}
     children: dict[str | None, list] = {None: []}
     for o in scene.objects:
-        children.setdefault(o.parent_id, [])
-        children[None] = children.get(None, [])
-    for o in scene.objects:
+        if o.parent_id is not None and o.parent_id not in obj_map:
+            raise ValueError(f"Object '{o.id}' references unknown parent_id '{o.parent_id}'")
         children.setdefault(o.parent_id, []).append(o)
-    # Deduplicate (we added to None twice in the setup)
-    children[None] = [o for o in scene.objects if o.parent_id is None]
+
+    visited_ids: set[str] = set()
 
     def _add_body(parent_el: ET.Element, obj) -> None:  # noqa: ANN001
+        if obj.id in visited_ids:
+            raise ValueError(f"Cyclic parent_id hierarchy detected at '{obj.id}'")
+        visited_ids.add(obj.id)
+
         info = mat_db.get(obj.material, mat_db["plastic"])
 
         # Density / friction
@@ -237,6 +223,13 @@ def compile_scene_to_mjcf(
             "density": str(density),
             "friction": friction,
         }
+        if getattr(obj, "rgba", None) is not None:
+            geom_attrs["rgba"] = " ".join(str(c) for c in obj.rgba)
+        elif "blue" in obj.label.lower() and obj.material == "plastic":
+            geom_attrs["rgba"] = "0.2 0.45 0.85 1.0"
+        elif "yellow" in obj.label.lower():
+            geom_attrs["rgba"] = "0.9 0.78 0.15 1.0"
+
         ET.SubElement(body, "geom", **geom_attrs)
 
         # Centroid site (at body origin — which IS the centroid for MuJoCo prims)
@@ -255,6 +248,10 @@ def compile_scene_to_mjcf(
 
     for obj in children[None]:
         _add_body(worldbody, obj)
+
+    if len(visited_ids) != len(scene.objects):
+        unreached = [o.id for o in scene.objects if o.id not in visited_ids]
+        raise ValueError(f"Cyclic or disconnected parent_id hierarchy for objects: {unreached}")
 
     # ── target site ───────────────────────────────────────────────────
     if scene.task.target_position is not None:
@@ -311,14 +308,7 @@ def compile_scene_to_mjcf(
 # ---------------------------------------------------------------------------
 
 def _build_gripper(worldbody: ET.Element) -> None:
-    """Add a two-finger parallel-jaw gripper driven by mocap weld.
-
-    Layout (all sizes in metres):
-    * ``ee_mocap``    — the mocap body the user drives via ``data.mocap_pos``
-    * ``gripper_base``— the physical body welded to ``ee_mocap``
-    * Two symmetric finger bodies with slide joints (±Y)
-    """
-    # Mocap body (kinematic, not simulated)
+    """Add a two-finger parallel-jaw gripper driven by mocap weld."""
     mocap = ET.SubElement(
         worldbody,
         "body",
@@ -338,7 +328,6 @@ def _build_gripper(worldbody: ET.Element) -> None:
         conaffinity="0",
     )
 
-    # Physical gripper base
     gripper_base = ET.SubElement(
         worldbody,
         "body",
@@ -357,7 +346,6 @@ def _build_gripper(worldbody: ET.Element) -> None:
         mass="0.2",
         **{"class": "gripper"},
     )
-    # Inertial for the base — keeps the solver happy
     ET.SubElement(
         gripper_base,
         "inertial",
@@ -366,7 +354,6 @@ def _build_gripper(worldbody: ET.Element) -> None:
         diaginertia="0.001 0.001 0.001",
     )
 
-    # Left finger
     finger_l = ET.SubElement(
         gripper_base,
         "body",
@@ -394,7 +381,6 @@ def _build_gripper(worldbody: ET.Element) -> None:
         **{"class": "gripper"},
     )
 
-    # Right finger (mirror)
     finger_r = ET.SubElement(
         gripper_base,
         "body",
@@ -439,32 +425,23 @@ def _camera_xyaxes(
     pos: tuple[float, float, float],
     lookat: tuple[float, float, float],
 ) -> str:
-    """Compute MuJoCo ``xyaxes`` from *pos* and *lookat*.
-
-    The camera looks from *pos* towards *lookat*.  MuJoCo's ``xyaxes``
-    attribute expects the camera X-axis (right) and Y-axis (up) as a
-    6-element vector.  We derive them from the forward vector and world-up.
-    """
+    """Compute MuJoCo ``xyaxes`` from *pos* and *lookat*."""
     import math
 
-    # Forward = lookat - pos (normalised)
     fx = lookat[0] - pos[0]
     fy = lookat[1] - pos[1]
     fz = lookat[2] - pos[2]
     norm = math.sqrt(fx * fx + fy * fy + fz * fz) or 1e-8
     fx, fy, fz = fx / norm, fy / norm, fz / norm
 
-    # World up
     ux, uy, uz = 0.0, 0.0, 1.0
 
-    # Right = forward × up  (normalised)
     rx = fy * uz - fz * uy
     ry = fz * ux - fx * uz
     rz = fx * uy - fy * ux
     norm = math.sqrt(rx * rx + ry * ry + rz * rz) or 1e-8
     rx, ry, rz = rx / norm, ry / norm, rz / norm
 
-    # True up = right × forward
     tux = ry * fz - rz * fy
     tuy = rz * fx - rx * fz
     tuz = rx * fy - ry * fx
@@ -492,5 +469,3 @@ class SceneCompiler:
             randomize=self.randomize,
             seed=self.seed,
         )
-
-

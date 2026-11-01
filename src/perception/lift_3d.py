@@ -1,14 +1,17 @@
 """WorldForge 3D Lifter — Stage 2 of the front-end perception pipeline.
 
-Lifts 2D SAM mask tracks and monocular depth into metric 3D primitives:
+Lifts 2D SAM mask tracks and monocular depth (or pinhole ray-table intersection
+when depth is absent) into metric 3D primitives:
 1. Derives pinhole intrinsics and camera extrinsics from ``CameraSpec``.
-2. Fits the tabletop plane via RANSAC on background pixels.
-3. Back-projects eroded object masks to compute 3D bounding sizes, centroids,
-   and snaps resting objects to ``z_table + 0.001``.
+2. Fits the tabletop plane via RANSAC on background pixels when depth is present.
+3. Back-projects eroded object masks (or intersects 2D mask footprints with the
+   tabletop plane ``z = table_z``) to compute 3D bounding sizes, centroids,
+   and snaps resting objects to ``z_table + half_h + 0.001``.
 4. Analyzes multi-frame 3D centroid trajectories using SVD line fitting to
    infer joint types (slide vs hinge) and articulation axes.
-5. Mode B (VLM fallback): Annotates Frame 0 with bounding boxes, contours,
-   labels, and an A4 metric scale grid for visual reasoning when depth is absent.
+5. Mode B (Monocular / VLM ray-plane fallback): Annotates Frame 0 with bounding
+   boxes, contours, labels, and an A4 metric scale grid while lifting 2D masks
+   via pinhole ray-tabletop homography.
 """
 
 from __future__ import annotations
@@ -77,13 +80,7 @@ def derive_camera_intrinsics(camera: CameraSpec) -> tuple[float, float, float, f
 
 
 def derive_camera_extrinsics(camera: CameraSpec) -> tuple[np.ndarray, np.ndarray]:
-    """Derive camera rotation matrix (3x3) and translation vector (3,) from CameraSpec.
-
-    Converts from OpenGL camera coordinate convention (used by MuJoCo) to world frame:
-      Column 0: Camera X (right)
-      Column 1: Camera Y (up)
-      Column 2: Camera Z (backward / -forward)
-    """
+    """Derive camera rotation matrix (3x3) and translation vector (3,) from CameraSpec."""
     pos = np.array(camera.pos, dtype=np.float64)
     lookat = np.array(camera.lookat, dtype=np.float64)
 
@@ -103,7 +100,6 @@ def derive_camera_extrinsics(camera: CameraSpec) -> tuple[np.ndarray, np.ndarray
     true_up = np.cross(right, forward)
     true_up = true_up / max(np.linalg.norm(true_up), 1e-8)
 
-    # Rotation matrix where columns are right, up, -forward
     R_cam_to_world = np.column_stack([right, true_up, -forward])
     t_cam_to_world = pos
     return R_cam_to_world, t_cam_to_world
@@ -115,21 +111,41 @@ def backproject_pixels(
     depths: np.ndarray,
     camera: CameraSpec,
 ) -> np.ndarray:
-    """Back-project 2D pixel coordinates + depths into 3D world coordinates.
-
-    Returns an (N, 3) array of 3D points in the world frame.
-    """
+    """Back-project 2D pixel coordinates + depths into 3D world coordinates."""
     fx, fy, cx, cy = derive_camera_intrinsics(camera)
     R_cam_to_world, t_cam_to_world = derive_camera_extrinsics(camera)
 
-    # OpenGL camera frame coordinates
     x_cam = (xs - cx) * depths / fx
-    y_cam = -(ys - cy) * depths / fy  # Image Y down -> OpenGL Y up
-    z_cam = -depths                   # Camera looks along -Z
+    y_cam = -(ys - cy) * depths / fy
+    z_cam = -depths
 
     p_cam = np.vstack([x_cam, y_cam, z_cam])  # (3, N)
     p_world = t_cam_to_world[:, None] + R_cam_to_world @ p_cam  # (3, N)
     return p_world.T  # (N, 3)
+
+
+def intersect_pixel_with_plane(
+    u: float,
+    v: float,
+    z_plane: float,
+    camera: CameraSpec,
+) -> tuple[float, float, float]:
+    """Intersect a 2D pixel ray (u, v) with the horizontal plane Z = z_plane."""
+    fx, fy, cam_cx, cam_cy = derive_camera_intrinsics(camera)
+    R_cam, t_cam = derive_camera_extrinsics(camera)
+
+    ray_cam = np.array([(u - cam_cx) / fx, -(v - cam_cy) / fy, -1.0], dtype=np.float64)
+    ray_world = R_cam @ ray_cam
+    ray_norm = np.linalg.norm(ray_world)
+    if ray_norm > 1e-6:
+        ray_world = ray_world / ray_norm
+
+    if abs(ray_world[2]) > 1e-4:
+        s = (z_plane - t_cam[2]) / ray_world[2]
+        if s > 0:
+            pt3d = t_cam + s * ray_world
+            return (float(pt3d[0]), float(pt3d[1]), float(z_plane))
+    return (0.0, 0.0, float(z_plane))
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +158,7 @@ def fit_tabletop_plane_ransac(
     max_iterations: int = 1000,
     seed: int = 42,
 ) -> tuple[float, np.ndarray]:
-    """Fit dominant horizontal plane (tabletop) using RANSAC.
-
-    Returns (z_table, plane_normal).
-    """
+    """Fit dominant horizontal plane (tabletop) using RANSAC."""
     if len(points_3d) < 3:
         return 0.0, np.array([0.0, 0.0, 1.0])
 
@@ -167,11 +180,9 @@ def fit_tabletop_plane_ransac(
             continue
         normal = normal / norm
 
-        # Orient normal towards +Z
         if normal[2] < 0:
             normal = -normal
 
-        # Plane must be predominantly horizontal (normal_z > 0.85)
         if normal[2] < 0.85:
             continue
 
@@ -184,7 +195,6 @@ def fit_tabletop_plane_ransac(
             best_normal = normal
             best_d = d
 
-    # Refit on best inliers via least squares
     distances = np.abs(points_3d @ best_normal + best_d)
     inlier_mask = distances < distance_threshold
     if np.sum(inlier_mask) >= 3:
@@ -194,6 +204,58 @@ def fit_tabletop_plane_ransac(
         z_table = -best_d / max(best_normal[2], 1e-6)
 
     return z_table, best_normal
+
+
+def _infer_joint_from_trajectory(
+    label: str,
+    traj_3d: list[tuple[float, float, float]],
+) -> tuple[Literal["free", "hinge", "slide", "fixed"], tuple[float, float, float], tuple[float, float] | None, bool]:
+    """Infer (joint_type, joint_axis, joint_range, is_prior_guess) from 3D trajectory and label."""
+    joint_type: Literal["free", "hinge", "slide", "fixed"] = "free"
+    joint_axis = (0.0, 0.0, 1.0)
+    is_prior_guess = False
+    joint_range: tuple[float, float] | None = None
+
+    P = np.array(traj_3d, dtype=np.float64)
+    total_displacement = float(np.linalg.norm(P[-1] - P[0])) if len(P) > 1 else 0.0
+
+    l_low = label.lower()
+    if "cabinet" in l_low or "coaster" in l_low or "marker" in l_low:
+        joint_type = "fixed"
+    elif "handle" in l_low:
+        joint_type = "fixed"
+    elif total_displacement > 0.02:
+        Pc = P - np.mean(P, axis=0)
+        _, S, Vt = np.linalg.svd(Pc)
+        axis = Vt[0]
+        if np.dot(P[-1] - P[0], axis) < 0:
+            axis = -axis
+
+        collinearity = S[1] / max(S[0], 1e-6) if len(S) > 1 else 0.0
+
+        if collinearity < 0.35:
+            if "drawer" in l_low or "slide" in l_low:
+                joint_type = "slide"
+                joint_axis = (float(axis[0]), float(axis[1]), float(axis[2]))
+                joint_range = (0.0, total_displacement * 1.2)
+            else:
+                joint_type = "free"
+        else:
+            joint_type = "hinge"
+            normal = np.cross(Vt[0], Vt[1])
+            normal = normal / max(np.linalg.norm(normal), 1e-6)
+            joint_axis = (float(normal[0]), float(normal[1]), float(normal[2]))
+            joint_range = (0.0, math.pi / 2.0)
+    else:
+        if "drawer" in l_low or "door" in l_low:
+            joint_type = "slide"
+            joint_axis = (0.0, -1.0, 0.0)
+            joint_range = (0.0, 0.12)
+            is_prior_guess = True
+        else:
+            joint_type = "free"
+
+    return joint_type, joint_axis, joint_range, is_prior_guess
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +310,7 @@ def lift_scene_to_3d(
         w_box = track.bbox_2d[2] - track.bbox_2d[0]
         h_box = track.bbox_2d[3] - track.bbox_2d[1]
         if w_box < 50 or h_box < 50 or np.sum(mask) < 200 or not np.any(mask):
-            mask = track.frame0_mask  # Preserve geometry for small/thin parts
+            mask = track.frame0_mask
 
         ys, xs = np.where(mask)
         if len(ys) == 0:
@@ -261,108 +323,45 @@ def lift_scene_to_3d(
 
         pts = backproject_pixels(xs[valid], ys[valid], depths[valid], camera)
 
-        # Robust extents (5th to 95th percentiles to avoid boundary outliers)
         p5 = np.percentile(pts, 5, axis=0)
         p95 = np.percentile(pts, 95, axis=0)
         extents = p95 - p5
 
-        # Centroid in XY from 3D bounding extents midpoint
         cx_3d = float((p5[0] + p95[0]) / 2.0)
         cy_3d = float((p5[1] + p95[1]) / 2.0)
 
-        # Height determination
         top_z = float(np.percentile(pts[:, 2], 95))
         obj_height = max(top_z - table_z, 0.01)
 
-        # Centroid Z: resting object snapped to table
         cz_3d = table_z + obj_height / 2.0 + 0.001
 
-        # Classify primitive: box vs cylinder
         width = float(extents[0])
         depth_val = float(extents[1])
         aspect_ratio = width / max(depth_val, 1e-4)
         is_cylindrical = 0.75 <= aspect_ratio <= 1.35 and (
             "cylinder" in track.label.lower()
             or "coaster" in track.label.lower()
+            or "marker" in track.label.lower()
             or "can" in track.label.lower()
             or "bottle" in track.label.lower()
         )
 
         if is_cylindrical:
             primitive = "cylinder"
-            radius = (width + depth_val) / 4.0
-            size = [radius, obj_height / 2.0]
+            radius = max((width + depth_val) / 4.0, 0.005)
+            size = [radius, max(obj_height / 2.0, 0.002)]
         else:
             primitive = "box"
             size = [max(width / 2.0, 0.005), max(depth_val / 2.0, 0.005), max(obj_height / 2.0, 0.005)]
 
-        # 3. Lift multi-frame 2D centroid trajectory to 3D via ray-plane intersection
-        fx, fy, cam_cx, cam_cy = derive_camera_intrinsics(camera)
-        R_cam, t_cam = derive_camera_extrinsics(camera)
+        traj_3d = [
+            intersect_pixel_with_plane(c2d[0], c2d[1], cz_3d, camera)
+            for c2d in track.centroids_2d
+        ] or [(cx_3d, cy_3d, cz_3d)]
 
-        traj_3d: list[tuple[float, float, float]] = []
-        z_plane = cz_3d
-        for c2d in track.centroids_2d:
-            ray_cam = np.array([
-                (c2d[0] - cam_cx) / fx,
-                -(c2d[1] - cam_cy) / fy,
-                -1.0,
-            ])
-            ray_world = R_cam @ ray_cam
-            ray_norm = np.linalg.norm(ray_world)
-            if ray_norm > 1e-6:
-                ray_world = ray_world / ray_norm
-
-            if abs(ray_world[2]) > 1e-4:
-                s = (z_plane - t_cam[2]) / ray_world[2]
-                pt3d = t_cam + s * ray_world
-            else:
-                pt3d = np.array([cx_3d, cy_3d, cz_3d])
-            traj_3d.append((float(pt3d[0]), float(pt3d[1]), float(pt3d[2])))
-
-        # 4. Trajectory analysis: fit joint axis
-        joint_type: Literal["free", "hinge", "slide", "fixed"] = "free"
-        joint_axis = (0.0, 0.0, 1.0)
-        is_prior_guess = False
-        joint_range: tuple[float, float] | None = None
-
-        P = np.array(traj_3d)
-        total_displacement = float(np.linalg.norm(P[-1] - P[0])) if len(P) > 1 else 0.0
-
-        if "cabinet" in track.label.lower() or "coaster" in track.label.lower() or "marker" in track.label.lower():
-            joint_type = "fixed"
-        elif "handle" in track.label.lower():
-            joint_type = "fixed"
-        elif total_displacement > 0.02:
-            Pc = P - np.mean(P, axis=0)
-            _, S, Vt = np.linalg.svd(Pc)
-            axis = Vt[0]
-            if np.dot(P[-1] - P[0], axis) < 0:
-                axis = -axis
-
-            collinearity = S[1] / max(S[0], 1e-6) if len(S) > 1 else 0.0
-
-            if collinearity < 0.35:
-                if "drawer" in track.label.lower() or "slide" in track.label.lower():
-                    joint_type = "slide"
-                    joint_axis = (float(axis[0]), float(axis[1]), float(axis[2]))
-                    joint_range = (0.0, total_displacement * 1.2)
-                else:
-                    joint_type = "free"
-            else:
-                joint_type = "hinge"
-                normal = np.cross(Vt[0], Vt[1])
-                normal = normal / max(np.linalg.norm(normal), 1e-6)
-                joint_axis = (float(normal[0]), float(normal[1]), float(normal[2]))
-                joint_range = (0.0, math.pi / 2.0)
-        else:
-            if "drawer" in track.label.lower() or "door" in track.label.lower():
-                joint_type = "slide"
-                joint_axis = (0.0, -1.0, 0.0)
-                joint_range = (0.0, 0.12)
-                is_prior_guess = True
-            else:
-                joint_type = "free"
+        joint_type, joint_axis, joint_range, is_prior_guess = _infer_joint_from_trajectory(
+            track.label, traj_3d
+        )
 
         lifted_objects.append(
             LiftedObject(
@@ -463,7 +462,7 @@ def _infer_hierarchies(objects: list[LiftedObject]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Mode B: VLM Fallback Annotation
+# Mode B: Monocular Ray-Tabletop Homography + VLM Fallback Annotation
 # ---------------------------------------------------------------------------
 
 def _lift_scene_vlm_fallback(
@@ -472,7 +471,8 @@ def _lift_scene_vlm_fallback(
     frame0_rgb: np.ndarray | None,
     scene_id: str,
 ) -> LiftedSceneGeometry:
-    """Annotate Frame 0 with bounding boxes, contours, and metric reference grid."""
+    """Lift 2D mask footprints onto the tabletop plane (z=0.0) via camera ray intersection
+    and annotate Frame 0 with bounding boxes, contours, and metric reference grid."""
     w, h = tracking_result.resolution
     canvas = frame0_rgb.copy() if frame0_rgb is not None else np.zeros((h, w, 3), dtype=np.uint8)
 
@@ -493,6 +493,7 @@ def _lift_scene_vlm_fallback(
         cv2.LINE_AA,
     )
 
+    table_z = 0.0
     lifted_objects: list[LiftedObject] = []
     colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 0, 255)]
 
@@ -518,21 +519,73 @@ def _lift_scene_vlm_fallback(
             cv2.LINE_AA,
         )
 
+        l_low = track.label.lower()
+        is_cyl = any(k in l_low for k in ("cylinder", "coaster", "marker", "can", "bottle"))
+
+        # Estimate half-height prior from object semantics before intersecting centroid ray
+        if "coaster" in l_low:
+            half_z = 0.005
+        elif "marker" in l_low:
+            half_z = 0.002
+        elif "obstacle" in l_low:
+            half_z = 0.06
+        elif "cylinder" in l_low:
+            half_z = 0.04
+        elif "cabinet" in l_low:
+            half_z = 0.08
+        else:
+            half_z = 0.025
+
+        cz_3d = table_z + half_z + 0.001
+        c0 = track.centroids_2d[0] if track.centroids_2d else ((xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
+        cx_3d, cy_3d, _ = intersect_pixel_with_plane(c0[0], c0[1], cz_3d, camera)
+
+        # Estimate XY footprint from bounding box rays at z = cz_3d
+        p_left = intersect_pixel_with_plane(float(xmin), float(c0[1]), cz_3d, camera)
+        p_right = intersect_pixel_with_plane(float(xmax), float(c0[1]), cz_3d, camera)
+        span_xy = float(np.hypot(p_right[0] - p_left[0], p_right[1] - p_left[1]))
+        half_span = float(np.clip(span_xy / 2.5, 0.015, 0.12))
+
+        if is_cyl:
+            primitive: Literal["box", "cylinder", "sphere"] = "cylinder"
+            size = [round(half_span, 4), round(half_z, 4)]
+        else:
+            primitive = "box"
+            if "cube" in l_low:
+                half_z = half_span
+                cz_3d = table_z + half_z + 0.001
+            size = [round(half_span, 4), round(half_span, 4), round(half_z, 4)]
+
+        traj_3d = [
+            intersect_pixel_with_plane(c2d[0], c2d[1], cz_3d, camera)
+            for c2d in track.centroids_2d
+        ] or [(cx_3d, cy_3d, cz_3d)]
+
+        joint_type, joint_axis, joint_range, is_prior_guess = _infer_joint_from_trajectory(
+            track.label, traj_3d
+        )
+
         lifted_objects.append(
             LiftedObject(
                 id=track.object_id,
                 label=track.label,
-                primitive="box",
-                size=[0.025, 0.025, 0.025],
-                position=(0.0, 0.0, 0.025),
-                joint_type="free",
+                primitive=primitive,
+                size=size,
+                position=(round(cx_3d, 4), round(cy_3d, 4), round(cz_3d, 4)),
+                joint_type=joint_type,
+                joint_axis=joint_axis,
+                joint_range=joint_range,
                 is_prior_guess=True,
+                is_static=(joint_type == "fixed"),
+                trajectory_3d=traj_3d,
             )
         )
 
+    _infer_hierarchies(lifted_objects)
+
     return LiftedSceneGeometry(
         scene_id=scene_id,
-        table_z=0.0,
+        table_z=table_z,
         camera=camera,
         objects=lifted_objects,
         annotated_rgb_frame=canvas,

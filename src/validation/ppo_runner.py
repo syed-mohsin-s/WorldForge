@@ -3,7 +3,7 @@
 Provides ``train_and_evaluate_ppo`` which:
 1. Creates a ``DummyVecEnv`` of ``ResidualOracleEnv`` instances.
 2. Trains ``PPO("MlpPolicy", ...)`` for a configurable number of timesteps.
-3. Evaluates the trained policy for 3 episodes and returns mean return.
+3. Evaluates the trained policy and returns mean return.
 4. Optionally records a ~4-second (100–120 frame at 30 FPS) rollout video (MP4).
 """
 
@@ -13,7 +13,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -134,6 +134,7 @@ def train_and_evaluate_ppo(
     eval_episodes: int = 1,
     eval_steps: int = 120,
     render_stride: int = 2,
+    reward_fn: Callable | None = None,
 ) -> PPOResult:
     """Train PPO on a WorldForge scene and evaluate."""
     import gymnasium as gym
@@ -146,7 +147,7 @@ def train_and_evaluate_ppo(
     # ── Build vectorized residual env ──────────────────────────────────
     def _make_env(idx: int):
         def _init():
-            base_e = WorldForgeEnv(scene, render_mode=None)
+            base_e = WorldForgeEnv(scene, reward_fn=reward_fn, render_mode=None)
             res_e = ResidualOracleEnv(base_e, scene.task.waypoints, residual_weight=0.15)
             return gym.wrappers.TimeLimit(res_e, max_episode_steps=eval_steps)
         return _init
@@ -202,6 +203,7 @@ def train_and_evaluate_ppo(
     # ── Evaluate ──────────────────────────────────────────────────────
     eval_base_env = WorldForgeEnv(
         scene,
+        reward_fn=reward_fn,
         render_mode="rgb_array" if rollout_video_path else None,
     )
     eval_res_env = ResidualOracleEnv(eval_base_env, scene.task.waypoints, residual_weight=0.15)

@@ -2,10 +2,12 @@
 
 Implements:
 * ``CostTracker`` — tracks API token costs and compute time.
-* ``run_self_healing_loop`` — runs validation gates, and when a gate
-  fails, formats a repair prompt, applies a deterministic or live Baseten
-  Muse Spark LLM-driven fix with AST validation and unified diff generation,
-  and re-runs up to ``max_tries`` times.
+* ``_extract_python_code`` & ``_compile_safe_reward_fn`` — strips markdown code
+  fences and enforces strict AST sandboxing (blocking imports, dunder access,
+  and dangerous builtins) before compiling LLM-synthesized reward code.
+* ``run_self_healing_loop`` — runs validation gates, and when a gate fails,
+  applies a deterministic or live Baseten Muse Spark LLM-driven fix with
+  unified diff generation, and re-runs up to ``max_tries`` times.
 """
 
 from __future__ import annotations
@@ -13,12 +15,14 @@ from __future__ import annotations
 import ast
 import copy
 import difflib
+import inspect
 import logging
 import math
 import os
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Callable
 
 import mujoco
@@ -113,6 +117,140 @@ class RepairResult:
     cost_tracker: CostTracker = field(default_factory=CostTracker)
     success: bool = False
     repair_diff: str = ""
+    repaired_reward_fn: Callable | None = None
+    repaired_reward_code: str = ""
+
+
+# ─── Safe AST Validation & Code Extraction ────────────────────────────
+
+_FORBIDDEN_AST_NODES = (
+    ast.Import,
+    ast.ImportFrom,
+    ast.Global,
+    ast.Nonlocal,
+    ast.Delete,
+    ast.With,
+    ast.AsyncWith,
+    ast.AsyncFor,
+    ast.AsyncFunctionDef,
+    ast.ClassDef,
+    ast.Yield,
+    ast.YieldFrom,
+    ast.Await,
+    ast.Try,
+    ast.Raise,
+)
+
+_FORBIDDEN_NAMES = frozenset({
+    "eval",
+    "exec",
+    "compile",
+    "open",
+    "__import__",
+    "__builtins__",
+    "__loader__",
+    "__spec__",
+    "getattr",
+    "setattr",
+    "delattr",
+    "globals",
+    "locals",
+    "vars",
+    "dir",
+    "input",
+    "breakpoint",
+    "exit",
+    "quit",
+    "os",
+    "sys",
+    "subprocess",
+    "shutil",
+    "pathlib",
+    "socket",
+    "ctypes",
+    " builtins",
+})
+
+_SAFE_BUILTINS: dict[str, Any] = {
+    "abs": abs,
+    "min": min,
+    "max": max,
+    "sum": sum,
+    "len": len,
+    "range": range,
+    "enumerate": enumerate,
+    "zip": zip,
+    "float": float,
+    "int": int,
+    "bool": bool,
+    "str": str,
+    "dict": dict,
+    "list": list,
+    "tuple": tuple,
+    "set": set,
+    "round": round,
+    "isinstance": isinstance,
+    "any": any,
+    "all": all,
+    "True": True,
+    "False": False,
+    "None": None,
+}
+
+
+def _extract_python_code(raw_reply: str) -> str:
+    """Extract Python source code from a raw or markdown-fenced LLM reply."""
+    text = raw_reply.strip()
+    if "&lt;think&gt;" in text and "&lt;/think&gt;" in text:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    fence_match = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        return "\n".join(lines[1:-1]).strip()
+
+    return text
+
+
+def _validate_safe_reward_ast(tree: ast.AST) -> None:
+    """Validate that an AST contains only safe numeric/reward computation nodes."""
+    has_compute_reward = False
+    for node in ast.walk(tree):
+        if isinstance(node, _FORBIDDEN_AST_NODES):
+            raise ValueError(f"Disallowed AST construct in synthesized reward: {type(node).__name__}")
+        if isinstance(node, ast.FunctionDef) and node.name == "compute_reward":
+            has_compute_reward = True
+        if isinstance(node, ast.Name):
+            if node.id in _FORBIDDEN_NAMES or node.id.startswith("__"):
+                raise ValueError(f"Disallowed identifier '{node.id}' in synthesized reward")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_"):
+                raise ValueError(f"Disallowed private/dunder attribute access '.{node.attr}'")
+    if not has_compute_reward:
+        raise ValueError("Synthesized code must define `def compute_reward(model, data, scene):`")
+
+
+def _compile_safe_reward_fn(raw_reply: str) -> tuple[Callable, str]:
+    """Strip markdown fences, AST-validate, and compile a restricted reward function."""
+    candidate_code = _extract_python_code(raw_reply)
+    tree = ast.parse(candidate_code, mode="exec")
+    _validate_safe_reward_ast(tree)
+
+    code_obj = compile(tree, filename="<synthesized_reward>", mode="exec")
+    safe_ns: dict[str, Any] = {
+        "__builtins__": dict(_SAFE_BUILTINS),
+        "math": math,
+        "np": np,
+        "mujoco": mujoco,
+    }
+    exec(code_obj, safe_ns, safe_ns)  # noqa: S102
+    fn = safe_ns.get("compute_reward")
+    if not callable(fn):
+        raise ValueError("Compiled namespace did not produce a callable `compute_reward`")
+    return fn, candidate_code
 
 
 # ─── Repair Strategies ────────────────────────────────────────────────
@@ -130,7 +268,7 @@ def _format_repair_prompt(
         f"### Diagnostics:\n{diagnostics}\n\n"
         f"### Instructions:\n"
         f"Identify the root cause of the gate {gate_num} failure and return "
-        f"a patched reward function or scene graph adjustment."
+        f"a patched reward function `def compute_reward(model, data, scene):`."
     )
 
 
@@ -177,20 +315,55 @@ _DETERMINISTIC_REPAIRS: dict[int, RepairFn] = {
 }
 
 
+def _build_unified_diff(
+    before_src: str,
+    after_src: str,
+    fromfile: str = "before",
+    tofile: str = "after",
+    from_label: str | None = None,
+    to_label: str | None = None,
+) -> str:
+    from_name = from_label if from_label is not None else fromfile
+    to_name = to_label if to_label is not None else tofile
+    return "".join(
+        difflib.unified_diff(
+            before_src.splitlines(keepends=True),
+            after_src.splitlines(keepends=True),
+            fromfile=from_name,
+            tofile=to_name,
+        )
+    )
+
+
+def _get_faulty_source(reward_fn_override: Callable | None) -> str:
+    if reward_fn_override is not None:
+        try:
+            return inspect.getsource(reward_fn_override)
+        except Exception:
+            pass
+    return (
+        "def compute_reward(model, data, scene):\n"
+        "    return 0.0, False, {'fault': 'Constant 0.0 reward injected'}\n"
+    )
+
+
+def _get_default_reward_source() -> str:
+    reward_file = Path(__file__).resolve().parents[1] / "compiler" / "generated_reward.py"
+    if reward_file.exists():
+        return reward_file.read_text(encoding="utf-8")
+    return ""
+
+
 def _call_live_llm_repair(
     gate_num: int,
     diagnostics: str,
     scene: SceneGraph,
     cost_tracker: CostTracker,
-) -> tuple[Callable | None, str, str]:
+    faulty_src: str,
+) -> tuple[Callable | None, str, str, str]:
     """Call Baseten meta-models/muse-spark-open-1026 to synthesize a patched reward function."""
     baseten_key = os.environ.get("BASETEN_API_KEY", "")
     baseten_url = os.environ.get("BASETEN_BASE_URL", "https://inference.baseten.co/v1")
-    faulty_src = (
-        "def compute_reward(model, data, scene):\n"
-        "    # Faulty constant zero reward\n"
-        "    return 0.0, False, {}\n"
-    )
     base_prompt = _format_repair_prompt(gate_num, diagnostics, scene)
 
     if baseten_key and not baseten_key.startswith("your_"):
@@ -204,7 +377,8 @@ def _call_live_llm_repair(
                         "role": "system",
                         "content": (
                             "You are Muse Code / Muse Spark, an expert MuJoCo reinforcement learning engineer. "
-                            "Output only valid Python code defining `compute_reward(model, data, scene)`."
+                            "Output only valid Python code defining `compute_reward(model, data, scene)` "
+                            "using `math`, `np`, and `mujoco` without any import statements."
                         ),
                     },
                     {"role": "user", "content": base_prompt},
@@ -215,54 +389,36 @@ def _call_live_llm_repair(
             raw_reply = resp.choices[0].message.content or ""
             cost_tracker.log_api_call(
                 input_tokens=len(base_prompt.split()) * 2,
-                output_tokens=200,
+                output_tokens=max(len(raw_reply.split()) * 2, 50),
                 model="meta-models/muse-spark-open-1026",
                 purpose=f"llm_repair_gate_{gate_num}",
             )
 
-            candidate_code = raw_reply.strip()
-            ast.parse(candidate_code)
-            ns: dict[str, Any] = {"math": math, "np": np, "mujoco": mujoco}
-            exec(candidate_code, ns)  # noqa: S102
-            if callable(ns.get("compute_reward")):
-                diff_lines = list(
-                    difflib.unified_diff(
-                        faulty_src.splitlines(keepends=True),
-                        (candidate_code + "\n").splitlines(keepends=True),
-                        fromfile="generated_reward.py (Attempt 1: Faulty)",
-                        tofile="generated_reward.py (Attempt 2: Muse Spark Auto-Patched)",
-                    )
-                )
-                return (
-                    ns["compute_reward"],
-                    f"Live Baseten Muse Spark AST-patched reward for gate {gate_num}",
-                    "".join(diff_lines),
-                )
+            compiled_fn, clean_code = _compile_safe_reward_fn(raw_reply)
+            diff_str = _build_unified_diff(
+                faulty_src,
+                clean_code + "\n",
+                fromfile="generated_reward.py (Attempt 1: Faulty)",
+                tofile="generated_reward.py (Attempt 2: Muse Spark AST-Patched)",
+            )
+            return (
+                compiled_fn,
+                f"Live Baseten Muse Spark AST-patched reward for gate {gate_num}",
+                diff_str,
+                clean_code,
+            )
         except Exception as exc:
             logger.warning("Live Baseten repair fallback (%s); restoring verified dense reward.", exc)
 
-    cost_tracker.log_api_call(
-        input_tokens=len(base_prompt.split()) * 2,
-        output_tokens=200,
-        purpose=f"llm_repair_gate_{gate_num}",
+    # Deterministic fallback when live LLM is unavailable or rejected by AST sandbox
+    default_src = _get_default_reward_source()
+    diff_str = _build_unified_diff(
+        faulty_src,
+        default_src,
+        fromfile="generated_reward.py (Attempt 1: Faulty Override)",
+        tofile="generated_reward.py (Attempt 2: Restored Dense Reward)",
     )
-    patched_src = (
-        "def compute_reward(model, data, scene):\n"
-        "    # Muse Spark Auto-Patched Multi-Stage Dense Reward\n"
-        "    r_reach = 1.0 - math.tanh(4.0 * d_reach)\n"
-        "    r_place = 1.0 - math.tanh(4.0 * d_place)\n"
-        "    reward = 0.25 * r_reach + 0.15 * grasp_bonus + 0.1 * lift_reward + 0.5 * r_place\n"
-        "    return reward, terminated, info\n"
-    )
-    diff_str = "".join(
-        difflib.unified_diff(
-            faulty_src.splitlines(keepends=True),
-            patched_src.splitlines(keepends=True),
-            fromfile="generated_reward.py (Attempt 1: Faulty Constant Reward)",
-            tofile="generated_reward.py (Attempt 2: Muse Spark Auto-Patched Multi-Stage Reward)",
-        )
-    )
-    return None, f"Restored verified multi-stage dense reward for gate {gate_num}", diff_str
+    return None, f"Restored verified multi-stage dense reward for gate {gate_num}", diff_str, default_src
 
 
 # ─── Self-Healing Loop ───────────────────────────────────────────────
@@ -281,6 +437,7 @@ def run_self_healing_loop(
     repairs_applied: list[str] = []
     current_scene = copy.deepcopy(scene)
     current_reward_override = reward_fn_override
+    faulty_src = _get_faulty_source(reward_fn_override)
     cached_gate_results: dict[int, dict] = {}
     last_failed_gate: int | None = None
 
@@ -300,34 +457,21 @@ def run_self_healing_loop(
 
         t0 = time.time()
 
-        suite = ValidationSuite(current_scene, verbose=verbose)
+        suite = ValidationSuite(
+            current_scene,
+            verbose=verbose,
+            reward_fn=current_reward_override,
+        )
 
         start_gate = 1
         if attempt > 1 and last_failed_gate == 3 and 1 in cached_gate_results and 2 in cached_gate_results:
             start_gate = 3
 
-        if current_reward_override is not None:
-            import src.compiler.base_env as _be
-            _orig_get_default = _be._get_default_reward
-
-            def _patched_default():
-                return current_reward_override
-            _be._get_default_reward = _patched_default
-
-            try:
-                report = suite.run_all(
-                    run_gate5=run_gate5,
-                    start_from_gate=start_gate,
-                    cached_gate_results=cached_gate_results,
-                )
-            finally:
-                _be._get_default_reward = _orig_get_default
-        else:
-            report = suite.run_all(
-                run_gate5=run_gate5,
-                start_from_gate=start_gate,
-                cached_gate_results=cached_gate_results,
-            )
+        report = suite.run_all(
+            run_gate5=run_gate5,
+            start_from_gate=start_gate,
+            cached_gate_results=cached_gate_results,
+        )
 
         for g_num, g_res in report.gate_results.items():
             if g_res.get("passed", False):
@@ -341,6 +485,7 @@ def run_self_healing_loop(
         if report.passed:
             result.success = True
             result.repairs_applied = repairs_applied
+            result.repaired_reward_fn = current_reward_override
             if verbose:
                 print(f"  ✓ All gates passed on attempt {attempt}")
             return result
@@ -358,8 +503,11 @@ def run_self_healing_loop(
             continue
 
         if use_live_llm and gate == 3:
-            compiled_fn, desc, diff_str = _call_live_llm_repair(gate, diag, current_scene, cost_tracker)
+            compiled_fn, desc, diff_str, clean_code = _call_live_llm_repair(
+                gate, diag, current_scene, cost_tracker, faulty_src
+            )
             result.repair_diff = diff_str
+            result.repaired_reward_code = clean_code
             current_reward_override = compiled_fn
             repairs_applied.append(f"Attempt {attempt}: {desc}")
             continue
@@ -371,13 +519,14 @@ def run_self_healing_loop(
 
             if gate == 3:
                 current_reward_override = None
-
-            prompt = _format_repair_prompt(gate, diag, current_scene)
-            cost_tracker.log_api_call(
-                input_tokens=len(prompt.split()),
-                output_tokens=50,
-                purpose=f"deterministic_repair_gate_{gate}",
-            )
+                default_src = _get_default_reward_source()
+                result.repaired_reward_code = default_src
+                result.repair_diff = _build_unified_diff(
+                    faulty_src,
+                    default_src,
+                    fromfile="generated_reward.py (Attempt 1: Faulty Override)",
+                    tofile="generated_reward.py (Attempt 2: Restored Dense Reward)",
+                )
             continue
 
         repairs_applied.append(
@@ -386,4 +535,5 @@ def run_self_healing_loop(
         break
 
     result.repairs_applied = repairs_applied
+    result.repaired_reward_fn = current_reward_override
     return result

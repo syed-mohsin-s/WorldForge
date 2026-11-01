@@ -24,12 +24,12 @@ RUN npm run build
 FROM python:3.12-slim-bookworm AS runtime
 
 # Copy Astral uv binary (10-100x faster than pip, multiplexed parallel downloads)
-# Pin uv so a new upstream "latest" image cannot invalidate every downstream
-# layer or change dependency-resolution behavior unexpectedly.
 COPY --from=ghcr.io/astral-sh/uv:0.13.6 /uv /uvx /bin/
 
 WORKDIR /app
 
+# Default MUJOCO_GL to egl (with automatic fallback to osmesa in base_env.py)
+# to prevent OSMesa + PyTorch thread/TLS segfaults during SB3 PPO training.
 ENV DEBIAN_FRONTEND=noninteractive \
     UV_SYSTEM_PYTHON=1 \
     UV_COMPILE_BYTECODE=1 \
@@ -38,7 +38,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     UV_HTTP_TIMEOUT=120 \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    MUJOCO_GL=osmesa \
+    MUJOCO_GL=egl \
     PORT=8000
 
 # Install system dependencies for MuJoCo physics, headless rendering & OpenCV
@@ -53,17 +53,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# The lock contains the complete, CPU-only Linux dependency graph.  Copy it by
-# itself so application edits never invalidate this expensive layer.
+# The lock contains the complete, CPU-only Linux dependency graph.
 COPY requirements.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip sync --system --torch-backend cpu --no-progress requirements.lock
 
-# Copy Python codebase, configs, scripts, and pre-rendered preview assets
+# Copy Python codebase, configs, and scripts (outputs/ is created dynamically
+# at runtime rather than copied from the build context, so fresh clones succeed).
 COPY src/ ./src/
 COPY configs/ ./configs/
 COPY scripts/ ./scripts/
-COPY outputs/ ./outputs/
 
 # Ensure output directories exist with write permissions
 RUN mkdir -p /app/outputs/uploads /app/outputs/runs
@@ -72,7 +71,7 @@ RUN mkdir -p /app/outputs/uploads /app/outputs/runs
 COPY --from=frontend-builder /app/frontend/dist ./frontend/dist
 
 # Health check against FastAPI backend
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:8000/api/status || exit 1
 
 EXPOSE 8000

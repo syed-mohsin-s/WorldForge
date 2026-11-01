@@ -11,7 +11,7 @@ Features:
 - Strict material priors assignment from ``configs/materials.yaml``.
 - Joint hierarchy & oracle waypoint synthesis with schema-grounded JSON parsing.
 - Validated Pydantic V2 ``SceneGraph`` emission.
-- Accurate API token and compute tracking in ``CostTracker``.
+- Accurate API token and compute tracking in ``CostTracker`` (zero phantom tokens on local runs).
 """
 
 from __future__ import annotations
@@ -214,7 +214,7 @@ class MuseSparkReasoner:
         task_prompt: str | None,
         task_type: str | None,
     ) -> SceneGraph:
-        """Deterministic rule-based synthesis for offline testing and fallback."""
+        """Deterministic rule-based synthesis for offline testing and fallback (zero API tokens logged)."""
         object_nodes: list[ObjectNode] = []
         for obj in geom.objects:
             mat = self._infer_material(obj.label, obj.id)
@@ -225,6 +225,7 @@ class MuseSparkReasoner:
                 damping=obj.joint_damping,
                 is_prior_guess=obj.is_prior_guess,
             )
+            rgba = (0.2, 0.45, 0.85, 1.0) if ("blue" in obj.label.lower() and mat == "plastic") else None
             object_nodes.append(
                 ObjectNode(
                     id=obj.id,
@@ -234,6 +235,7 @@ class MuseSparkReasoner:
                     position=obj.position,
                     quaternion=obj.quaternion,
                     material=mat,
+                    rgba=rgba,
                     is_static=obj.is_static,
                     joint=joint,
                     parent_id=obj.parent_id,
@@ -251,13 +253,6 @@ class MuseSparkReasoner:
                 f"{[(o.id, self._infer_material(o.label, o.id)) for o in geom.objects]}. "
                 f"Synthesized {len(task_spec.waypoints)} oracle keyframes ensuring kinematic clearance and weld stability."
             )
-
-        self.cost_tracker.log_api_call(
-            input_tokens=350,
-            output_tokens=220,
-            model="muse_spark_local",
-            purpose=f"local_scene_synthesis_{geom.scene_id}",
-        )
 
         return SceneGraph(
             scene_id=geom.scene_id,
@@ -317,7 +312,7 @@ class MuseSparkReasoner:
         target_obj = next((o for o in geom.objects if o.is_static and o.id != manipulated.id), None)
 
         if target_obj:
-            target_pos = (target_obj.position[0], target_obj.position[1], target_obj.position[2] + 0.035)
+            target_pos = (target_obj.position[0], target_obj.position[1], target_obj.position[2] + 0.030)
         else:
             target_pos = (-0.15, 0.1, 0.035)
 
@@ -325,13 +320,13 @@ class MuseSparkReasoner:
         tx, ty, tz = target_pos
 
         waypoints: list[tuple[float, float, float, float]] = [
-            (mx, my, mz + 0.09, 1.0),
-            (mx, my, mz + 0.03, 1.0),
-            (mx, my, mz + 0.03, -1.0),
-            (mx, my, mz + 0.09, -1.0),
-            (tx, ty, mz + 0.09, -1.0),
-            (tx, ty, tz + 0.02, -1.0),
-            (tx, ty, tz + 0.02, 1.0),
+            (mx, my, mz + 0.095, 1.0),
+            (mx, my, mz + 0.029, 1.0),
+            (mx, my, mz + 0.029, -1.0),
+            (mx, my, mz + 0.095, -1.0),
+            (tx, ty, mz + 0.095, -1.0),
+            (tx, ty, tz + 0.025, -1.0),
+            (tx, ty, tz + 0.025, 1.0),
         ]
 
         return TaskSpec(
@@ -345,7 +340,7 @@ class MuseSparkReasoner:
 
     def _build_push_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
         fallback_obj = geom.objects[0] if geom.objects else LiftedObject(
-            id="cylinder_1", label="yellow cylinder", primitive="cylinder", size=[0.025, 0.04], position=(0.1, 0.0, 0.04)
+            id="blue_cylinder", label="blue plastic cylinder", primitive="cylinder", size=[0.02, 0.04], position=(0.1, -0.05, 0.041)
         )
         manipulated = next((o for o in geom.objects if not o.is_static and "obstacle" not in o.label.lower()), fallback_obj)
         target_obj = next((o for o in geom.objects if "marker" in o.label.lower() or "coaster" in o.label.lower()), None)
@@ -384,7 +379,7 @@ class MuseSparkReasoner:
 
     def _build_articulate_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
         fallback_obj = geom.objects[0] if geom.objects else LiftedObject(
-            id="drawer_handle", label="drawer handle", primitive="box", size=[0.015, 0.05, 0.015], position=(0.0, -0.12, 0.085), joint_type="slide"
+            id="drawer_panel", label="wooden drawer front panel", primitive="box", size=[0.10, 0.005, 0.06], position=(0.0, -0.105, 0.0), joint_type="slide"
         )
         manipulated = next((o for o in geom.objects if o.joint_type in ("slide", "hinge")), fallback_obj)
         target_delta = 0.10
@@ -411,7 +406,9 @@ class MuseSparkReasoner:
 
     def _infer_material(self, label: str, object_id: str) -> str:
         text = f"{label} {object_id}".lower()
-        if any(k in text for k in ("metal", "steel", "handle", "iron")):
+        if any(k in text for k in ("plastic", "cube", "cylinder")):
+            return "plastic"
+        if any(k in text for k in ("metal", "steel", "handle", "iron", "obstacle")):
             return "metal"
         if any(k in text for k in ("wood", "wooden", "coaster", "cabinet", "drawer")):
             return "wood"
@@ -436,6 +433,7 @@ class MuseSparkReasoner:
         """Call Muse Spark 1.2 API for unified reasoning."""
         import httpx
 
+        api_url = os.environ.get("META_SPARK_API_URL", "https://api.meta.ai/v1/models/muse-spark-1.2/reason")
         headers = {
             "Authorization": f"Bearer {self.meta_api_key}",
             "Content-Type": "application/json",
@@ -458,30 +456,18 @@ class MuseSparkReasoner:
             ],
         }
 
-        in_toks = 850
-        out_toks = 450
-
-        try:
-            with httpx.Client(timeout=30.0) as client:
-                resp = client.post(
-                    "https://api.meta.ai/v1/models/muse-spark-1.2/reason",
-                    headers=headers,
-                    json=payload,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                self.cost_tracker.log_api_call(
-                    input_tokens=in_toks,
-                    output_tokens=out_toks,
-                    model="muse_spark_1.2",
-                    purpose="scene_graph_synthesis",
-                )
-                return SceneGraph(**data)
-        except Exception as exc:
-            self.cost_tracker.log_api_call(
-                input_tokens=in_toks,
-                output_tokens=50,
-                model="muse_spark_1.2",
-                purpose=f"spark_api_fallback: {exc}",
+        with httpx.Client(timeout=30.0) as client:
+            resp = client.post(
+                api_url,
+                headers=headers,
+                json=payload,
             )
-            return self._synthesize_local(geometry, prompt, task_type)
+            resp.raise_for_status()
+            data = resp.json()
+            self.cost_tracker.log_api_call(
+                input_tokens=850,
+                output_tokens=450,
+                model="muse_spark_1.2",
+                purpose="scene_graph_synthesis",
+            )
+            return SceneGraph(**data)

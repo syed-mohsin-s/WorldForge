@@ -10,10 +10,12 @@ Provides REST and Server-Sent Event (SSE) endpoints for:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import io
 import json
 import logging
 import os
+import re
 import shutil
 import threading
 import zipfile
@@ -21,9 +23,9 @@ from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -32,40 +34,24 @@ import numpy as np
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.generated_reward import compute_reward
 from src.compiler.mjcf_builder import SceneCompiler
-from src.pipeline import OUTPUTS_ROOT, SCENES_DIR, run_worldforge_pipeline, stream_worldforge_pipeline
+from src.pipeline import (
+    OUTPUTS_ROOT,
+    SCENES_DIR,
+    run_worldforge_pipeline,
+    sanitize_scene_id,
+    stream_worldforge_pipeline,
+)
 from src.schema.scene_graph import SceneGraph
 from src.validation.ppo_runner import OracleController
 
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="WorldForge-RL Backend API",
-    version="1.0.0",
-    description="Studio-Grade MuJoCo 3.17 + Baseten / Meta RL Environment Synthesis API",
-)
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
-app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_ROOT)), name="outputs")
-
-# The production image contains the Vite build at /app/frontend/dist.  Keep
-# this optional so native API development still works before the frontend has
-# been built locally.
-FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
-FRONTEND_ASSETS = FRONTEND_DIST / "assets"
-if FRONTEND_ASSETS.is_dir():
-    app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS)), name="frontend-assets")
+_ALLOWED_VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mov", ".avi", ".mkv"})
+_SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
 
-def ensure_preview_assets():
+def ensure_preview_assets() -> None:
     """Ensure cached preview assets exist for all golden scenes."""
     for file_path in SCENES_DIR.glob("*.json"):
         clean_id = file_path.stem
@@ -82,7 +68,57 @@ def ensure_preview_assets():
                 logger.warning("Could not auto-generate preview assets for %s: %s", clean_id, exc)
 
 
-ensure_preview_assets()
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    """Generate missing preview assets in a background daemon thread so cold start is non-blocking."""
+    if os.environ.get("WORLDFORGE_SYNC_PREVIEWS", "").lower() in ("1", "true", "yes"):
+        ensure_preview_assets()
+    else:
+        threading.Thread(target=ensure_preview_assets, daemon=True, name="preview-init").start()
+    yield
+
+
+app = FastAPI(
+    title="WorldForge-RL Backend API",
+    version="1.0.0",
+    description="Studio-Grade MuJoCo 3.17 + Baseten / Meta RL Environment Synthesis API",
+    lifespan=_lifespan,
+)
+
+# Restrict CORS origins instead of reflecting arbitrary origins with allow_credentials=True
+_raw_origins = os.environ.get(
+    "CORS_ALLOWED_ORIGINS",
+    "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000",
+)
+_allowed_origins = [o.strip() for o in _raw_origins.split(",") if o.strip() and o.strip() != "*"]
+if not _allowed_origins:
+    _allowed_origins = ["http://localhost:5173", "http://localhost:8000"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_allowed_origins,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization"],
+)
+
+
+@app.middleware("http")
+async def _security_headers_middleware(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/outputs/"):
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["Content-Security-Policy"] = "sandbox"
+    return response
+
+
+OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
+app.mount("/outputs", StaticFiles(directory=str(OUTPUTS_ROOT)), name="outputs")
+
+FRONTEND_DIST = Path(__file__).resolve().parents[2] / "frontend" / "dist"
+FRONTEND_ASSETS = FRONTEND_DIST / "assets"
+if FRONTEND_ASSETS.is_dir():
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_ASSETS)), name="frontend-assets")
 
 
 # ---------------------------------------------------------------------------
@@ -116,16 +152,37 @@ class SimResetRequest(BaseModel):
 active_sim_sessions: dict[str, dict[str, Any]] = {}
 
 
-def _load_scene_graph(scene_id: str) -> SceneGraph:
-    clean_id = scene_id.replace(".json", "")
-    target = SCENES_DIR / f"{clean_id}.json"
+def _resolve_safe_scene_path(scene_id: str, fallback_to_default: bool = False) -> tuple[str, Path]:
+    """Validate scene_id against path traversal and resolve to a file inside SCENES_DIR."""
+    try:
+        clean_id = sanitize_scene_id(scene_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    scenes_root = SCENES_DIR.resolve()
+    target = (SCENES_DIR / f"{clean_id}.json").resolve()
+    if target.parent != scenes_root:
+        raise HTTPException(status_code=400, detail="Invalid scene_id")
+
     if not target.exists():
-        for p in SCENES_DIR.glob("*.json"):
+        for p in sorted(SCENES_DIR.glob("*.json")):
             if clean_id in p.stem or p.stem in clean_id:
-                target = p
+                target = p.resolve()
+                clean_id = p.stem
                 break
+
     if not target.exists():
-        target = SCENES_DIR / "scene1_pick_place.json"
+        if fallback_to_default:
+            clean_id = "scene1_pick_place"
+            target = (SCENES_DIR / "scene1_pick_place.json").resolve()
+        else:
+            raise HTTPException(status_code=404, detail=f"Scene '{scene_id}' not found")
+
+    return clean_id, target
+
+
+def _load_scene_graph(scene_id: str, fallback_to_default: bool = True) -> SceneGraph:
+    _, target = _resolve_safe_scene_path(scene_id, fallback_to_default=fallback_to_default)
     with open(target, "r", encoding="utf-8") as f:
         data = json.load(f)
     return SceneGraph.model_validate(data)
@@ -202,16 +259,17 @@ def get_system_status() -> dict[str, Any]:
     """Return system readiness, hardware, and connected LLM provider telemetry."""
     baseten_key = os.environ.get("BASETEN_API_KEY", "")
     meta_key = os.environ.get("META_API_KEY", "")
+    meta_sam_url = os.environ.get("META_SAM_API_URL", "")
     modal_token = os.environ.get("MODAL_TOKEN_ID", "")
     sam_endpoint = os.environ.get("SAM31_ENDPOINT_URL", "")
 
     sam_provider = "sim-depth-seg (offline)"
     if sam_endpoint and sam_endpoint.strip():
         sam_provider = "unsloth/sam3.1 (Colab/Kaggle T4 GPU)"
-    elif meta_key and not meta_key.startswith("your_"):
+    elif meta_key and not meta_key.startswith("your_") and meta_sam_url:
         sam_provider = "meta-api/sam-3.1"
     elif os.environ.get("SAM31_LOCAL_HF", "").lower() in ("true", "1", "yes"):
-        sam_provider = "unsloth/sam3.1 (Snapdragon Oryon CPU)"
+        sam_provider = "unsloth/sam3.1 (Local HF CPU)"
 
     return {
         "status": "online",
@@ -233,7 +291,7 @@ def get_system_status() -> dict[str, Any]:
             "grant": "$130 Modal Cloud Credit",
         },
         "sam31": {
-            "configured": bool(sam_endpoint or (meta_key and not meta_key.startswith("your_"))),
+            "configured": bool(sam_endpoint or (meta_key and not meta_key.startswith("your_") and meta_sam_url)),
             "provider": sam_provider,
             "endpoint_url": sam_endpoint,
         },
@@ -284,16 +342,7 @@ def list_scenes() -> list[dict[str, Any]]:
 @app.get("/api/scene-preview/{scene_id}")
 def get_scene_preview(scene_id: str) -> dict[str, Any]:
     """Retrieve scene-specific Stage 1 perception masks, Stage 8 render+diff overlay, and 4.0s rollouts."""
-    clean_id = scene_id.replace(".json", "")
-    target = SCENES_DIR / f"{clean_id}.json"
-    if not target.exists():
-        for p in SCENES_DIR.glob("*.json"):
-            if clean_id in p.stem or p.stem in clean_id:
-                clean_id = p.stem
-                target = p
-                break
-    if not target.exists():
-        clean_id = "scene1_pick_place"
+    clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=True)
 
     return {
         "scene_id": clean_id,
@@ -307,15 +356,7 @@ def get_scene_preview(scene_id: str) -> dict[str, Any]:
 @app.get("/api/scenes/{scene_id}")
 def get_scene(scene_id: str) -> dict[str, Any]:
     """Retrieve full SceneGraph JSON for a given scene ID or file ID."""
-    clean_id = scene_id.replace(".json", "")
-    target = SCENES_DIR / f"{clean_id}.json"
-    if not target.exists():
-        for p in SCENES_DIR.glob("*.json"):
-            if clean_id in p.stem or p.stem in clean_id:
-                target = p
-                break
-    if not target.exists():
-        raise HTTPException(status_code=404, detail=f"Scene '{scene_id}' not found")
+    _, target = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
 
     with open(target, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -329,7 +370,7 @@ def get_scene(scene_id: str) -> dict[str, Any]:
 @app.post("/api/sim/reset")
 def sim_reset(req: SimResetRequest) -> dict[str, Any]:
     """Reset the live MuJoCo 3.17 simulation environment and return ground-truth state."""
-    clean_id = req.scene_id.replace(".json", "")
+    clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
     sg = _load_scene_graph(clean_id)
     prev = active_sim_sessions.get(clean_id)
     lock = prev["lock"] if (prev and "lock" in prev) else threading.Lock()
@@ -356,7 +397,7 @@ def sim_reset(req: SimResetRequest) -> dict[str, Any]:
 @app.post("/api/sim/step")
 def sim_step(req: SimActionRequest) -> dict[str, Any]:
     """Execute a single real physics step in MuJoCo 3.17 with the given 4-DoF action."""
-    clean_id = req.scene_id.replace(".json", "")
+    clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
     if clean_id not in active_sim_sessions:
         sim_reset(SimResetRequest(scene_id=clean_id))
 
@@ -376,7 +417,7 @@ def sim_step(req: SimActionRequest) -> dict[str, Any]:
 @app.post("/api/sim/oracle-step")
 def sim_oracle_step(req: SimResetRequest) -> dict[str, Any]:
     """Step the deterministic Waypoint Oracle controller inside MuJoCo 3.17."""
-    clean_id = req.scene_id.replace(".json", "")
+    clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
     if clean_id not in active_sim_sessions:
         sim_reset(SimResetRequest(scene_id=clean_id))
 
@@ -400,7 +441,7 @@ def sim_trajectory(
     max_steps: int = Query(120),
 ) -> list[dict[str, Any]]:
     """Compute and return the full high-fidelity MuJoCo 3.17 physics trajectory."""
-    clean_id = scene_id.replace(".json", "")
+    clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=True)
     sg = _load_scene_graph(clean_id)
     env = WorldForgeEnv(sg)
     ctrl = OracleController(sg.task.waypoints)
@@ -431,9 +472,10 @@ def sim_trajectory(
 @app.post("/api/run")
 def run_pipeline(req: RunRequest) -> dict[str, Any]:
     """Execute the complete 8-stage pipeline synchronously and return all telemetry."""
+    clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=False)
     try:
         result = run_worldforge_pipeline(
-            scene_id=req.scene_id,
+            scene_id=clean_id,
             inject_fault=req.inject_fault,
             provider=req.provider,
             quick_ppo=req.quick_ppo,
@@ -441,9 +483,13 @@ def run_pipeline(req: RunRequest) -> dict[str, Any]:
             task_prompt=req.task_prompt,
         )
         return result
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:
         logger.exception("Pipeline run failed: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc))
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.get("/api/run/stream")
@@ -456,9 +502,10 @@ def stream_pipeline_get(
     video_path: str | None = Query(None),
 ):
     """Stream the 8-stage pipeline as Server-Sent Events (SSE)."""
+    clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
     return StreamingResponse(
         stream_worldforge_pipeline(
-            scene_id=scene_id,
+            scene_id=clean_id,
             inject_fault=inject_fault,
             provider=provider,
             quick_ppo=quick_ppo,
@@ -477,9 +524,10 @@ def stream_pipeline_get(
 @app.post("/api/run/stream")
 def stream_pipeline_post(req: RunRequest):
     """Stream the 8-stage pipeline via POST as Server-Sent Events (SSE)."""
+    clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=False)
     return StreamingResponse(
         stream_worldforge_pipeline(
-            scene_id=req.scene_id,
+            scene_id=clean_id,
             inject_fault=req.inject_fault,
             provider=req.provider,
             quick_ppo=req.quick_ppo,
@@ -498,9 +546,9 @@ def stream_pipeline_post(req: RunRequest):
 @app.get("/api/export/{scene_id}")
 def export_gym_package(scene_id: str) -> Response:
     """Export a self-contained Gymnasium + MuJoCo 3.17 environment ZIP package."""
-    clean_id = scene_id.replace(".json", "")
-    sg = _load_scene_graph(clean_id)
-    out_dir = OUTPUTS_ROOT / clean_id
+    clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
+    sg = _load_scene_graph(clean_id, fallback_to_default=False)
+    out_dir = (OUTPUTS_ROOT / clean_id).resolve()
 
     mjcf_path = out_dir / "environment.xml"
     if mjcf_path.exists():
@@ -511,21 +559,147 @@ def export_gym_package(scene_id: str) -> Response:
     reward_src_path = Path(__file__).resolve().parents[1] / "compiler" / "generated_reward.py"
     reward_code = reward_src_path.read_text(encoding="utf-8") if reward_src_path.exists() else ""
 
-    standalone_runner = f'''"""Standalone WorldForge-RL Gymnasium Environment Runner ({sg.scene_id})."""
+    standalone_runner = f'''"""Standalone WorldForge-RL Gymnasium Environment ({sg.scene_id})."""
+from __future__ import annotations
+
 import json
+import math
 from pathlib import Path
+from typing import Any
+
+import gymnasium as gym
 import mujoco
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-MODEL = mujoco.MjModel.from_xml_path(str(HERE / "environment.xml"))
-DATA = mujoco.MjData(MODEL)
+
+
+class WorldForgeStandaloneEnv(gym.Env):
+    """Self-contained Gymnasium environment wrapping {sg.scene_id} in MuJoCo 3.x."""
+
+    metadata = {{"render_modes": ["rgb_array"], "render_fps": 25}}
+
+    def __init__(
+        self,
+        xml_path: str | Path = HERE / "environment.xml",
+        scene_json_path: str | Path = HERE / "scene_graph.json",
+        render_mode: str | None = None,
+        n_substeps: int = 10,
+        max_delta_m: float = 0.02,
+    ) -> None:
+        super().__init__()
+        self.render_mode = render_mode
+        self.n_substeps = n_substeps
+        self.max_delta = max_delta_m
+
+        with open(scene_json_path, "r", encoding="utf-8") as f:
+            self.scene_data = json.load(f)
+
+        self.model = mujoco.MjModel.from_xml_path(str(xml_path))
+        self.data = mujoco.MjData(self.model)
+
+        self._obj_body_ids = []
+        for obj in self.scene_data.get("objects", []):
+            bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, obj["id"])
+            if bid >= 0:
+                self._obj_body_ids.append(bid)
+
+        n_objs = len(self._obj_body_ids)
+        obs_dim = 3 + 2 + 3 * n_objs + 6 * n_objs + 3
+        self.observation_space = gym.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
+        )
+        self.action_space = gym.spaces.Box(
+            low=-1.0, high=1.0, shape=(4,), dtype=np.float32
+        )
+
+        self._mocap_id = 0
+        self._finger_act_L = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "finger_actuator")
+        self._finger_act_R = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, "finger_actuator_R")
+        self._finger_jnt_L = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint_L")
+        self._finger_jnt_R = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, "finger_joint_R")
+        self._renderer: mujoco.Renderer | None = None
+
+    def _obs(self) -> np.ndarray:
+        parts = [self.data.mocap_pos[self._mocap_id].copy()]
+        parts.append(np.array([
+            self.data.qpos[self.model.jnt_qposadr[self._finger_jnt_L]],
+            self.data.qpos[self.model.jnt_qposadr[self._finger_jnt_R]],
+        ], dtype=np.float64))
+        for bid in self._obj_body_ids:
+            parts.append(self.data.xpos[bid].copy())
+        for bid in self._obj_body_ids:
+            parts.append(self.data.cvel[bid].copy())
+        target = self.scene_data.get("task", {{}}).get("target_position")
+        parts.append(np.array(target, dtype=np.float64) if target is not None else np.zeros(3))
+        return np.concatenate(parts).astype(np.float32)
+
+    def _compute_reward(self) -> tuple[float, bool, dict[str, Any]]:
+        task = self.scene_data.get("task", {{}})
+        obj_id = task.get("manipulated_object_id", "")
+        bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, obj_id)
+        obj_pos = self.data.xpos[bid].copy() if bid >= 0 else np.zeros(3)
+        grip_pos = self.data.mocap_pos[self._mocap_id].copy()
+        d_reach = float(np.linalg.norm(grip_pos - obj_pos))
+        r_reach = 1.0 - math.tanh(4.0 * d_reach)
+
+        target = task.get("target_position")
+        if target is not None:
+            d_goal = float(np.linalg.norm(obj_pos - np.array(target, dtype=np.float64)))
+            r_goal = 1.0 - math.tanh(4.0 * d_goal)
+            terminated = d_goal < 0.04
+            reward = 0.3 * r_reach + 0.7 * r_goal + (10.0 if terminated else 0.0)
+        else:
+            terminated = False
+            reward = r_reach
+        return float(reward), bool(terminated), {{"d_reach": d_reach}}
+
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        super().reset(seed=seed)
+        mujoco.mj_resetData(self.model, self.data)
+        mujoco.mj_forward(self.model, self.data)
+        return self._obs(), {{}}
+
+    def step(self, action: np.ndarray):
+        action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+        self.data.mocap_pos[self._mocap_id] += action[:3] * self.max_delta
+        grip_target = float((action[3] + 1.0) / 2.0 * 0.04)
+        self.data.ctrl[self._finger_act_L] = grip_target
+        self.data.ctrl[self._finger_act_R] = grip_target
+        for _ in range(self.n_substeps):
+            mujoco.mj_step(self.model, self.data)
+        obs = self._obs()
+        reward, terminated, info = self._compute_reward()
+        return obs, reward, terminated, False, info
+
+    def render(self) -> np.ndarray | None:
+        if self.render_mode != "rgb_array":
+            return None
+        w, h = self.scene_data.get("camera", {{}}).get("resolution", [640, 480])
+        if self._renderer is None:
+            self._renderer = mujoco.Renderer(self.model, height=h, width=w)
+        cam_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_CAMERA, "render_cam")
+        self._renderer.update_scene(self.data, camera=cam_id if cam_id >= 0 else -1)
+        return self._renderer.render()
+
+    def close(self) -> None:
+        if self._renderer is not None:
+            self._renderer.close()
+            self._renderer = None
+
 
 if __name__ == "__main__":
-    mujoco.mj_resetData(MODEL, DATA)
+    env = WorldForgeStandaloneEnv()
+    obs, _ = env.reset(seed=42)
+    total_return = 0.0
     for step in range(250):
-        mujoco.mj_step(MODEL, DATA)
-    print(f"Successfully simulated 250 steps of {sg.scene_id} in MuJoCo {{mujoco.__version__}}!")
+        action = env.action_space.sample()
+        obs, reward, terminated, truncated, info = env.step(action)
+        total_return += reward
+        if terminated or truncated:
+            obs, _ = env.reset()
+    env.close()
+    print(f"Simulated 250 Gymnasium steps of {sg.scene_id} (return={{total_return:.2f}})")
 '''
 
     buf = io.BytesIO()
@@ -553,20 +727,43 @@ if __name__ == "__main__":
 
 @app.post("/api/upload-video")
 async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
-    """Accept an uploaded tabletop MP4 video for perception analysis."""
-    uploads_dir = OUTPUTS_ROOT / "uploads"
+    """Accept an uploaded tabletop video for perception analysis with extension and content-type validation."""
+    raw_name = Path(file.filename or "").name
+    if not raw_name:
+        raise HTTPException(status_code=400, detail="Missing filename")
+
+    clean_name = _SAFE_FILENAME_RE.sub("_", raw_name).lstrip(".")
+    ext = Path(clean_name).suffix.lower()
+    if ext not in _ALLOWED_VIDEO_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file extension '{ext}'. Only video files ({sorted(_ALLOWED_VIDEO_EXTENSIONS)}) are allowed.",
+        )
+
+    content_type = (file.content_type or "").lower()
+    if content_type and not (
+        content_type.startswith("video/") or content_type == "application/octet-stream"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid Content-Type '{content_type}'. Expected video/*.",
+        )
+
+    uploads_dir = (OUTPUTS_ROOT / "uploads").resolve()
     uploads_dir.mkdir(parents=True, exist_ok=True)
 
-    safe_name = Path(file.filename or "uploaded_tabletop.mp4").name
-    dest_path = uploads_dir / safe_name
+    dest_path = (uploads_dir / clean_name).resolve()
+    if dest_path.parent != uploads_dir:
+        raise HTTPException(status_code=400, detail="Invalid upload filename")
+
     with open(dest_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
 
     return {
         "status": "success",
-        "filename": safe_name,
+        "filename": clean_name,
         "video_path": str(dest_path),
-        "video_url": f"/outputs/uploads/{safe_name}",
+        "video_url": f"/outputs/uploads/{clean_name}",
         "size_bytes": dest_path.stat().st_size,
     }
 
@@ -577,7 +774,6 @@ def serve_frontend() -> Response:
     index_html = FRONTEND_DIST / "index.html"
     if not index_html.is_file():
         raise HTTPException(status_code=404, detail="Frontend build is not available.")
-    # Keep the HTML fresh so a rebuilt image references its latest hashed assets.
     return FileResponse(index_html, headers={"Cache-Control": "no-cache"})
 
 
