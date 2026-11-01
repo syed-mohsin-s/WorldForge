@@ -56,6 +56,8 @@ def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     """
     a = mask_a.astype(bool)
     b = mask_b.astype(bool)
+    if a.shape != b.shape:
+        b = cv2.resize(b.astype(np.uint8), (a.shape[1], a.shape[0]), interpolation=cv2.INTER_NEAREST).astype(bool)
 
     intersection = np.logical_and(a, b).sum()
     union = np.logical_or(a, b).sum()

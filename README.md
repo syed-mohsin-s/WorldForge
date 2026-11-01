@@ -2,7 +2,7 @@
 
 > **Autonomous Synthesis of Validated, Trainable MuJoCo 3.x Gymnasium Environments from Monocular Video & 3D Scene Graphs**
 
-[![CI Tests](https://img.shields.io/badge/tests-86%20passed%20(100%25)-brightgreen.svg)]()
+[![CI Tests](https://img.shields.io/badge/tests-88%20passed%20(100%25)-brightgreen.svg)]()
 [![Python 3.12](https://img.shields.io/badge/python-3.12-blue.svg)]()
 [![MuJoCo 3.x](https://img.shields.io/badge/mujoco-3.17.0-orange.svg)]()
 [![Baseten](https://img.shields.io/badge/Baseten-meta--models%2Fmuse--spark--open--1026-violet.svg)]()
@@ -284,27 +284,55 @@ Once started:
 
 ## Studio 2.0 Interface Walkthrough
 
-```
-┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ WorldForge Studio 2.0  [⚡ 8-Stage Pipeline Studio]  [🎮 3D PBR Workbench]  $0.0088   │
-├────────────────────────────────────────────────────────────────────────────────────────┤
-│ 8-STAGE AUTONOMOUS PIPELINE:                                                           │
-│ [1. SAM 3.1] [2. 3D LIFT] [3. MUSE SPARK] [4. SCENEGRAPH] [5. MJCF] [6. REWARD] ...   │
-├───────────────────────┬────────────────────────────────┬───────────────────────────────┤
-│ LEFT: PERCEPTION      │ CENTER: SYNTHESIS ARTIFACTS    │ RIGHT: VALIDATION & ROLLOUT   │
-│ • SAM 3.1 4px Masks   │ • Spark Reasoning Token Stream │ • 4.0s Trained PPO MP4 (20fps)│
-│ • Zero Flying Pixels  │ • Pydantic V2 SceneGraph JSON  │ • Pure Waypoint Oracle MP4    │
-│ • Stage 8 Render+Diff │ • Compiled MuJoCo 3.17 MJCF    │ • 5-Gate Telemetry Checklist  │
-│   Mask IoU (up to 100%)• Dense Reward Code & Diff     │ • Learning Return Curve       │
-│ • Green/Red Overlays  │ • [🎮 Open 3D Workbench ↗]     │ • Self-Healing Retry Badge    │
-└───────────────────────┴────────────────────────────────┴───────────────────────────────┘
-```
+WorldForge Studio 2.0 provides an autonomous dual-cockpit interface: an **8-Stage Autonomous Pipeline Studio** and an interactive **3D PBR Workbench**, backed by real Python MuJoCo 3.17 physics and live token streaming from Baseten's `meta-models/muse-spark-open-1026`.
 
-1. **Scene Preset Selector**: Switch seamlessly between **Red Cube Pick & Place**, **Push Around Obstacle**, and **Articulated Slide Drawer** with automatic cache-busted image and rollout updates.
-2. **Interactive 8-Stage Pipeline Bar**: Displays real-time status and timing badges across Meta AI and Python stages with zero vertical clipping.
-3. **Live Baseten Reasoning Stream**: Watch `meta-models/muse-spark-open-1026` generate chain-of-thought domain reasoning tokens live via Server-Sent Events (SSE).
-4. **Self-Healing Simulation**: Check **"Inject Gate 3 Fault (Demo Self-Healing)"** to watch Gate 3 fail, emit diagnostic logs, synthesize an automated AST patch, and re-validate 100% green.
-5. **Interactive 3D PBR Workbench**: Switch into the full-screen Three.js WebGL workbench with 4-DoF manual jogging controls, waypoint spline trajectories, and real-time multi-channel reward waveforms—all executed directly by MuJoCo 3.17 on the backend.
+### 1. 8-Stage Autonomous Pipeline Studio
+
+![WorldForge Studio 2.0 Interface Walkthrough](docs/assets/studio_walkthrough.png)
+
+The interface is structured into three responsive, synchronized functional zones:
+
+#### A. Top Impact Telemetry & Navigation Bar
+- **Dynamic Speedup Readout**: Benchmarks the end-to-end synthesis duration against human expert baseline (`6.0 hrs Manual MJCF → ~30s WorldForge`, a **>700× speedup**).
+- **Cost & Hackathon Credit Tracker**: Tracks real-time API token consumption and compute cost (`$0.00xx` against `$150 Meta + $100 Baseten` hackathon grants).
+- **Render+Diff IoU Metric**: Displays the visual alignment score (up to **100% IoU**) between MuJoCo renders and the ground-truth video keyframe.
+- **Automated Self-Healing Badge**: Dynamically indicates repair status, transitioning from retry progress to emerald green (`Self-Healing: Patched on Retry 1 / 4 ✓`) upon successful gate remediation.
+- **Cockpit Switcher**: Instant toggling between `⚡ 8-Stage Pipeline Studio` and `🎮 3D PBR Workbench`.
+
+#### B. Interactive 8-Stage Pipeline Progress Header
+Displays live status and execution timings across all stages:
+1. `SAM 3.1` (Meta / B10): Multiplexed object mask segmentation with 4px boundary erosion.
+2. `3D Lift` (Python): Metric depth back-projection, RANSAC tabletop fitting, and SVD joint axis estimation.
+3. `Muse Spark` (Meta / B10): Live reasoning and domain parameter synthesis from Baseten.
+4. `Scene Graph` (Python): Pydantic V2 strict validation with auto-snap height grounding (`z = table_z + h/2 + 0.001m`).
+5. `MJCF Builder` (Python): Deterministic MuJoCo 3.17 XML compilation with Cartesian `<mocap>` weld actuators.
+6. `Muse Code` (Meta / B10): Multi-stage dense reward function synthesis and automated repair patching.
+7. `Validation & PPO` (Python): 5-Gate objective physics verification and Stable-Baselines3 PPO residual policy training.
+8. `Render + Diff` (Python): Closed-loop mask IoU evaluation against video Frame 0.
+
+#### C. Tri-Pane Real-Time Studio Dashboard
+- **Left Pane — Perception & Render+Diff**: Shows 4px boundary-eroded SAM 3.1 masks (eliminating flying depth pixels) and Stage 8 Render+Diff green/red composite overlay.
+- **Center Pane — Live Synthesis Artifacts**: Tabbed inspector with zero mock data:
+  - `Spark Reasoning`: Live token streaming from `meta-models/muse-spark-open-1026`.
+  - `SceneGraph`: Validated Pydantic V2 JSON specification.
+  - `MJCF XML`: Production-ready MuJoCo 3.17 XML code.
+  - `Reward Code`: Python dense reward function and automated AST patch diffs.
+- **Right Pane — MuJoCo 3.17 Rollout & 5-Gate Telemetry**:
+  - Multi-mode 4.0s video player (`PPO Policy`, `Oracle Baseline`, and `Perception Frame 0`).
+  - 5-Gate objective physics checklist (`Gate 1: Numerical Stability`, `Gate 2: Static Equilibrium`, `Gate 3: Reward Variance`, `Gate 4: Waypoint Oracle`, `Gate 5: PPO Convergence`).
+  - Real-time PPO learning return curve chart.
+
+---
+
+### 2. Interactive 3D PBR Workbench
+
+![3D PBR Workbench View](docs/assets/workbench_walkthrough.png)
+
+Switch to the full-screen **3D PBR Workbench** to interact directly with the compiled MuJoCo 3.17 physics environment:
+- **Real-Time WebGL Three.js Viewport**: Tabletop scene rendering with PBR materials, shadows, and cyan dashed 3D spline waypoint trajectories.
+- **4-DoF Mocap Actuator Jogging**: Directly step the Cartesian gripper in MuJoCo physics using `+X`, `-X`, `+Y`, `-Y`, `+Z`, `-Z`, and `Open / Close Jaws`.
+- **Camera Presets**: Instant viewpoint transitions (`Isometric Rig`, `MuJoCo render_cam`, `Top XY Plane`, and `Front XZ`).
+- **Closed-Loop Waypoint Oracle**: Click **Run Waypoint Oracle** to execute the deterministic proportional controller through all waypoints and observe terminal reward acquisition (`★ TERMINAL GOAL (+10.0)`).
 
 ---
 
@@ -313,15 +341,15 @@ Once started:
 WorldForge includes an exhaustive test suite covering all 5 architectural phases:
 
 ```bash
-# Run all 86 unit and integration tests:
+# Run all 88 unit and integration tests:
 .venv/Scripts/python.exe -m pytest tests/ -v
 ```
 
 ```text
-======================== 86 passed in 70.61s (0:01:10) ========================
+======================= 88 passed in 169.93s (0:02:49) =======================
 - tests/test_phase1.py : 25 PASSED (Schema validation, MJCF compilation, Gymnasium env)
 - tests/test_phase2.py : 27 PASSED (Reward shaping, Gates 1–5, PPO convergence, self-healing)
-- tests/test_phase3.py : 9 PASSED (SAM 3.1 erosion, depth back-projection, SVD joint axis)
+- tests/test_phase3.py : 11 PASSED (SAM 3.1 erosion, depth back-projection, SVD joint axis)
 - tests/test_phase4.py : 14 PASSED (Render+Diff IoU, coordinate refinement, Modal sandbox)
 - tests/test_phase5.py : 11 PASSED (Baseten enforcement, SSE streaming, FastAPI live sim endpoints)
 ```

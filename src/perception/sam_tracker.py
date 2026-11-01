@@ -163,10 +163,11 @@ class SAM31Tracker:
         self,
         video_path: str,
         text_prompts: list[str] | None = None,
+        target_size: tuple[int, int] | None = (640, 480),
     ) -> SamTrackingResult:
         """Track objects in a video file via the 4-tier SAM 3.1 execution hierarchy."""
         prompts = text_prompts or ["object"]
-        frames_rgb = self._decode_video_frames(video_path, max_frames=15)
+        frames_rgb = self._decode_video_frames(video_path, max_frames=15, target_size=target_size)
         scene_id = Path(video_path).stem if video_path else "video_scene"
 
         # Tier 1: Hosted Meta SAM 3.1 API
@@ -260,7 +261,11 @@ class SAM31Tracker:
         return res
 
     @staticmethod
-    def _decode_video_frames(video_path: str, max_frames: int = 15) -> list[np.ndarray]:
+    def _decode_video_frames(
+        video_path: str,
+        max_frames: int = 15,
+        target_size: tuple[int, int] | None = (640, 480),
+    ) -> list[np.ndarray]:
         """Decode evenly spaced RGB frames from an MP4 file using OpenCV."""
         if not video_path or not Path(video_path).exists():
             return []
@@ -272,7 +277,10 @@ class SAM31Tracker:
             ret, bgr = cap.read()
             if not ret:
                 break
-            frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            if target_size and (rgb.shape[1] != target_size[0] or rgb.shape[0] != target_size[1]):
+                rgb = cv2.resize(rgb, target_size, interpolation=cv2.INTER_AREA)
+            frames.append(rgb)
         cap.release()
         return frames
 
@@ -471,7 +479,13 @@ class SAM31Tracker:
         )
 
         tracks: list[ObjectMaskTrack] = []
-        raw_items = data.get("tracks") or data.get("objects") or data.get("masks") or []
+        raw_items = (
+            data.get("tracks")
+            or data.get("detections")
+            or data.get("objects")
+            or data.get("masks")
+            or []
+        )
 
         for idx, item in enumerate(raw_items):
             label = item.get("label", prompts[idx] if idx < len(prompts) else f"object_{idx}")

@@ -215,6 +215,8 @@ def lift_scene_to_3d(
         )
 
     w, h = tracking_result.resolution
+    if frame0_depth is not None and (frame0_depth.shape[0] != h or frame0_depth.shape[1] != w):
+        frame0_depth = cv2.resize(frame0_depth, (w, h), interpolation=cv2.INTER_NEAREST)
 
     # 1. Backproject background pixels to fit tabletop plane
     all_obj_mask = np.zeros((h, w), dtype=bool)

@@ -310,7 +310,10 @@ class MuseSparkReasoner:
             return self._build_pick_place_task(geom, prompt)
 
     def _build_pick_place_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
-        manipulated = next((o for o in geom.objects if not o.is_static and o.parent_id is None), geom.objects[0])
+        fallback_obj = geom.objects[0] if geom.objects else LiftedObject(
+            id="manipulated_object", label="manipulated object", primitive="box", size=[0.025, 0.025, 0.025], position=(0.0, 0.0, 0.026)
+        )
+        manipulated = next((o for o in geom.objects if not o.is_static and o.parent_id is None), fallback_obj)
         target_obj = next((o for o in geom.objects if o.is_static and o.id != manipulated.id), None)
 
         if target_obj:
@@ -341,7 +344,10 @@ class MuseSparkReasoner:
         )
 
     def _build_push_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
-        manipulated = next((o for o in geom.objects if not o.is_static and "obstacle" not in o.label.lower()), geom.objects[0])
+        fallback_obj = geom.objects[0] if geom.objects else LiftedObject(
+            id="cylinder_1", label="yellow cylinder", primitive="cylinder", size=[0.025, 0.04], position=(0.1, 0.0, 0.04)
+        )
+        manipulated = next((o for o in geom.objects if not o.is_static and "obstacle" not in o.label.lower()), fallback_obj)
         target_obj = next((o for o in geom.objects if "marker" in o.label.lower() or "coaster" in o.label.lower()), None)
         obstacle = next((o for o in geom.objects if "obstacle" in o.label.lower()), None)
 
@@ -377,7 +383,10 @@ class MuseSparkReasoner:
         )
 
     def _build_articulate_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
-        manipulated = next((o for o in geom.objects if o.joint_type in ("slide", "hinge")), geom.objects[0])
+        fallback_obj = geom.objects[0] if geom.objects else LiftedObject(
+            id="drawer_handle", label="drawer handle", primitive="box", size=[0.015, 0.05, 0.015], position=(0.0, -0.12, 0.085), joint_type="slide"
+        )
+        manipulated = next((o for o in geom.objects if o.joint_type in ("slide", "hinge")), fallback_obj)
         target_delta = 0.10
 
         waypoints: list[tuple[float, float, float, float]] = [

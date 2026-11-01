@@ -86,9 +86,12 @@ def _save_mask_Overlay(rgb: np.ndarray, masks: dict[str, np.ndarray], out_path: 
         (245, 158, 11),
         (168, 85, 247),
     ]
+    h, w = canvas.shape[:2]
     for idx, (obj_id, mask) in enumerate(masks.items()):
         if not np.any(mask):
             continue
+        if mask.shape != (h, w):
+            mask = cv2.resize(mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
         color = np.array(palette[idx % len(palette)], dtype=np.uint8)
         canvas[mask] = (0.45 * canvas[mask] + 0.55 * color).astype(np.uint8)
         contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -122,9 +125,15 @@ def _save_diff_overlay(ref_masks: dict[str, np.ndarray], sim_masks: dict[str, np
     ref_union = np.zeros((h, w), dtype=bool)
     sim_union = np.zeros((h, w), dtype=bool)
     for k in ref_masks:
-        ref_union |= ref_masks[k]
-        if k in sim_masks:
-            sim_union |= sim_masks[k]
+        m = ref_masks[k]
+        if m.shape != (h, w):
+            m = cv2.resize(m.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        ref_union |= m
+    for k in sim_masks:
+        m = sim_masks[k]
+        if m.shape != (h, w):
+            m = cv2.resize(m.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        sim_union |= m
 
     overlap = ref_union & sim_union
     ref_only = ref_union & ~sim_union
@@ -178,11 +187,35 @@ def run_worldforge_pipeline(
 
     tracker = SAM31Tracker(cost_tracker=cost_tracker)
     if video_path and Path(video_path).exists():
+        prompts: list[str] = []
+        for o in ref_sg.objects:
+            prompts.append(o.label)
+            for token in o.label.replace("(", " ").replace(")", " ").split():
+                c_tok = token.strip().lower()
+                if c_tok in ("cube", "box", "coaster", "target", "drawer", "cylinder", "object", "cup", "bottle") and c_tok not in prompts:
+                    prompts.append(c_tok)
+            short_id = o.id.replace("_", " ")
+            if short_id not in prompts:
+                prompts.append(short_id)
+        cam_w, cam_h = ref_sg.camera.resolution
+        sam_result = tracker.track_video(video_path, text_prompts=prompts, target_size=(cam_w, cam_h))
+        if not sam_result or not sam_result.tracks:
+            sam_result, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
+        else:
+            _, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
+            if sam_result.frame0_depth is None:
+                sam_result.frame0_depth = sim_depth_fallback
+            if sam_result.frame0_rgb is not None:
+                frame0_rgb = sam_result.frame0_rgb
+    elif tracker.has_configured_backend():
         prompts = [o.label for o in ref_sg.objects]
-        sam_result = tracker.track_video(video_path, text_prompts=prompts)
-        _, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
-        if sam_result.frame0_depth is None:
-            sam_result.frame0_depth = sim_depth_fallback
+        sam_result = tracker.segment_image(frame0_rgb, text_prompts=prompts, scene_id=ref_sg.scene_id)
+        if not sam_result or not sam_result.tracks:
+            sam_result, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
+        else:
+            _, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
+            if sam_result.frame0_depth is None:
+                sam_result.frame0_depth = sim_depth_fallback
     else:
         sam_result, frame0_depth = tracker.segment_from_sim_env(ref_env, ref_sg)
 

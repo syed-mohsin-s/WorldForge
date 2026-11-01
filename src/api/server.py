@@ -203,6 +203,15 @@ def get_system_status() -> dict[str, Any]:
     baseten_key = os.environ.get("BASETEN_API_KEY", "")
     meta_key = os.environ.get("META_API_KEY", "")
     modal_token = os.environ.get("MODAL_TOKEN_ID", "")
+    sam_endpoint = os.environ.get("SAM31_ENDPOINT_URL", "")
+
+    sam_provider = "sim-depth-seg (offline)"
+    if sam_endpoint and sam_endpoint.strip():
+        sam_provider = "unsloth/sam3.1 (Colab/Kaggle T4 GPU)"
+    elif meta_key and not meta_key.startswith("your_"):
+        sam_provider = "meta-api/sam-3.1"
+    elif os.environ.get("SAM31_LOCAL_HF", "").lower() in ("true", "1", "yes"):
+        sam_provider = "unsloth/sam3.1 (Snapdragon Oryon CPU)"
 
     return {
         "status": "online",
@@ -222,6 +231,11 @@ def get_system_status() -> dict[str, Any]:
         "modal": {
             "configured": bool(modal_token),
             "grant": "$130 Modal Cloud Credit",
+        },
+        "sam31": {
+            "configured": bool(sam_endpoint or (meta_key and not meta_key.startswith("your_"))),
+            "provider": sam_provider,
+            "endpoint_url": sam_endpoint,
         },
     }
 
