@@ -74,7 +74,7 @@ class OracleController:
         err = np.array([wx, wy, wz], dtype=np.float64) - grip_pos
         dist = float(np.linalg.norm(err))
 
-        if dist < 0.005 or self.step_in_wp >= 60:
+        if dist < 0.005 or self.step_in_wp >= 75:
             self.wp_idx += 1
             self.step_in_wp = 0
             if self.wp_idx >= len(self.waypoints):
@@ -112,7 +112,13 @@ class ResidualOracleEnv(gym.Wrapper):
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         u_oracle = self.controller.get_action(self.env.unwrapped)
-        u_total = np.clip(u_oracle + self.residual_weight * action, -1.0, 1.0)
+        if self.controller.dwell_remaining > 0 or self.controller.completed:
+            u_total = u_oracle
+        else:
+            # Apply bounded residual to XYZ while keeping discrete gripper command authoritative
+            eff_weight = min(self.residual_weight, 0.05)
+            u_xyz = np.clip(u_oracle[:3] + eff_weight * action[:3], -1.0, 1.0)
+            u_total = np.array([u_xyz[0], u_xyz[1], u_xyz[2], u_oracle[3]], dtype=np.float32)
         return self.env.step(u_total)
 
 
@@ -132,7 +138,7 @@ def train_and_evaluate_ppo(
     n_envs: int = 4,
     rollout_video_path: str | None = None,
     eval_episodes: int = 1,
-    eval_steps: int = 120,
+    eval_steps: int = 150,
     render_stride: int = 2,
     reward_fn: Callable | None = None,
 ) -> PPOResult:
@@ -259,7 +265,7 @@ def train_and_evaluate_ppo(
 def record_oracle_rollout(
     scene: SceneGraph,
     output_path: str,
-    max_steps: int = 120,
+    max_steps: int = 150,
     fps: int = 30,
     render_stride: int = 2,
 ) -> str:

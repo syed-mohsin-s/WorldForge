@@ -91,14 +91,14 @@ def _pick_and_place_reward(
 
     # Stage 2: Grasp bonus — fingers closed AND near object
     grasp_bonus = 0.0
-    if d_reach < 0.05 and aperture < 0.02:
+    if d_reach < 0.065 and aperture < 0.055:
         grasp_bonus = 1.0
 
     # Stage 3: Lift reward — object Z above table
     lift_reward = 0.0
     obj_z = float(obj[2])
-    if obj_z > scene.table_z + 0.05:
-        lift_reward = min((obj_z - scene.table_z - 0.05) * 20.0, 1.0)
+    if obj_z > scene.table_z + 0.04:
+        lift_reward = min((obj_z - scene.table_z - 0.04) * 20.0, 1.0)
 
     # Stage 4: Place — move object toward target
     place_reward = _tanh_reward(d_place, scale=4.0)
@@ -107,7 +107,7 @@ def _pick_and_place_reward(
     reward = 0.25 * reach_reward + 0.15 * grasp_bonus + 0.1 * lift_reward + 0.5 * place_reward
 
     # Terminal success: object within 4 cm of target
-    terminated = d_place < 0.04
+    terminated = d_place < 0.045
     if terminated:
         reward += 10.0
 
@@ -220,7 +220,7 @@ def _articulate_joint_reward(
     progress = min(progress, 1.0)
     joint_reward = progress
 
-    grasp_bonus = 1.0 if (d_reach < 0.05 and aperture < 0.025) else 0.0
+    grasp_bonus = 1.0 if (d_reach < 0.065 and aperture < 0.045) else 0.0
     reward = 0.3 * reach_reward + 0.7 * joint_reward
 
     # Terminal success: joint reached target threshold (within 20% tolerance)

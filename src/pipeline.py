@@ -322,7 +322,7 @@ def run_worldforge_pipeline(
             target_size=(cam_w, cam_h),
             object_ids=object_ids,
         )
-        if not sam_result or not sam_result.tracks:
+        if not sam_result or not sam_result.tracks or getattr(sam_result, "sam_provider_used", "").startswith("opencv"):
             sam_result, _ = tracker.segment_from_sim_env(ref_env, ref_sg)
         else:
             if sam_result.frame0_rgb is not None:
@@ -334,7 +334,7 @@ def run_worldforge_pipeline(
             scene_id=ref_sg.scene_id,
             object_ids=object_ids,
         )
-        if not sam_result or not sam_result.tracks:
+        if not sam_result or not sam_result.tracks or getattr(sam_result, "sam_provider_used", "").startswith("opencv"):
             sam_result, _ = tracker.segment_from_sim_env(ref_env, ref_sg)
         else:
             _, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
@@ -425,6 +425,25 @@ def run_worldforge_pipeline(
         reasoner=reasoner,
         task_prompt=task_prompt,
     )
+    # Run coordinate alignment against Frame 0 masks BEFORE compiling and recording rollouts
+    # so any single-view depth centroid offset is corrected prior to Stage 7 execution.
+    pre_aligned_sg, pre_diff_report = evaluate_and_align_sim(
+        scene=validated_sg,
+        target_masks=ref_masks,
+        target_rgb=frame0_rgb,
+        refine_if_below=0.82,
+        max_refine_iters=10,
+        cost_tracker=cost_tracker,
+        pass_threshold=0.60,
+    )
+    if pre_diff_report.mean_iou >= pre_diff_report.initial_mean_iou:
+        validated_sg = _ground_reconstructed_scene_graph(
+            synthesized_sg=pre_aligned_sg,
+            ref_sg=ref_sg,
+            reasoner=reasoner,
+            task_prompt=task_prompt,
+        )
+
     s4_dur = round(time.time() - t0, 3)
     stage_timings["4"] = s4_dur
     emit({"stage": 4, "name": "Scene Graph", "status": "completed", "duration_s": s4_dur})
@@ -504,17 +523,17 @@ def run_worldforge_pipeline(
         n_envs=2,
         rollout_video_path=str(rollout_mp4_path),
         eval_episodes=1,
-        eval_steps=120,
+        eval_steps=150,
         reward_fn=repair_result.repaired_reward_fn,
     )
 
-    if not oracle_mp4_path.exists():
-        record_oracle_rollout(
-            scene=validated_sg,
-            output_path=str(oracle_mp4_path),
-            max_steps=120,
-            fps=30,
-        )
+    # Always regenerate oracle_rollout.mp4 so UI never plays stale cached rollouts
+    record_oracle_rollout(
+        scene=validated_sg,
+        output_path=str(oracle_mp4_path),
+        max_steps=150,
+        fps=30,
+    )
 
     gate_results: dict[str, Any] = {
         str(k): v for k, v in repair_result.final_report.gate_results.items()

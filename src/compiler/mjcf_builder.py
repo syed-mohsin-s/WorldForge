@@ -86,7 +86,7 @@ def compile_scene_to_mjcf(
         gripper_cls,
         "geom",
         condim="4",
-        friction="1.5 0.02 0.01",
+        friction="2.0 0.05 0.01",
         rgba="0.3 0.3 0.3 1",
     )
 
@@ -287,7 +287,7 @@ def compile_scene_to_mjcf(
         name="finger_actuator",
         joint="finger_joint_L",
         ctrlrange="0 0.04",
-        kp="250",
+        kp="300",
     )
     ET.SubElement(
         actuator,
@@ -295,7 +295,7 @@ def compile_scene_to_mjcf(
         name="finger_actuator_R",
         joint="finger_joint_R",
         ctrlrange="0 0.04",
-        kp="250",
+        kp="300",
     )
 
     # ── serialize ─────────────────────────────────────────────────────
@@ -358,7 +358,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         gripper_base,
         "body",
         name="finger_L",
-        pos="0 -0.02 -0.02",
+        pos="0 -0.005 -0.02",
     )
     ET.SubElement(
         finger_l,
@@ -366,7 +366,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         name="finger_joint_L",
         type="slide",
         axis="0 -1 0",
-        damping="10",
+        damping="12",
         range="0 0.04",
         limited="true",
     )
@@ -375,7 +375,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         "geom",
         name="finger_L_geom",
         type="box",
-        size="0.01 0.005 0.03",
+        size="0.012 0.005 0.03",
         rgba="0.4 0.4 0.4 1",
         mass="0.05",
         **{"class": "gripper"},
@@ -385,7 +385,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         gripper_base,
         "body",
         name="finger_R",
-        pos="0 0.02 -0.02",
+        pos="0 0.005 -0.02",
     )
     ET.SubElement(
         finger_r,
@@ -393,7 +393,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         name="finger_joint_R",
         type="slide",
         axis="0 1 0",
-        damping="10",
+        damping="12",
         range="0 0.04",
         limited="true",
     )
@@ -402,7 +402,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         "geom",
         name="finger_R_geom",
         type="box",
-        size="0.01 0.005 0.03",
+        size="0.012 0.005 0.03",
         rgba="0.4 0.4 0.4 1",
         mass="0.05",
         **{"class": "gripper"},

@@ -233,7 +233,7 @@ def _infer_joint_from_trajectory(
 
         collinearity = S[1] / max(S[0], 1e-6) if len(S) > 1 else 0.0
 
-        if collinearity < 0.35:
+        if "drawer" in l_low or "slide" in l_low or collinearity < 0.40:
             if "drawer" in l_low or "slide" in l_low:
                 joint_type = "slide"
                 joint_axis = (float(axis[0]), float(axis[1]), float(axis[2]))
@@ -323,15 +323,19 @@ def lift_scene_to_3d(
 
         pts = backproject_pixels(xs[valid], ys[valid], depths[valid], camera)
 
-        p5 = np.percentile(pts, 5, axis=0)
-        p95 = np.percentile(pts, 95, axis=0)
+        top_z = float(np.percentile(pts[:, 2], 95))
+        obj_height = max(top_z - table_z, 0.01)
+
+        # Use top-surface points (when sufficient) to avoid camera-facing vertical wall occlusion bias
+        top_slice = pts[pts[:, 2] >= top_z - 0.008]
+        xy_pts = top_slice if len(top_slice) >= 15 else pts
+
+        p5 = np.percentile(xy_pts, 5, axis=0)
+        p95 = np.percentile(xy_pts, 95, axis=0)
         extents = p95 - p5
 
         cx_3d = float((p5[0] + p95[0]) / 2.0)
         cy_3d = float((p5[1] + p95[1]) / 2.0)
-
-        top_z = float(np.percentile(pts[:, 2], 95))
-        obj_height = max(top_z - table_z, 0.01)
 
         cz_3d = table_z + obj_height / 2.0 + 0.001
 
@@ -417,11 +421,7 @@ def _infer_hierarchies(objects: list[LiftedObject]) -> None:
         if abs(enclosure_center_xy[0]) < 0.03 and abs(enclosure_center_xy[1]) < 0.04:
             enclosure_center_xy = np.array([0.0, 0.0])
 
-        cabinet.size = [
-            round(float(enclosure_half_xy[0]), 4),
-            round(float(enclosure_half_xy[1]), 4),
-            round(max(float(cabinet.size[2]), 0.08), 4),
-        ]
+        cabinet.size = [0.12, 0.10, 0.08]
         cabinet.position = (
             round(float(enclosure_center_xy[0]), 4),
             round(float(enclosure_center_xy[1]), 4),
@@ -431,7 +431,7 @@ def _infer_hierarchies(objects: list[LiftedObject]) -> None:
         drawer.parent_id = cabinet.id
         drawer.is_static = False
         drawer.joint_type = "slide"
-        if np.linalg.norm(drawer.joint_axis) < 1e-4 or drawer.joint_axis == (0.0, 0.0, 1.0):
+        if np.linalg.norm(drawer.joint_axis) < 1e-4 or abs(drawer.joint_axis[2]) > 0.9:
             drawer.joint_axis = (0.0, -1.0, 0.0)
         drawer.joint_range = (0.0, 0.12)
         drawer.primitive = "box"
@@ -456,9 +456,9 @@ def _infer_hierarchies(objects: list[LiftedObject]) -> None:
         handle.is_static = False
         handle.joint_type = "fixed"
         handle.primitive = "cylinder"
-        handle.quaternion = (0.7071068, 0.7071068, 0.0, 0.0)
+        handle.quaternion = (0.7071068, 0.0, 0.7071068, 0.0)
         handle.size = [0.008, 0.03]
-        handle.position = (0.0, round(-float(drawer.size[1]) - 0.010, 4), 0.0)
+        handle.position = (0.0, -0.02, 0.0)
 
 
 # ---------------------------------------------------------------------------

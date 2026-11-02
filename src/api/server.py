@@ -109,6 +109,7 @@ async def _security_headers_middleware(request: Request, call_next):
     if request.url.path.startswith("/outputs/"):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Content-Security-Policy"] = "sandbox"
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     return response
 
 

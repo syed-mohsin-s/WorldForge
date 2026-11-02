@@ -318,13 +318,14 @@ class MuseSparkReasoner:
 
         mx, my, mz = manipulated.position
         tx, ty, tz = target_pos
+        grasp_z = max(mz + 0.026, 0.050)
 
         waypoints: list[tuple[float, float, float, float]] = [
-            (mx, my, mz + 0.095, 1.0),
-            (mx, my, mz + 0.029, 1.0),
-            (mx, my, mz + 0.029, -1.0),
-            (mx, my, mz + 0.095, -1.0),
-            (tx, ty, mz + 0.095, -1.0),
+            (mx, my, 0.14, 1.0),
+            (mx, my, grasp_z, 1.0),
+            (mx, my, grasp_z, -1.0),
+            (mx, my, 0.14, -1.0),
+            (tx, ty, 0.14, -1.0),
             (tx, ty, tz + 0.025, -1.0),
             (tx, ty, tz + 0.025, 1.0),
         ]
@@ -355,17 +356,23 @@ class MuseSparkReasoner:
         tx, ty = target_pos[0], target_pos[1]
 
         if obstacle:
+            ox, oy = obstacle.position[0], obstacle.position[1]
+            clear_y1 = round(min(my - 0.03, oy - 0.13), 4)
+            clear_y2 = round(min(my, oy - 0.09), 4)
             waypoints: list[tuple[float, float, float, float]] = [
-                (mx + 0.06, my, 0.06, -0.5),
-                (mx + 0.02, my, 0.055, -0.5),
-                (0.0, -0.05, 0.055, -0.5),
-                (tx + 0.05, ty - 0.05, 0.055, -0.5),
-                (tx, ty, 0.055, -0.5),
+                (mx, my, 0.16, 1.0),
+                (mx, my, 0.055, 1.0),
+                (mx, my, 0.055, -1.0),
+                (round(ox + 0.02, 4), clear_y1, 0.055, -1.0),
+                (round(tx + 0.03, 4), clear_y2, 0.055, -1.0),
+                (tx, ty, 0.055, -1.0),
             ]
         else:
             waypoints = [
-                (mx + 0.05, my, 0.055, -0.5),
-                (tx, ty, 0.055, -0.5),
+                (mx, my, 0.16, 1.0),
+                (mx, my, 0.055, 1.0),
+                (mx, my, 0.055, -1.0),
+                (tx, ty, 0.055, -1.0),
             ]
 
         return TaskSpec(
@@ -384,11 +391,13 @@ class MuseSparkReasoner:
         manipulated = next((o for o in geom.objects if o.joint_type in ("slide", "hinge")), fallback_obj)
         target_delta = 0.10
 
+        # Waypoint 0 clears the cabinet roof (z=0.22 > 0.161) to y=-0.15 before lowering to the handle
         waypoints: list[tuple[float, float, float, float]] = [
-            (0.0, -0.12, 0.085, 1.0),
-            (0.0, -0.12, 0.085, -1.0),
-            (0.0, -0.22, 0.085, -1.0),
-            (0.0, -0.22, 0.085, 1.0),
+            (0.0, -0.15, 0.22, 1.0),
+            (0.0, -0.125, 0.105, 1.0),
+            (0.0, -0.125, 0.105, -1.0),
+            (0.0, -0.235, 0.105, -1.0),
+            (0.0, -0.235, 0.105, 1.0),
         ]
 
         return TaskSpec(

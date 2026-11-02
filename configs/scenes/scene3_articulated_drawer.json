@@ -33,7 +33,7 @@
         "type": "slide",
         "axis": [0, -1, 0],
         "range": [0.0, 0.12],
-        "damping": 2.0,
+        "damping": 1.5,
         "is_prior_guess": true
       },
       "parent_id": "cabinet_body"
@@ -43,8 +43,8 @@
       "label": "metal drawer handle",
       "primitive": "cylinder",
       "size": [0.008, 0.03],
-      "position": [0.0, -0.01, 0.0],
-      "quaternion": [0.7071068, 0.7071068, 0, 0],
+      "position": [0.0, -0.02, 0.0],
+      "quaternion": [0.7071068, 0, 0.7071068, 0],
       "material": "metal",
       "is_static": false,
       "joint": {"type": "fixed", "axis": [0, 0, 1], "damping": 0.5, "is_prior_guess": false},
@@ -58,10 +58,11 @@
     "target_position": null,
     "target_joint_delta": 0.10,
     "waypoints": [
-      [0.0, -0.12, 0.085, 1.0],
-      [0.0, -0.12, 0.085, -1.0],
-      [0.0, -0.22, 0.085, -1.0],
-      [0.0, -0.22, 0.085, 1.0]
+      [0.0, -0.15, 0.22, 1.0],
+      [0.0, -0.125, 0.105, 1.0],
+      [0.0, -0.125, 0.105, -1.0],
+      [0.0, -0.235, 0.105, -1.0],
+      [0.0, -0.235, 0.105, 1.0]
     ]
   }
 }
