@@ -72,6 +72,7 @@ export interface SceneObject {
   position: [number, number, number];
   quaternion?: [number, number, number, number];
   material: string;
+  rgba?: [number, number, number, number] | null;
   is_static: boolean;
   parent_id: string | null;
   joint: {
@@ -94,7 +95,9 @@ export interface SceneGraph {
   };
   objects: SceneObject[];
   task: {
-    task_type: 'pick_and_place' | 'push_to_target' | 'articulate_joint';
+    task_type: 'pick_and_place' | 'push_to_target' | 'articulate_joint' | 'multi_stack';
+    stack_order?: string[] | null;
+    user_prompt?: string | null;
     description: string;
     manipulated_object_id: string;
     target_position?: [number, number, number] | null;
@@ -314,6 +317,7 @@ export function streamPipeline(
     provider: string;
     quick_ppo: boolean;
     video_path?: string | null;
+    task_prompt?: string | null;
   },
   onEvent: (ev: PipelineStageEvent) => void,
   onError: (err: any) => void,
@@ -327,6 +331,9 @@ export function streamPipeline(
   });
   if (params.video_path) {
     q.set('video_path', params.video_path);
+  }
+  if (params.task_prompt && params.task_prompt.trim()) {
+    q.set('task_prompt', params.task_prompt.trim());
   }
   const es = new EventSource(`${API_BASE}/api/run/stream?${q.toString()}`);
 
@@ -738,7 +745,8 @@ const SceneCanvas: React.FC<SceneCanvasProps> = ({
         if (obj.id === 'table') continue;
         const pos = st.objectPositions[obj.id] ?? obj.position;
         const matSpec = MATERIAL_DB[obj.material] ?? MATERIAL_DB.plastic;
-        const baseColor = new THREE.Color(matSpec.rgba[0], matSpec.rgba[1], matSpec.rgba[2]);
+        const rgbaSrc = obj.rgba ?? matSpec.rgba;
+        const baseColor = new THREE.Color(rgbaSrc[0], rgbaSrc[1], rgbaSrc[2]);
         const isManipulated = obj.id === sg.task.manipulated_object_id;
 
         const roughness =
@@ -1351,6 +1359,7 @@ export function App() {
   const [selectedSceneId, setSelectedSceneId] = useState<string>('scene1_pick_place');
   const [provider, setProvider] = useState<string>('auto');
   const [injectFault, setInjectFault] = useState<boolean>(false);
+  const [userPrompt, setUserPrompt] = useState<string>('');
   const [status, setStatus] = useState<SystemStatus | null>(null);
 
   // Video Upload State for Stage 1 SAM 3.1 Perception
@@ -1508,6 +1517,7 @@ export function App() {
         provider,
         quick_ppo: true,
         video_path: uploadedVideoPath,
+        task_prompt: userPrompt,
       },
       (ev: PipelineStageEvent) => {
         if (typeof ev.stage === 'number') {
@@ -1969,6 +1979,18 @@ export function App() {
                     </button>
                   </div>
                 )}
+
+                {/* User Intent Prompt Input Box */}
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={userPrompt}
+                    onChange={(e) => setUserPrompt(e.target.value)}
+                    disabled={isRunning}
+                    placeholder="Describe task intent (e.g., Stack the 3 objects by geometry stability)..."
+                    className="w-72 sm:w-80 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-violet-500"
+                  />
+                </div>
 
                 {/* 1-Click Gymnasium Package (.zip) Export Button */}
                 <a

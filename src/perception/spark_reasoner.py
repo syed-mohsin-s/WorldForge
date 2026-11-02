@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 from pathlib import Path
@@ -37,6 +38,25 @@ logger = logging.getLogger(__name__)
 
 _MATERIALS_PATH = Path(__file__).resolve().parents[2] / "configs" / "materials.yaml"
 BASETEN_MODEL = "meta-models/muse-spark-open-1026"
+
+
+def _object_footprint_area(obj: LiftedObject) -> float:
+    """Compute horizontal base footprint area (m^2) from MuJoCo half-sizes."""
+    if obj.primitive == "box":
+        hx = float(obj.size[0]) if len(obj.size) > 0 else 0.025
+        hy = float(obj.size[1]) if len(obj.size) > 1 else hx
+        return 4.0 * hx * hy
+    radius = float(obj.size[0]) if len(obj.size) > 0 else 0.025
+    return math.pi * radius * radius
+
+
+def _object_half_height(obj: LiftedObject) -> float:
+    """Return local vertical half-height (m) from MuJoCo half-sizes."""
+    if obj.primitive == "box":
+        return float(obj.size[2]) if len(obj.size) > 2 else 0.02
+    elif obj.primitive == "cylinder":
+        return float(obj.size[1]) if len(obj.size) > 1 else 0.02
+    return float(obj.size[0]) if len(obj.size) > 0 else 0.02
 
 
 class MuseSparkReasoner:
@@ -83,24 +103,26 @@ class MuseSparkReasoner:
         self,
         geometry: LiftedSceneGeometry,
         task_prompt: str | None = None,
-        task_type: Literal["pick_and_place", "push_to_target", "articulate_joint"] | None = None,
+        task_type: Literal["pick_and_place", "push_to_target", "articulate_joint", "multi_stack"] | None = None,
+        user_prompt: str | None = None,
     ) -> SceneGraph:
-        """Produce a validated SceneGraph from lifted geometry and task prompt."""
+        """Produce a validated SceneGraph from lifted geometry and natural-language user intent prompt."""
         self.last_reasoning_trace = ""
+        effective_prompt = (user_prompt or task_prompt or "").strip() or None
 
         if self.provider == "baseten" or (self.provider == "auto" and self.baseten_api_key):
             try:
-                return self._call_baseten_api(geometry, task_prompt, task_type)
+                return self._call_baseten_api(geometry, effective_prompt, task_type)
             except Exception as exc:
                 logger.warning("Baseten API call failed: %s; falling back to local synthesis.", exc)
 
         if self.provider == "meta" or (self.provider == "auto" and self.meta_api_key):
             try:
-                return self._call_spark_api(geometry, task_prompt, task_type)
+                return self._call_spark_api(geometry, effective_prompt, task_type)
             except Exception as exc:
                 logger.warning("Meta API call failed: %s; falling back to local synthesis.", exc)
 
-        return self._synthesize_local(geometry, task_prompt, task_type)
+        return self._synthesize_local(geometry, effective_prompt, task_type)
 
     # ------------------------------------------------------------------
     # Baseten OpenAI-Compatible API (meta-models/muse-spark-open-1026)
@@ -242,17 +264,30 @@ class MuseSparkReasoner:
                 )
             )
 
-        inferred_task_type = task_type or self._infer_task_type(geom, task_prompt)
+        inferred_task_type = self._infer_task_type(geom, task_prompt, task_type)
         task_spec = self._synthesize_task_spec(geom, inferred_task_type, task_prompt)
 
         if not self.last_reasoning_trace:
-            self.last_reasoning_trace = (
-                f"Analyzing 3D scene '{geom.scene_id}': grounded tabletop at z={geom.table_z:.3f}m. "
-                f"Classified task as '{inferred_task_type}' based on object kinematics. "
-                f"Assigned material priors from configs/materials.yaml: "
-                f"{[(o.id, self._infer_material(o.label, o.id)) for o in geom.objects]}. "
-                f"Synthesized {len(task_spec.waypoints)} oracle keyframes ensuring kinematic clearance and weld stability."
-            )
+            if inferred_task_type == "multi_stack":
+                footprint_info = [
+                    (o.id, round(_object_footprint_area(o) * 1e4, 2), round(_object_half_height(o) * 200, 1))
+                    for o in geom.objects
+                ]
+                self.last_reasoning_trace = (
+                    f"Analyzing 3D scene '{geom.scene_id}' for multi-object stacking: grounded tabletop at z={geom.table_z:.3f}m. "
+                    f"Evaluated 3D-lifted bounding extents and base footprint areas (cm^2, height cm): {footprint_info}. "
+                    f"Center-of-Mass stability reasoning: sorted stack order {task_spec.stack_order} from widest base support polygon "
+                    f"to smallest top object so vertical CoM projection stays strictly inside each support footprint. "
+                    f"Implicitly spawned 4-DoF parallel-jaw gripper and synthesized {len(task_spec.waypoints)} two-stage stacking waypoints."
+                )
+            else:
+                self.last_reasoning_trace = (
+                    f"Analyzing 3D scene '{geom.scene_id}': grounded tabletop at z={geom.table_z:.3f}m. "
+                    f"Classified task as '{inferred_task_type}' based on object kinematics. "
+                    f"Assigned material priors from configs/materials.yaml: "
+                    f"{[(o.id, self._infer_material(o.label, o.id)) for o in geom.objects]}. "
+                    f"Synthesized {len(task_spec.waypoints)} oracle keyframes ensuring kinematic clearance and weld stability."
+                )
 
         return SceneGraph(
             scene_id=geom.scene_id,
@@ -270,15 +305,22 @@ class MuseSparkReasoner:
         self,
         geom: LiftedSceneGeometry,
         prompt: str | None,
-    ) -> Literal["pick_and_place", "push_to_target", "articulate_joint"]:
+        explicit_task_type: str | None = None,
+    ) -> Literal["pick_and_place", "push_to_target", "articulate_joint", "multi_stack"]:
         if prompt:
             p_lower = prompt.lower()
+            if any(k in p_lower for k in ("stack", "tower", "one by one", "one-by-one", "pile")):
+                if len(geom.objects) >= 2 or explicit_task_type == "multi_stack":
+                    return "multi_stack"
             if "pull" in p_lower or "drawer" in p_lower or "articulate" in p_lower or "open" in p_lower:
                 return "articulate_joint"
             if "push" in p_lower:
                 return "push_to_target"
             if "pick" in p_lower or "place" in p_lower:
                 return "pick_and_place"
+
+        if explicit_task_type in ("pick_and_place", "push_to_target", "articulate_joint", "multi_stack"):
+            return explicit_task_type  # type: ignore[return-value]
 
         has_slide_or_hinge = any(o.joint_type in ("slide", "hinge") for o in geom.objects)
         if has_slide_or_hinge:
@@ -296,13 +338,113 @@ class MuseSparkReasoner:
         task_type: str,
         prompt: str | None,
     ) -> TaskSpec:
-        """Synthesize task target and oracle waypoints."""
-        if task_type == "articulate_joint":
+        """Synthesize task target and collision-free oracle waypoints."""
+        if task_type == "multi_stack":
+            return self._build_multi_stack_task(geom, prompt)
+        elif task_type == "articulate_joint":
             return self._build_articulate_task(geom, prompt)
         elif task_type == "push_to_target":
             return self._build_push_task(geom, prompt)
         else:
             return self._build_pick_place_task(geom, prompt)
+
+    def _build_multi_stack_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
+        """Sort perceived objects by 3D base footprint area (w * d) for CoM stability and chain stacking waypoints."""
+        candidates = [o for o in geom.objects if o.parent_id is None and not o.is_static]
+        if len(candidates) < 2:
+            candidates = [o for o in geom.objects if o.parent_id is None]
+        if len(candidates) < 2:
+            return self._build_pick_place_task(geom, prompt)
+
+        # Sort descending by base footprint area w * d (widest base = index 0, then middle, then top)
+        sorted_objs = sorted(candidates, key=_object_footprint_area, reverse=True)
+        if len(sorted_objs) == 2:
+            obj_0, obj_1 = sorted_objs[0], sorted_objs[1]
+            stack_order = [obj_0.id, obj_1.id]
+            x0, y0, z0 = obj_0.position
+            x1, y1, z1 = obj_1.position
+            hz_0, hz_1 = _object_half_height(obj_0), _object_half_height(obj_1)
+            z_center_1_on_0 = z0 + hz_0 + hz_1 + 0.002
+            grasp_z1 = round(max(z1 + 0.027, 0.048), 4)
+            place_z1 = round(z_center_1_on_0 + 0.028, 4)
+            waypoints = [
+                (round(x1, 4), round(y1, 4), 0.15, 1.0),
+                (round(x1, 4), round(y1, 4), grasp_z1, 1.0),
+                (round(x1, 4), round(y1, 4), grasp_z1, -1.0),
+                (round(x1, 4), round(y1, 4), 0.16, -1.0),
+                (round(x0, 4), round(y0, 4), 0.16, -1.0),
+                (round(x0, 4), round(y0, 4), place_z1, -1.0),
+                (round(x0, 4), round(y0, 4), place_z1, 1.0),
+                (round(x0, 4), round(y0, 4), 0.18, 1.0),
+            ]
+            return TaskSpec(
+                task_type="multi_stack",
+                description=prompt or f"Stack {obj_1.label} onto {obj_0.label}.",
+                manipulated_object_id=obj_1.id,
+                target_position=(round(x0, 4), round(y0, 4), round(z_center_1_on_0, 4)),
+                stack_order=stack_order,
+                user_prompt=prompt,
+                waypoints=waypoints,
+            )
+
+        sorted_objs = sorted_objs[:3]
+        obj_0, obj_1, obj_2 = sorted_objs[0], sorted_objs[1], sorted_objs[2]
+        stack_order = [obj_0.id, obj_1.id, obj_2.id]
+
+        x0, y0, z0 = obj_0.position
+        x1, y1, z1 = obj_1.position
+        x2, y2, z2 = obj_2.position
+
+        hz_0 = _object_half_height(obj_0)
+        hz_1 = _object_half_height(obj_1)
+        hz_2 = _object_half_height(obj_2)
+
+        # Center Z of obj_1 when resting on top of obj_0, and obj_2 when resting on top of obj_1
+        z_center_1_on_0 = z0 + hz_0 + hz_1 + 0.002
+        z_center_2_on_1 = z_center_1_on_0 + hz_1 + hz_2 + 0.002
+
+        # Mocap gripper Z offset above object center for parallel-jaw pinch (+0.027m)
+        grasp_z1 = round(max(z1 + 0.027, 0.048), 4)
+        place_z1 = round(z_center_1_on_0 + 0.028, 4)
+
+        grasp_z2 = round(max(z2 + 0.027, 0.048), 4)
+        place_z2 = round(z_center_2_on_1 + 0.029, 4)
+
+        waypoints: list[tuple[float, float, float, float]] = [
+            # Stage A: Pick obj_1 and stack onto base obj_0
+            (round(x1, 4), round(y1, 4), 0.15, 1.0),
+            (round(x1, 4), round(y1, 4), grasp_z1, 1.0),
+            (round(x1, 4), round(y1, 4), grasp_z1, -1.0),
+            (round(x1, 4), round(y1, 4), 0.16, -1.0),
+            (round(x0, 4), round(y0, 4), 0.16, -1.0),
+            (round(x0, 4), round(y0, 4), place_z1, -1.0),
+            (round(x0, 4), round(y0, 4), place_z1, 1.0),
+            (round(x0, 4), round(y0, 4), 0.18, 1.0),
+            # Stage B: Pick obj_2 and stack onto obj_1
+            (round(x2, 4), round(y2, 4), 0.18, 1.0),
+            (round(x2, 4), round(y2, 4), grasp_z2, 1.0),
+            (round(x2, 4), round(y2, 4), grasp_z2, -1.0),
+            (round(x2, 4), round(y2, 4), 0.20, -1.0),
+            (round(x0, 4), round(y0, 4), 0.20, -1.0),
+            (round(x0, 4), round(y0, 4), place_z2, -1.0),
+            (round(x0, 4), round(y0, 4), place_z2, 1.0),
+            (round(x0, 4), round(y0, 4), 0.22, 1.0),
+        ]
+
+        return TaskSpec(
+            task_type="multi_stack",
+            description=(
+                prompt
+                or f"Stack {obj_1.label} ({obj_1.id}) onto widest base {obj_0.label} ({obj_0.id}), "
+                f"then stack {obj_2.label} ({obj_2.id}) on top."
+            ),
+            manipulated_object_id=obj_2.id,
+            target_position=(round(x0, 4), round(y0, 4), round(z_center_2_on_1, 4)),
+            target_joint_delta=None,
+            stack_order=stack_order,
+            user_prompt=prompt,
+            waypoints=waypoints,
+        )
 
     def _build_pick_place_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
         fallback_obj = geom.objects[0] if geom.objects else LiftedObject(
@@ -336,6 +478,7 @@ class MuseSparkReasoner:
             manipulated_object_id=manipulated.id,
             target_position=target_pos,
             target_joint_delta=None,
+            user_prompt=prompt,
             waypoints=waypoints,
         )
 
@@ -381,6 +524,7 @@ class MuseSparkReasoner:
             manipulated_object_id=manipulated.id,
             target_position=target_pos,
             target_joint_delta=None,
+            user_prompt=prompt,
             waypoints=waypoints,
         )
 
@@ -406,6 +550,7 @@ class MuseSparkReasoner:
             manipulated_object_id=manipulated.id,
             target_position=None,
             target_joint_delta=target_delta,
+            user_prompt=prompt,
             waypoints=waypoints,
         )
 

@@ -227,10 +227,11 @@ def _ground_reconstructed_scene_graph(
         seen_ids.add(s_obj.id)
 
     # Backfill any occluded objects from ref_sg so task references remain valid
-    for r_obj in ref_sg.objects:
-        if r_obj.id not in seen_ids:
-            reconstructed_objs.append(r_obj.model_copy(deep=True))
-            seen_ids.add(r_obj.id)
+    if synthesized_sg.task.task_type != "multi_stack":
+        for r_obj in ref_sg.objects:
+            if r_obj.id not in seen_ids:
+                reconstructed_objs.append(r_obj.model_copy(deep=True))
+                seen_ids.add(r_obj.id)
 
     # Recompute task spec & oracle waypoints directly from the reconstructed object positions
     lifted_for_task = LiftedSceneGeometry(
@@ -256,12 +257,17 @@ def _ground_reconstructed_scene_graph(
             for o in reconstructed_objs
         ],
     )
+    effective_task_type = (
+        "multi_stack"
+        if synthesized_sg.task.task_type == "multi_stack"
+        else ref_sg.task.task_type
+    )
     reconstructed_task = reasoner._synthesize_task_spec(
         lifted_for_task,
-        ref_sg.task.task_type,
+        effective_task_type,
         task_prompt or synthesized_sg.task.description or ref_sg.task.description,
     )
-    if ref_sg.task.manipulated_object_id in seen_ids:
+    if effective_task_type != "multi_stack" and ref_sg.task.manipulated_object_id in seen_ids:
         reconstructed_task.manipulated_object_id = ref_sg.task.manipulated_object_id
 
     return SceneGraph(
@@ -311,16 +317,29 @@ def run_worldforge_pipeline(
     frame0_rgb = ref_env.render_camera()
 
     tracker = SAM31Tracker(cost_tracker=cost_tracker)
+    is_stack_intent = bool(
+        ref_sg.task.task_type == "multi_stack"
+        or (task_prompt and any(k in task_prompt.lower() for k in ("stack", "tower", "one by one", "one-by-one", "particle")))
+    )
     prompts = [o.label for o in ref_sg.objects]
-    object_ids = [o.id for o in ref_sg.objects]
+    object_ids: list[str] | None = [o.id for o in ref_sg.objects]
+    has_video_input = bool(video_path and Path(video_path).exists())
 
-    if video_path and Path(video_path).exists():
+    if has_video_input:
         cam_w, cam_h = ref_sg.camera.resolution
+        # When user supplies a custom video + intent prompt (e.g. stacking 3 particles),
+        # enable open multi-object discovery (object_ids=None) instead of clamping to golden IDs.
+        video_prompts = (
+            ["particle_0", "particle_1", "particle_2", "block", "object"]
+            if is_stack_intent
+            else prompts
+        )
+        video_obj_ids = None if is_stack_intent else object_ids
         sam_result = tracker.track_video(
-            video_path,
-            text_prompts=prompts,
+            str(video_path),
+            text_prompts=video_prompts,
             target_size=(cam_w, cam_h),
-            object_ids=object_ids,
+            object_ids=video_obj_ids,
         )
         if not sam_result or not sam_result.tracks or getattr(sam_result, "sam_provider_used", "").startswith("opencv"):
             sam_result, _ = tracker.segment_from_sim_env(ref_env, ref_sg)
@@ -516,6 +535,7 @@ def run_worldforge_pipeline(
     rollout_mp4_path = out_dir / "rollout.mp4"
     oracle_mp4_path = out_dir / "oracle_rollout.mp4"
 
+    rollout_steps = 220 if validated_sg.task.task_type == "multi_stack" else 150
     ppo_timesteps = 512 if quick_ppo else 2048
     ppo_res = train_and_evaluate_ppo(
         scene=validated_sg,
@@ -523,7 +543,7 @@ def run_worldforge_pipeline(
         n_envs=2,
         rollout_video_path=str(rollout_mp4_path),
         eval_episodes=1,
-        eval_steps=150,
+        eval_steps=rollout_steps,
         reward_fn=repair_result.repaired_reward_fn,
     )
 
@@ -531,7 +551,7 @@ def run_worldforge_pipeline(
     record_oracle_rollout(
         scene=validated_sg,
         output_path=str(oracle_mp4_path),
-        max_steps=150,
+        max_steps=rollout_steps,
         fps=30,
     )
 

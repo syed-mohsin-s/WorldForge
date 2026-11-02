@@ -109,11 +109,19 @@ class ObjectNode(BaseModel):
 class TaskSpec(BaseModel):
     """Describes the manipulation task the RL agent should solve."""
 
-    task_type: Literal["pick_and_place", "push_to_target", "articulate_joint"]
+    task_type: Literal["pick_and_place", "push_to_target", "articulate_joint", "multi_stack"]
     description: str
     manipulated_object_id: str = Field(..., min_length=1)
     target_position: tuple[float, float, float] | None = None
     target_joint_delta: float | None = None
+    stack_order: list[str] | None = Field(
+        default=None,
+        description="Ordered object_ids from bottom base [0] to middle [1] to top [2] for multi_stack.",
+    )
+    user_prompt: str | None = Field(
+        default=None,
+        description="Optional natural-language user intent prompt.",
+    )
     waypoints: list[tuple[float, float, float, float]] = Field(
         default_factory=list,
         description="Oracle keyframes as [x, y, z, gripper_cmd].",
@@ -169,6 +177,13 @@ class SceneGraph(BaseModel):
                 f"task.manipulated_object_id '{self.task.manipulated_object_id}' "
                 f"not found among scene objects {list(obj_map.keys())}"
             )
+
+        if self.objects and self.task.stack_order:
+            for sid in self.task.stack_order:
+                if sid not in obj_map:
+                    raise ValueError(
+                        f"task.stack_order id '{sid}' not found among scene objects {list(obj_map.keys())}"
+                    )
 
         eps = 0.001  # 1 mm clearance
         for obj in self.objects:

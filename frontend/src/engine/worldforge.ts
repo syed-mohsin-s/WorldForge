@@ -53,7 +53,9 @@ export interface ObjectNode {
 }
 
 export interface TaskSpec {
-  task_type: "pick_and_place" | "push_to_target" | "articulate_joint";
+  task_type: "pick_and_place" | "push_to_target" | "articulate_joint" | "multi_stack";
+  stack_order?: string[] | null;
+  user_prompt?: string | null;
   description: string;
   manipulated_object_id: string;
   target_position?: [number, number, number] | null;
@@ -378,6 +380,8 @@ export function streamPipeline(
     inject_fault: boolean;
     provider: string;
     quick_ppo?: boolean;
+    task_prompt?: string | null;
+    video_path?: string | null;
   },
   onEvent: (ev: PipelineStageEvent) => void,
   onError: (err: any) => void,
@@ -389,6 +393,12 @@ export function streamPipeline(
     provider: params.provider,
     quick_ppo: String(params.quick_ppo ?? true),
   });
+  if (params.task_prompt && params.task_prompt.trim()) {
+    query.set("task_prompt", params.task_prompt.trim());
+  }
+  if (params.video_path) {
+    query.set("video_path", params.video_path);
+  }
 
   const eventSource = new EventSource(`${API_BASE}/api/run/stream?${query.toString()}`);
 

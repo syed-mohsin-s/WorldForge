@@ -1,9 +1,11 @@
 """WorldForge Dense Reward Module — multi-stage task rewards.
 
-Supports three task types with smooth, shaped dense rewards:
-  * ``pick_and_place``: reach → grasp → lift → place → success
-  * ``push_to_target``:  reach → push progress → success
+Supports four task types with smooth, shaped dense rewards:
+  * ``pick_and_place``:   reach → grasp → lift → place → success
+  * ``push_to_target``:   reach → push progress → success
   * ``articulate_joint``: reach → joint displacement → success
+  * ``multi_stack``:      Stage 1 (obj_1 onto base obj_0, +5.0 subgoal) →
+                          Stage 2 (obj_2 onto obj_1, +10.0 terminal success)
 
 The ``compute_reward`` function is the default reward for ``WorldForgeEnv``
 when no custom ``reward_fn`` is passed.  It can also be overridden at
@@ -18,7 +20,7 @@ from typing import Any
 import mujoco
 import numpy as np
 
-from src.schema.scene_graph import SceneGraph
+from src.schema.scene_graph import ObjectNode, SceneGraph
 
 
 def compute_reward(
@@ -37,6 +39,8 @@ def compute_reward(
         return _push_to_target_reward(model, data, scene)
     elif task_type == "articulate_joint":
         return _articulate_joint_reward(model, data, scene)
+    elif task_type == "multi_stack":
+        return _multi_stack_reward(model, data, scene)
     else:
         raise ValueError(f"Unknown task type: {task_type!r}")
 
@@ -67,6 +71,14 @@ def _finger_aperture(model: mujoco.MjModel, data: mujoco.MjData) -> float:
 def _tanh_reward(dist: float, scale: float = 5.0) -> float:
     """Smooth tanh-shaped reward: 1.0 at dist=0, ~0 at dist >> 1/scale."""
     return 1.0 - math.tanh(scale * dist)
+
+
+def _node_half_height(obj: ObjectNode) -> float:
+    if obj.primitive == "box":
+        return float(obj.size[2])
+    elif obj.primitive == "cylinder":
+        return float(obj.size[1])
+    return float(obj.size[0])
 
 
 # ─── Pick and Place ───────────────────────────────────────────────────
@@ -238,5 +250,84 @@ def _articulate_joint_reward(
         "grasp_bonus": grasp_bonus,
         "lift_reward": progress * 0.5,
         "place_reward": joint_reward,
+    }
+    return reward, terminated, info
+
+
+# ─── Progressive Multi-Object Tower Stacking ─────────────────────────
+
+def _multi_stack_reward(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    scene: SceneGraph,
+) -> tuple[float, bool, dict]:
+    """Two-stage progressive dense reward for stacking 3 objects [base, mid, top]."""
+    obj_map = {o.id: o for o in scene.objects}
+    order = scene.task.stack_order
+    if not order or len(order) < 3:
+        order = [o.id for o in scene.objects[:3]]
+    if len(order) < 3:
+        return _pick_and_place_reward(model, data, scene)
+
+    id_0, id_1, id_2 = order[0], order[1], order[2]
+    pos_0 = _body_pos(model, data, id_0)
+    pos_1 = _body_pos(model, data, id_1)
+    pos_2 = _body_pos(model, data, id_2)
+
+    hz_0 = _node_half_height(obj_map[id_0]) if id_0 in obj_map else 0.02
+    hz_1 = _node_half_height(obj_map[id_1]) if id_1 in obj_map else 0.02
+    hz_2 = _node_half_height(obj_map[id_2]) if id_2 in obj_map else 0.02
+
+    grip = _gripper_pos(data)
+    aperture = _finger_aperture(model, data)
+
+    target_1_on_0 = np.array([pos_0[0], pos_0[1], pos_0[2] + hz_0 + hz_1], dtype=np.float64)
+    d_xy_10 = float(np.linalg.norm(pos_1[:2] - pos_0[:2]))
+    d_place_1 = float(np.linalg.norm(pos_1 - target_1_on_0))
+    stage1_stacked = (d_xy_10 < 0.035) and (float(pos_1[2]) > float(pos_0[2]) + hz_0 * 0.75)
+
+    target_2_on_1 = np.array([pos_1[0], pos_1[1], pos_1[2] + hz_1 + hz_2], dtype=np.float64)
+    d_xy_21 = float(np.linalg.norm(pos_2[:2] - pos_1[:2]))
+    d_place_2 = float(np.linalg.norm(pos_2 - target_2_on_1))
+    stage2_stacked = (
+        stage1_stacked
+        and (d_xy_21 < 0.035)
+        and (float(pos_2[2]) > float(pos_1[2]) + hz_1 * 0.75)
+    )
+
+    if not stage1_stacked:
+        # Stage 1: Reach, grasp, lift, and place obj_1 onto base obj_0
+        d_reach = float(np.linalg.norm(grip - pos_1))
+        reach_reward = _tanh_reward(d_reach, scale=4.0)
+        grasp_bonus = 1.0 if (d_reach < 0.065 and aperture < 0.060) else 0.0
+        lift_reward = min(max(float(pos_1[2]) - (scene.table_z + hz_1 + 0.015), 0.0) * 20.0, 1.0)
+        place_reward = _tanh_reward(d_place_1, scale=4.0)
+        reward = 0.25 * reach_reward + 0.15 * grasp_bonus + 0.10 * lift_reward + 0.50 * place_reward
+        d_goal = d_place_1
+    else:
+        # Stage 2: Subgoal bonus (+5.0) locked in; now stack obj_2 onto obj_1
+        d_reach = float(np.linalg.norm(grip - pos_2))
+        reach_reward = _tanh_reward(d_reach, scale=4.0)
+        grasp_bonus = 1.0 if (d_reach < 0.065 and aperture < 0.060) else 0.0
+        lift_reward = min(max(float(pos_2[2]) - (scene.table_z + hz_2 + 0.025), 0.0) * 15.0, 1.0)
+        place_reward = _tanh_reward(d_place_2, scale=4.0)
+        reward = 5.0 + 0.25 * reach_reward + 0.15 * grasp_bonus + 0.10 * lift_reward + 0.50 * place_reward
+        d_goal = d_place_2
+
+    terminated = bool(stage2_stacked)
+    if terminated:
+        reward += 10.0
+
+    info: dict[str, Any] = {
+        "d_reach": d_reach,
+        "d_place": d_goal,
+        "d_goal": d_goal,
+        "stage1_stacked": stage1_stacked,
+        "stage2_stacked": stage2_stacked,
+        "reach_reward": reach_reward,
+        "grasp_bonus": grasp_bonus,
+        "lift_reward": lift_reward,
+        "place_reward": place_reward,
+        "obj_pos": pos_2.tolist(),
     }
     return reward, terminated, info

@@ -233,3 +233,26 @@ def test_api_sim_endpoints():
     resp = client.get("/api/sim/trajectory?scene_id=scene1_pick_place&max_steps=10")
     assert resp.status_code == 200
     assert len(resp.json()) == 10
+
+
+def test_multi_stack_reasoner_prompt_driven():
+    """Verify prompt-driven 3-object footprint sorting and multi_stack trajectory synthesis without hardcoded scene configs."""
+    geom = LiftedSceneGeometry(
+        scene_id="custom_3_particles",
+        table_z=0.0,
+        camera=CameraSpec(pos=(0.55, -0.55, 0.72), lookat=(0.0, 0.0, 0.06)),
+        objects=[
+            LiftedObject(id="particle_0", label="small blue cube", primitive="box", size=[0.018, 0.018, 0.018], position=(-0.12, -0.04, 0.019)),
+            LiftedObject(id="particle_1", label="wide wooden base", primitive="box", size=[0.036, 0.036, 0.020], position=(0.0, 0.08, 0.021)),
+            LiftedObject(id="particle_2", label="medium red block", primitive="box", size=[0.026, 0.026, 0.020], position=(0.12, -0.04, 0.021)),
+        ],
+    )
+    reasoner = MuseSparkReasoner(provider="local")
+    synth = reasoner.synthesize_scene_graph(
+        geom,
+        user_prompt="Stack the 3 particles from widest base to smallest top by understanding their geometry and stability",
+    )
+    assert synth.task.task_type == "multi_stack"
+    assert synth.task.stack_order == ["particle_1", "particle_2", "particle_0"]
+    assert "Center-of-Mass stability" in reasoner.last_reasoning_trace
+    assert len(synth.task.waypoints) == 16
