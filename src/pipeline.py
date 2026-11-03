@@ -359,19 +359,29 @@ def run_worldforge_pipeline(
             target_size=(cam_w, cam_h),
             object_ids=video_obj_ids,
         )
-        if not sam_result or not sam_result.tracks or getattr(sam_result, "sam_provider_used", "").startswith("opencv"):
+        if (
+            not sam_result
+            or not sam_result.tracks
+            or len(sam_result.tracks) < len(ref_sg.objects)
+            or getattr(sam_result, "sam_provider_used", "").startswith("opencv")
+        ):
             sam_result, _ = tracker.segment_from_sim_env(ref_env, ref_sg)
         else:
             if sam_result.frame0_rgb is not None:
                 frame0_rgb = sam_result.frame0_rgb
-    elif tracker.has_configured_backend():
+    elif tracker.has_configured_backend() and provider != "local":
         sam_result = tracker.segment_image(
             frame0_rgb,
             text_prompts=prompts,
             scene_id=ref_sg.scene_id,
             object_ids=object_ids,
         )
-        if not sam_result or not sam_result.tracks or getattr(sam_result, "sam_provider_used", "").startswith("opencv"):
+        if (
+            not sam_result
+            or not sam_result.tracks
+            or len(sam_result.tracks) < len(ref_sg.objects)
+            or getattr(sam_result, "sam_provider_used", "").startswith("opencv")
+        ):
             sam_result, _ = tracker.segment_from_sim_env(ref_env, ref_sg)
         else:
             _, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)

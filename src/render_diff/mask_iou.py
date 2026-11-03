@@ -191,7 +191,12 @@ def evaluate_and_align_sim(
     R_cam, _ = derive_camera_extrinsics(current_scene.camera)
     Z_approx = float(np.linalg.norm(np.array(current_scene.camera.pos) - np.array(current_scene.camera.lookat)))
 
-    if initial_mean_iou < refine_if_below:
+    max_target_area = max((int(np.sum(m)) for m in target_masks.values()), default=0)
+    is_closeup_or_multistack = (
+        current_scene.task.task_type == "multi_stack" or max_target_area > 8000
+    )
+
+    if initial_mean_iou < refine_if_below and not is_closeup_or_multistack:
         refined = True
         for _ in range(max_refine_iters):
             iterations_used += 1

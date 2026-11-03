@@ -52,6 +52,34 @@ class OracleController:
 
         wx, wy, wz, grip_cmd = self.waypoints[self.wp_idx]
 
+        # For 3-object multi_stack (16 waypoints), dynamically lock pickup/placement XY
+        # to live body centers in MuJoCo so any millimeter shift in Stage A is compensated in Stage B.
+        scene_obj = getattr(env, "scene", None)
+        if (
+            scene_obj is not None
+            and getattr(scene_obj.task, "task_type", "") == "multi_stack"
+            and scene_obj.task.stack_order
+            and len(scene_obj.task.stack_order) >= 3
+            and len(self.waypoints) == 16
+        ):
+            try:
+                import mujoco
+                id_0, id_1, id_2 = scene_obj.task.stack_order[:3]
+                if self.wp_idx in (4, 5, 6, 7):
+                    bid0 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_0)
+                    if bid0 >= 0:
+                        wx, wy = float(env.data.xpos[bid0][0]), float(env.data.xpos[bid0][1])
+                elif self.wp_idx in (8, 9):
+                    bid2 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_2)
+                    if bid2 >= 0:
+                        wx, wy = float(env.data.xpos[bid2][0]), float(env.data.xpos[bid2][1])
+                elif self.wp_idx in (12, 13, 14, 15):
+                    bid1 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_1)
+                    if bid1 >= 0:
+                        wx, wy = float(env.data.xpos[bid1][0]), float(env.data.xpos[bid1][1])
+            except Exception:
+                pass
+
         # Trigger 15-step dwell when grip command changes (e.g. open -> closed)
         if (
             self.prev_grip_cmd is not None
@@ -231,7 +259,8 @@ def train_and_evaluate_ppo(
                 obs, reward, terminated, truncated, info = eval_env.step(action)
                 ep_return += reward
             elif ep == 0 and rollout_video_path:
-                eval_base_env.step(np.array([0.0, 0.0, 0.0, last_grip], dtype=np.float32))
+                u_after = eval_res_env.controller.get_action(eval_base_env)
+                eval_base_env.step(u_after)
 
             if ep == 0 and rollout_video_path and (step_i % render_stride == 0):
                 try:
@@ -278,7 +307,7 @@ def record_oracle_rollout(
     last_grip = scene.task.waypoints[-1][3] if scene.task.waypoints else 0.0
 
     for step_i in range(max_steps):
-        if not terminated:
+        if not controller.completed:
             action = controller.get_action(env)
             obs, reward, term, trunc, info = env.step(action)
             if term or trunc:

@@ -424,8 +424,8 @@ class MuseSparkReasoner:
             x1, y1, z1 = obj_1.position
             hz_0, hz_1 = _object_half_height(obj_0), _object_half_height(obj_1)
             z_center_1_on_0 = z0 + hz_0 + hz_1 + 0.002
-            grasp_z1 = round(max(z1 + 0.027, 0.048), 4)
-            place_z1 = round(z_center_1_on_0 + 0.028, 4)
+            grasp_z1 = round(max(z1 + 0.026, 0.042), 4)
+            place_z1 = round(z_center_1_on_0 + 0.025, 4)
             waypoints = [
                 (round(x1, 4), round(y1, 4), 0.15, 1.0),
                 (round(x1, 4), round(y1, 4), grasp_z1, 1.0),
@@ -463,11 +463,11 @@ class MuseSparkReasoner:
         z_center_2_on_1 = z_center_1_on_0 + hz_1 + hz_2 + 0.002
 
         # Mocap gripper Z offset above object center for parallel-jaw pinch (+0.027m)
-        grasp_z1 = round(max(z1 + 0.027, 0.048), 4)
-        place_z1 = round(z_center_1_on_0 + 0.028, 4)
+        grasp_z1 = round(max(z1 + 0.026, 0.042), 4)
+        place_z1 = round(z_center_1_on_0 + 0.025, 4)
 
-        grasp_z2 = round(max(z2 + 0.027, 0.048), 4)
-        place_z2 = round(z_center_2_on_1 + 0.029, 4)
+        grasp_z2 = round(max(z2 + 0.026, 0.042), 4)
+        place_z2 = round(z_center_2_on_1 + 0.025, 4)
 
         waypoints: list[tuple[float, float, float, float]] = [
             # Stage A: Pick obj_1 and stack onto base obj_0

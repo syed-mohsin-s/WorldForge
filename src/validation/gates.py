@@ -249,6 +249,25 @@ class ValidationSuite:
 
         for wp_idx, wp in enumerate(waypoints):
             wx, wy, wz, grip_cmd = wp
+            if (
+                self.scene.task.task_type == "multi_stack"
+                and self.scene.task.stack_order
+                and len(self.scene.task.stack_order) >= 3
+                and len(waypoints) == 16
+            ):
+                id_0, id_1, id_2 = self.scene.task.stack_order[:3]
+                if wp_idx in (4, 5, 6, 7):
+                    bid0 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_0)
+                    if bid0 >= 0:
+                        wx, wy = float(env.data.xpos[bid0][0]), float(env.data.xpos[bid0][1])
+                elif wp_idx in (8, 9):
+                    bid2 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_2)
+                    if bid2 >= 0:
+                        wx, wy = float(env.data.xpos[bid2][0]), float(env.data.xpos[bid2][1])
+                elif wp_idx in (12, 13, 14, 15):
+                    bid1 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_1)
+                    if bid1 >= 0:
+                        wx, wy = float(env.data.xpos[bid1][0]), float(env.data.xpos[bid1][1])
 
             if prev_grip_cmd is not None and grip_cmd != prev_grip_cmd:
                 for _ in range(dwell_steps):

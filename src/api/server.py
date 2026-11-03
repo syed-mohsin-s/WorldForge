@@ -465,8 +465,9 @@ def sim_trajectory(
     terminated = False
     last_grip = sg.task.waypoints[-1][3] if sg.task.waypoints else 0.0
 
-    for s in range(max_steps):
-        if not terminated:
+    effective_steps = max(max_steps, 220) if (sg.task.task_type == "multi_stack" and max_steps >= 120) else max_steps
+    for s in range(effective_steps):
+        if not ctrl.completed:
             action = ctrl.get_action(env)
             obs, r, term, trunc, info = env.step(action)
             if term or trunc:

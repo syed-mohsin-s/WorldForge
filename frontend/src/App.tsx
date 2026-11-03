@@ -1614,7 +1614,7 @@ export function App() {
       setIsSimPlaying(false);
     } else {
       setIsSimPlaying(true);
-      fetchSimTrajectory(selectedSceneId, 120)
+      fetchSimTrajectory(selectedSceneId, activeSceneGraph.task.task_type === 'multi_stack' ? 220 : 120)
         .then((traj) => {
           let wpIdx = 0;
           playTimerRef.current = window.setInterval(() => {
@@ -1650,7 +1650,7 @@ export function App() {
   };
 
   const handleStepOracleEnd = () => {
-    fetchSimTrajectory(selectedSceneId, 120)
+    fetchSimTrajectory(selectedSceneId, activeSceneGraph.task.task_type === 'multi_stack' ? 220 : 120)
       .then((traj) => {
         if (traj.length > 0) {
           const finalState = traj[traj.length - 1];

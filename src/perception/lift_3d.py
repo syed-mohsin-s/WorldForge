@@ -93,9 +93,9 @@ def _estimate_object_rgba(
             green_ex = g - 0.5 * (r + b)
             if green_ex > 3.5:
                 return (0.46, 0.78, 0.56, 1.0)
-            if lum > 145.0 and abs(r - b) < 12.0:
+            if lum > 142.0 and abs(r - b) < 16.0:
                 return (0.92, 0.90, 0.90, 1.0)
-            if 80.0 < lum <= 145.0 and abs(r - b) < 15.0:
+            if 75.0 < lum <= 142.0 and abs(r - b) < 22.0:
                 return (0.52, 0.50, 0.48, 1.0)
             return (
                 round(float(np.clip(r / 255.0, 0.12, 0.95)), 3),
@@ -579,8 +579,8 @@ def _lift_scene_vlm_fallback(
 
         if is_closeup_video and "cabinet" not in l_low:
             area_ratio = math.sqrt(float(np.sum(track.frame0_mask)) / max(max_mask_area, 1.0))
-            half_span = round(float(np.clip(0.016 + 0.012 * area_ratio, 0.018, 0.028)), 4)
-            half_z = 0.020
+            half_span = round(float(np.clip(0.015 + 0.014 * area_ratio, 0.019, 0.029)), 4)
+            half_z = 0.016
             cz_3d = table_z + half_z + 0.001
 
             u_norm = (c0[0] - (w / 2.0)) / max(w * 0.42, 1.0)

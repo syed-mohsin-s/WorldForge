@@ -283,16 +283,19 @@ def _multi_stack_reward(
 
     target_1_on_0 = np.array([pos_0[0], pos_0[1], pos_0[2] + hz_0 + hz_1], dtype=np.float64)
     d_xy_10 = float(np.linalg.norm(pos_1[:2] - pos_0[:2]))
+    d_z_10 = abs(float(pos_1[2]) - float(target_1_on_0[2]))
     d_place_1 = float(np.linalg.norm(pos_1 - target_1_on_0))
-    stage1_stacked = (d_xy_10 < 0.035) and (float(pos_1[2]) > float(pos_0[2]) + hz_0 * 0.75)
+    stage1_stacked = (d_xy_10 < 0.035) and (d_z_10 < 0.018)
 
     target_2_on_1 = np.array([pos_1[0], pos_1[1], pos_1[2] + hz_1 + hz_2], dtype=np.float64)
     d_xy_21 = float(np.linalg.norm(pos_2[:2] - pos_1[:2]))
+    d_z_21 = abs(float(pos_2[2]) - float(target_2_on_1[2]))
     d_place_2 = float(np.linalg.norm(pos_2 - target_2_on_1))
     stage2_stacked = (
         stage1_stacked
         and (d_xy_21 < 0.035)
-        and (float(pos_2[2]) > float(pos_1[2]) + hz_1 * 0.75)
+        and (d_z_21 < 0.018)
+        and (aperture > 0.045)
     )
 
     if not stage1_stacked:
