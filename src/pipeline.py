@@ -57,6 +57,51 @@ OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
 
 _SAFE_SCENE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+import tempfile
+
+_ALLOWED_VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mov", ".avi", ".mkv"})
+
+
+def validate_safe_video_path(video_path: str | Path | None) -> Path | None:
+    """Validate that video_path is a legitimate video file confined to safe project or temp directories."""
+    if not video_path:
+        return None
+
+    path_str = str(video_path).strip()
+    if not path_str:
+        return None
+
+    parts = Path(path_str).parts
+    if ".." in parts:
+        raise ValueError(f"Path traversal detected in video_path: {path_str!r}")
+
+    p = Path(path_str).resolve()
+    ext = p.suffix.lower()
+    if ext not in _ALLOWED_VIDEO_EXTENSIONS:
+        raise ValueError(
+            f"Invalid video extension '{ext}'. Only video files ({sorted(_ALLOWED_VIDEO_EXTENSIONS)}) are allowed."
+        )
+
+    allowed_roots = [
+        OUTPUTS_ROOT.resolve(),
+        PROJECT_ROOT.resolve(),
+        Path(tempfile.gettempdir()).resolve(),
+    ]
+    is_safe = False
+    for root in allowed_roots:
+        try:
+            p.relative_to(root)
+            is_safe = True
+            break
+        except ValueError:
+            continue
+
+    if not is_safe:
+        raise ValueError(f"video_path {path_str!r} is outside allowed directories.")
+
+    return p
+
+
 
 @dataclass
 class StageEvent:
@@ -300,6 +345,10 @@ def run_worldforge_pipeline(
     on_stage_event: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     """Execute the complete 8-stage WorldForge pipeline and return rich telemetry."""
+    if video_path:
+        safe_vp = validate_safe_video_path(video_path)
+        video_path = str(safe_vp) if safe_vp else None
+
     t_pipeline_start = time.time()
     cost_tracker = CostTracker(pricing_tier="contributor")
     stage_timings: dict[str, float] = {}
@@ -565,22 +614,38 @@ def run_worldforge_pipeline(
         faulty_override = _degenerate_zero_reward
 
     use_live_llm = bool(reasoner.baseten_api_key and provider in ("auto", "baseten"))
-    repair_result = run_self_healing_loop(
-        scene=validated_sg,
-        max_tries=3,
-        use_live_llm=use_live_llm,
-        reward_fn_override=faulty_override,
-        run_gate5=False,
-        verbose=False,
+    modal_remote = bool(
+        os.environ.get("MODAL_TOKEN_ID")
+        and os.environ.get("MODAL_REMOTE_EXEC", "").lower() in ("1", "true", "yes")
     )
-    cost_tracker.log_compute(repair_result.cost_tracker.total_cpu_core_seconds)
-    for call in repair_result.cost_tracker.call_log:
-        cost_tracker.log_api_call(
-            input_tokens=call["input_tokens"],
-            output_tokens=call["output_tokens"],
-            model=call["model"],
-            purpose=call["purpose"],
+    if modal_remote:
+        from src.sandbox.modal_executor import ModalSandboxRunner
+        modal_runner = ModalSandboxRunner(cost_tracker=cost_tracker)
+        repair_result = modal_runner.run_repair(
+            scene=validated_sg,
+            max_tries=3,
+            use_live_llm=use_live_llm,
+            reward_fn_override=faulty_override,
+            run_gate5=False,
+            verbose=False,
         )
+    else:
+        repair_result = run_self_healing_loop(
+            scene=validated_sg,
+            max_tries=3,
+            use_live_llm=use_live_llm,
+            reward_fn_override=faulty_override,
+            run_gate5=False,
+            verbose=False,
+        )
+        cost_tracker.log_compute(repair_result.cost_tracker.total_cpu_core_seconds)
+        for call in repair_result.cost_tracker.call_log:
+            cost_tracker.log_api_call(
+                input_tokens=call["input_tokens"],
+                output_tokens=call["output_tokens"],
+                model=call["model"],
+                purpose=call["purpose"],
+            )
 
     repair_diff = repair_result.repair_diff
     if repair_result.repaired_reward_code:
@@ -629,7 +694,7 @@ def run_worldforge_pipeline(
     gate_results["5"] = {
         "passed": gate5_passed,
         "gate": 5,
-        "name": "Short PPO Training (Residual + Oracle)",
+        "name": "Short PPO Training (Residual + Oracle)" if not quick_ppo else "Short PPO Smoke Test (Residual + Oracle)",
         "ppo_mean_return": round(ppo_res.eval_mean_return, 2),
         "random_return": round(gate3_random, 2),
         "oracle_return": round(gate4_return, 2),
@@ -733,6 +798,9 @@ def stream_worldforge_pipeline(
     task_prompt: str | None = None,
 ) -> Iterator[str]:
     """Run the pipeline in a worker thread and yield Server-Sent Events (SSE)."""
+    if video_path:
+        safe_vp = validate_safe_video_path(video_path)
+        video_path = str(safe_vp) if safe_vp else None
     q: queue.Queue[dict[str, Any] | None] = queue.Queue()
 
     def _on_event(evt: dict[str, Any]) -> None:

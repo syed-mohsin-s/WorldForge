@@ -144,8 +144,8 @@ class ResidualOracleEnv(gym.Wrapper):
             u_total = u_oracle
         else:
             # Apply bounded residual to XYZ while keeping discrete gripper command authoritative
-            eff_weight = min(self.residual_weight, 0.05)
-            u_xyz = np.clip(u_oracle[:3] + eff_weight * action[:3], -1.0, 1.0)
+            eff_weight = min(self.residual_weight, 0.08)
+            u_xyz = np.clip((1.0 - eff_weight) * u_oracle[:3] + eff_weight * action[:3], -1.0, 1.0)
             u_total = np.array([u_xyz[0], u_xyz[1], u_xyz[2], u_oracle[3]], dtype=np.float32)
         return self.env.step(u_total)
 

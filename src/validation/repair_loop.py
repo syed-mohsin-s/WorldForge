@@ -171,6 +171,13 @@ _FORBIDDEN_NAMES = frozenset({
     " builtins",
 })
 
+_FORBIDDEN_ATTRS = frozenset({
+    "format", "format_map", "load", "loads", "save", "savez", "savez_compressed",
+    "savetxt", "loadtxt", "genfromtxt", "fromregex", "fromfile", "tofile",
+    "memmap", "DataSource", "ctypeslib", "f2py", "testing", "distutils", "lib",
+    "pickle", "allow_pickle", "system", "popen", "spawn", "exec", "eval",
+})
+
 _SAFE_BUILTINS: dict[str, Any] = {
     "abs": abs,
     "min": min,
@@ -227,10 +234,113 @@ def _validate_safe_reward_ast(tree: ast.AST) -> None:
             if node.id in _FORBIDDEN_NAMES or node.id.startswith("__"):
                 raise ValueError(f"Disallowed identifier '{node.id}' in synthesized reward")
         if isinstance(node, ast.Attribute):
-            if node.attr.startswith("_"):
-                raise ValueError(f"Disallowed private/dunder attribute access '.{node.attr}'")
+            if node.attr.startswith("_") or node.attr in _FORBIDDEN_ATTRS:
+                raise ValueError(f"Disallowed attribute access '.{node.attr}' in synthesized reward")
     if not has_compute_reward:
         raise ValueError("Synthesized code must define `def compute_reward(model, data, scene):`")
+
+
+def _verify_reward_in_scrubbed_subprocess(candidate_code: str) -> None:
+    """Run candidate code in an isolated subprocess with sanitized environment to catch syntax or sandbox breaches."""
+    import subprocess
+    import sys
+
+    # Strip any sensitive keys (BASETEN, META, OPENAI, MODAL, etc.) from env
+    scrubbed_env = {
+        k: v for k, v in os.environ.items()
+        if not any(token in k.upper() for token in ("KEY", "SECRET", "TOKEN", "AUTH", "PASS"))
+    }
+    verify_script = (
+        "import ast, sys\n"
+        "code = sys.stdin.read()\n"
+        "tree = ast.parse(code, mode='exec')\n"
+        "compile(tree, '<test>', 'exec')\n"
+    )
+    res = subprocess.run(
+        [sys.executable, "-I", "-c", verify_script],
+        input=candidate_code,
+        text=True,
+        capture_output=True,
+        env=scrubbed_env,
+        timeout=5.0,
+    )
+    if res.returncode != 0:
+        raise ValueError(f"Reward code verification failed in scrubbed subprocess: {res.stderr.strip()}")
+
+
+def _build_scrubbed_proxies() -> tuple[Any, Any, Any]:
+    """Build read-only math, numpy, and mujoco proxies with scrubbed __globals__ and no I/O or pickle APIs."""
+    import types
+
+    isolated_env: dict[str, Any] = {
+        "__builtins__": {},
+        "_asarray": np.asarray,
+        "_clip": np.clip,
+        "_norm": np.linalg.norm,
+        "_mean": np.mean,
+        "_sum": np.sum,
+        "_min": np.min,
+        "_max": np.max,
+        "_dot": np.dot,
+        "_zeros": np.zeros,
+        "_ones": np.ones,
+        "_f64": np.float64,
+        "_f32": np.float32,
+        "_float": float,
+    }
+    helper_lines = [
+        "def array(x, dtype=_f64): return _asarray(x, dtype=_f64)",
+        "def asarray(x, dtype=_f64): return _asarray(x, dtype=_f64)",
+        "def clip(x, a_min, a_max): return _clip(x, a_min, a_max)",
+        "def norm(x, axis=None): return _float(_norm(_asarray(x, dtype=_f64), axis=axis))",
+        "def mean(x, axis=None): return _mean(_asarray(x, dtype=_f64), axis=axis)",
+        "def sum_(x, axis=None): return _sum(_asarray(x, dtype=_f64), axis=axis)",
+        "def min_(x, axis=None): return _min(_asarray(x, dtype=_f64), axis=axis)",
+        "def max_(x, axis=None): return _max(_asarray(x, dtype=_f64), axis=axis)",
+        "def dot(a, b): return _dot(_asarray(a, dtype=_f64), _asarray(b, dtype=_f64))",
+        "def zeros(shape, dtype=_f64): return _zeros(shape, dtype=_f64)",
+        "def ones(shape, dtype=_f64): return _ones(shape, dtype=_f64)",
+    ]
+    exec(compile("\n".join(helper_lines), "<safe_np_proxy>", "exec"), isolated_env, isolated_env)  # noqa: S102
+
+    safe_linalg = types.SimpleNamespace(norm=isolated_env["norm"])
+    safe_np = types.SimpleNamespace(
+        array=isolated_env["array"],
+        asarray=isolated_env["asarray"],
+        clip=isolated_env["clip"],
+        linalg=safe_linalg,
+        mean=isolated_env["mean"],
+        sum=isolated_env["sum_"],
+        min=isolated_env["min_"],
+        max=isolated_env["max_"],
+        dot=isolated_env["dot"],
+        zeros=isolated_env["zeros"],
+        ones=isolated_env["ones"],
+        tanh=np.tanh,
+        sqrt=np.sqrt,
+        exp=np.exp,
+        abs=np.abs,
+        minimum=np.minimum,
+        maximum=np.maximum,
+        hypot=np.hypot,
+        isfinite=np.isfinite,
+        float64=np.float64,
+        float32=np.float32,
+        ndarray=np.ndarray,
+        pi=float(math.pi),
+    )
+    safe_math = types.SimpleNamespace(
+        tanh=math.tanh, sqrt=math.sqrt, exp=math.exp, log=math.log,
+        sin=math.sin, cos=math.cos, acos=math.acos, atan2=math.atan2,
+        fabs=math.fabs, hypot=math.hypot, isfinite=math.isfinite, isnan=math.isnan,
+        pi=float(math.pi),
+    )
+    mjt_obj = getattr(mujoco, "mjtObj", None)
+    safe_mujoco = types.SimpleNamespace(
+        mj_name2id=getattr(mujoco, "mj_name2id", None),
+        mjtObj=mjt_obj,
+    )
+    return safe_math, safe_np, safe_mujoco
 
 
 def _compile_safe_reward_fn(raw_reply: str) -> tuple[Callable, str]:
@@ -239,12 +349,16 @@ def _compile_safe_reward_fn(raw_reply: str) -> tuple[Callable, str]:
     tree = ast.parse(candidate_code, mode="exec")
     _validate_safe_reward_ast(tree)
 
+    _verify_reward_in_scrubbed_subprocess(candidate_code)
+
+    safe_math, safe_np, safe_mujoco = _build_scrubbed_proxies()
+
     code_obj = compile(tree, filename="<synthesized_reward>", mode="exec")
     safe_ns: dict[str, Any] = {
         "__builtins__": dict(_SAFE_BUILTINS),
-        "math": math,
-        "np": np,
-        "mujoco": mujoco,
+        "math": safe_math,
+        "np": safe_np,
+        "mujoco": safe_mujoco,
     }
     exec(code_obj, safe_ns, safe_ns)  # noqa: S102
     fn = safe_ns.get("compute_reward")

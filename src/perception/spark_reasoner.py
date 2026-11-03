@@ -646,7 +646,7 @@ class MuseSparkReasoner:
         """Call Muse Spark 1.2 API for unified reasoning."""
         import httpx
 
-        api_url = os.environ.get("META_SPARK_API_URL", "https://api.meta.ai/v1/models/muse-spark-1.2/reason")
+        api_url = os.environ.get("META_SPARK_API_URL", "https://api.meta.ai/v1/chat/completions")
         headers = {
             "Authorization": f"Bearer {self.meta_api_key}",
             "Content-Type": "application/json",

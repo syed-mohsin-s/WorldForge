@@ -44,10 +44,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Install system dependencies for MuJoCo physics, headless rendering & OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
+    libgl1-mesa-dri \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libegl1 \
+    libegl-mesa0 \
+    libgbm1 \
     libgles2 \
     libosmesa6 \
     curl \

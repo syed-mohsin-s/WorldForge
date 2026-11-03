@@ -34,12 +34,14 @@ import numpy as np
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.generated_reward import compute_reward
 from src.compiler.mjcf_builder import SceneCompiler
+from collections import OrderedDict
 from src.pipeline import (
     OUTPUTS_ROOT,
     SCENES_DIR,
     run_worldforge_pipeline,
     sanitize_scene_id,
     stream_worldforge_pipeline,
+    validate_safe_video_path,
 )
 from src.schema.scene_graph import SceneGraph
 from src.validation.ppo_runner import OracleController
@@ -139,6 +141,7 @@ class RunRequest(BaseModel):
 class SimActionRequest(BaseModel):
     """Real MuJoCo 3.17 simulation action request."""
     scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
+    session_id: str = Field(default="default", description="Client session ID for physics isolation")
     action: tuple[float, float, float, float] = Field(
         default=(0.0, 0.0, 0.0, 1.0),
         description="4-DoF [dx, dy, dz, grip_cmd] action executed by MuJoCo 3.17 mocap weld",
@@ -148,9 +151,12 @@ class SimActionRequest(BaseModel):
 class SimResetRequest(BaseModel):
     """Real MuJoCo 3.17 simulation reset request."""
     scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
+    session_id: str = Field(default="default", description="Client session ID for physics isolation")
 
 
-active_sim_sessions: dict[str, dict[str, Any]] = {}
+active_sim_sessions: OrderedDict[str, dict[str, Any]] = OrderedDict()
+_SIM_SESSIONS_LOCK = threading.Lock()
+_MAX_SIM_SESSIONS = 32
 
 
 def _resolve_safe_scene_path(scene_id: str, fallback_to_default: bool = False) -> tuple[str, Path]:
@@ -386,36 +392,53 @@ def sim_reset(req: SimResetRequest) -> dict[str, Any]:
     """Reset the live MuJoCo 3.17 simulation environment and return ground-truth state."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
     sg = _load_scene_graph(clean_id)
-    prev = active_sim_sessions.get(clean_id)
-    lock = prev["lock"] if (prev and "lock" in prev) else threading.Lock()
-    with lock:
+    session_key = f"{req.session_id}:{clean_id}"
+
+    with _SIM_SESSIONS_LOCK:
+        prev = active_sim_sessions.get(session_key)
         if prev and "env" in prev:
             try:
                 prev["env"].close()
             except Exception:
                 pass
-        env = WorldForgeEnv(sg)
-        env.reset(seed=42)
-        ctrl = OracleController(sg.task.waypoints)
-        active_sim_sessions[clean_id] = {
-            "env": env,
-            "sg": sg,
-            "ctrl": ctrl,
-            "step": 0,
-            "grip_cmd": 1.0,
-            "lock": lock,
-        }
-        return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
+
+        if len(active_sim_sessions) >= _MAX_SIM_SESSIONS and session_key not in active_sim_sessions:
+            _, oldest = active_sim_sessions.popitem(last=False)
+            if "env" in oldest:
+                try:
+                    oldest["env"].close()
+                except Exception:
+                    pass
+
+        lock = threading.Lock()
+        with lock:
+            env = WorldForgeEnv(sg)
+            env.reset(seed=42)
+            ctrl = OracleController(sg.task.waypoints)
+            active_sim_sessions[session_key] = {
+                "env": env,
+                "sg": sg,
+                "ctrl": ctrl,
+                "step": 0,
+                "grip_cmd": 1.0,
+                "lock": lock,
+            }
+            active_sim_sessions.move_to_end(session_key)
+            return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
 
 
 @app.post("/api/sim/step")
 def sim_step(req: SimActionRequest) -> dict[str, Any]:
     """Execute a single real physics step in MuJoCo 3.17 with the given 4-DoF action."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
-    if clean_id not in active_sim_sessions:
-        sim_reset(SimResetRequest(scene_id=clean_id))
+    session_key = f"{req.session_id}:{clean_id}"
 
-    session = active_sim_sessions[clean_id]
+    with _SIM_SESSIONS_LOCK:
+        if session_key not in active_sim_sessions:
+            sim_reset(SimResetRequest(scene_id=clean_id, session_id=req.session_id))
+        session = active_sim_sessions[session_key]
+        active_sim_sessions.move_to_end(session_key)
+
     with session["lock"]:
         env: WorldForgeEnv = session["env"]
         sg: SceneGraph = session["sg"]
@@ -432,10 +455,14 @@ def sim_step(req: SimActionRequest) -> dict[str, Any]:
 def sim_oracle_step(req: SimResetRequest) -> dict[str, Any]:
     """Step the deterministic Waypoint Oracle controller inside MuJoCo 3.17."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
-    if clean_id not in active_sim_sessions:
-        sim_reset(SimResetRequest(scene_id=clean_id))
+    session_key = f"{req.session_id}:{clean_id}"
 
-    session = active_sim_sessions[clean_id]
+    with _SIM_SESSIONS_LOCK:
+        if session_key not in active_sim_sessions:
+            sim_reset(SimResetRequest(scene_id=clean_id, session_id=req.session_id))
+        session = active_sim_sessions[session_key]
+        active_sim_sessions.move_to_end(session_key)
+
     with session["lock"]:
         env: WorldForgeEnv = session["env"]
         sg: SceneGraph = session["sg"]
@@ -452,7 +479,7 @@ def sim_oracle_step(req: SimResetRequest) -> dict[str, Any]:
 @app.get("/api/sim/trajectory")
 def sim_trajectory(
     scene_id: str = Query("scene1_pick_place"),
-    max_steps: int = Query(120),
+    max_steps: int = Query(120, ge=1, le=500),
 ) -> list[dict[str, Any]]:
     """Compute and return the full high-fidelity MuJoCo 3.17 physics trajectory."""
     clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=True)
@@ -488,6 +515,11 @@ def sim_trajectory(
 def run_pipeline(req: RunRequest) -> dict[str, Any]:
     """Execute the complete 8-stage pipeline synchronously and return all telemetry."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=False)
+    if req.video_path:
+        try:
+            validate_safe_video_path(req.video_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         result = run_worldforge_pipeline(
             scene_id=clean_id,
@@ -518,6 +550,11 @@ def stream_pipeline_get(
 ):
     """Stream the 8-stage pipeline as Server-Sent Events (SSE)."""
     clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
+    if video_path:
+        try:
+            validate_safe_video_path(video_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StreamingResponse(
         stream_worldforge_pipeline(
             scene_id=clean_id,
@@ -540,6 +577,11 @@ def stream_pipeline_get(
 def stream_pipeline_post(req: RunRequest):
     """Stream the 8-stage pipeline via POST as Server-Sent Events (SSE)."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=False)
+    if req.video_path:
+        try:
+            validate_safe_video_path(req.video_path)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StreamingResponse(
         stream_worldforge_pipeline(
             scene_id=clean_id,
@@ -771,8 +813,28 @@ async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
     if dest_path.parent != uploads_dir:
         raise HTTPException(status_code=400, detail="Invalid upload filename")
 
-    with open(dest_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    max_bytes = 25 * 1024 * 1024  # 25 MB cap
+    total_bytes = 0
+    try:
+        with open(dest_path, "wb") as buffer:
+            while True:
+                chunk = await file.read(65536)
+                if not chunk:
+                    break
+                total_bytes += len(chunk)
+                if total_bytes > max_bytes:
+                    raise HTTPException(
+                        status_code=413,
+                        detail="File exceeds maximum allowed upload size of 25 MB",
+                    )
+                buffer.write(chunk)
+    except Exception:
+        if dest_path.exists():
+            try:
+                dest_path.unlink()
+            except OSError:
+                pass
+        raise
 
     return {
         "status": "success",

@@ -54,7 +54,7 @@ class ModalSandboxRunner:
 
     def is_cloud_available(self) -> bool:
         """Return True if Modal authentication token is present in the environment."""
-        return bool(os.environ.get("MODAL_TOKEN_ID"))
+        return bool(os.environ.get("MODAL_TOKEN_ID")) and os.environ.get("MODAL_REMOTE_EXEC", "").lower() in ("1", "true", "yes")
 
     def _check_budget(self) -> None:
         """Check if total spent exceeds max_budget_usd; raise BudgetExceededError if so."""
@@ -186,7 +186,7 @@ class ModalSandboxRunner:
         app = modal.App.lookup("worldforge-sandbox", create_if_missing=True)
         image = (
             modal.Image.debian_slim(python_version="3.12")
-            .apt_install("libgl1-mesa-glx", "libosmesa6-dev", "libegl1-mesa-dev")
+            .apt_install("libgl1", "libgl1-mesa-dri", "libegl1", "libegl-mesa0", "libgbm1", "libosmesa6")
             .pip_install(
                 "mujoco>=3.1.0",
                 "gymnasium>=1.0.0",

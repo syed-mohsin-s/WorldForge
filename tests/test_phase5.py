@@ -306,3 +306,76 @@ def test_multi_stack_color_order_and_prompt_extraction():
     assert synth.objects[1].rgba == (0.46, 0.78, 0.56, 1.0)
     assert synth.objects[2].rgba == (0.92, 0.9, 0.9, 1.0)
 
+def test_ast_sandbox_blocks_format_string_and_pickle():
+    """Verify AST sandbox strictly blocks format strings, np.load, and forbidden attributes."""
+    from src.validation.repair_loop import _compile_safe_reward_fn
+
+    for bad_code in [
+        'def compute_reward(m, d, s):\n    return "{0}".format(m), False, {}',
+        'def compute_reward(m, d, s):\n    return "{0}".format_map({"0": m}), False, {}',
+        'def compute_reward(m, d, s):\n    return np.load("exploit.npy", allow_pickle=True), False, {}',
+        'def compute_reward(m, d, s):\n    return np.savetxt("pwned.txt", [1]), False, {}',
+    ]:
+        with pytest.raises(ValueError):
+            _compile_safe_reward_fn(bad_code)
+
+
+def test_api_upload_size_limit_25mb():
+    """Verify that uploading > 25 MB yields HTTP 413 Payload Too Large."""
+    class LargeStream(io.BytesIO):
+        def __init__(self, size: int):
+            self.remaining = size
+            self.total = size
+
+        def read(self, size: int = -1) -> bytes:
+            if self.remaining <= 0:
+                return b""
+            chunk_size = min(size if size > 0 else 65536, self.remaining)
+            self.remaining -= chunk_size
+            return b"A" * chunk_size
+
+    oversized = LargeStream(25 * 1024 * 1024 + 1024)
+    resp = client.post(
+        "/api/upload-video",
+        files={"file": ("too_large.mp4", oversized, "video/mp4")},
+    )
+    assert resp.status_code == 413
+    assert "exceeds maximum allowed upload size of 25 MB" in resp.json()["detail"]
+
+
+def test_api_video_path_traversal_and_extension_rejected():
+    """Verify video_path rejects traversal attempts and non-video extensions."""
+    for bad_path in ["/etc/passwd", "../exploit.mp4", "c:/windows/system32/cmd.exe", "test.txt"]:
+        resp = client.post("/api/run", json={"scene_id": "scene1_pick_place", "video_path": bad_path})
+        assert resp.status_code == 400
+
+
+def test_api_trajectory_max_steps_bounds():
+    """Verify max_steps is bounded between 1 and 500."""
+    resp0 = client.get("/api/sim/trajectory?scene_id=scene1_pick_place&max_steps=0")
+    assert resp0.status_code == 422
+
+    resp501 = client.get("/api/sim/trajectory?scene_id=scene1_pick_place&max_steps=501")
+    assert resp501.status_code == 422
+
+
+def test_api_session_id_isolation():
+    """Verify that distinct session_ids maintain isolated simulation state."""
+    client.post("/api/sim/reset", json={"scene_id": "scene1_pick_place", "session_id": "sess_A"})
+    s_a1 = client.post(
+        "/api/sim/step",
+        json={"scene_id": "scene1_pick_place", "session_id": "sess_A", "action": [0.0, 0.0, -0.5, 1.0]},
+    ).json()
+    assert s_a1["step"] == 1
+
+    s_b0 = client.post(
+        "/api/sim/reset", json={"scene_id": "scene1_pick_place", "session_id": "sess_B"}
+    ).json()
+    assert s_b0["step"] == 0
+
+    s_a2 = client.post(
+        "/api/sim/step",
+        json={"scene_id": "scene1_pick_place", "session_id": "sess_A", "action": [0.0, 0.0, -0.5, 1.0]},
+    ).json()
+    assert s_a2["step"] == 2
+
