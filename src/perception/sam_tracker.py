@@ -34,6 +34,69 @@ logger = logging.getLogger(__name__)
 _LOCAL_SAM3_PROCESSOR: Any = None
 _LOCAL_SAM3_MODEL: Any = None
 
+_COLOR_SYNONYMS: dict[str, str] = {
+    "grey": "gray",
+    "gray": "gray",
+    "silver": "gray",
+    "metallic": "gray",
+    "green": "green",
+    "mint": "green",
+    "white": "white",
+    "red": "red",
+    "blue": "blue",
+    "yellow": "yellow",
+    "black": "black",
+    "orange": "orange",
+    "purple": "purple",
+    "pink": "pink",
+    "brown": "brown",
+    "cyan": "cyan",
+}
+
+
+def extract_prompts_from_user_intent(
+    task_prompt: str | None,
+    fallback_prompts: list[str],
+    is_stack_intent: bool = False,
+) -> list[str]:
+    """Extract natural-language visual object prompts from user intent prompt for SAM 3.1."""
+    if not task_prompt or not task_prompt.strip():
+        if is_stack_intent:
+            return ["left object", "center object", "right object"]
+        return fallback_prompts
+
+    tokens = re.findall(r"[a-zA-Z]+", task_prompt.lower())
+    extracted_colors: list[str] = []
+    for tok in tokens:
+        canon = _COLOR_SYNONYMS.get(tok)
+        if canon and canon not in extracted_colors:
+            extracted_colors.append(canon)
+
+    if len(extracted_colors) >= 2:
+        return [f"{c} object" for c in extracted_colors]
+
+    if is_stack_intent:
+        if len(extracted_colors) == 1:
+            c0 = extracted_colors[0]
+            return [f"{c0} object", "center object", "right object"]
+        return ["left object", "center object", "right object"]
+
+    if len(extracted_colors) == 1:
+        return [f"{extracted_colors[0]} object"] + [
+            p for p in fallback_prompts if extracted_colors[0] not in p.lower()
+        ]
+
+    return fallback_prompts
+
+
+def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
+    """Compute binary mask Intersection-over-Union."""
+    inter = int(np.sum(mask_a & mask_b))
+    if inter == 0:
+        return 0.0
+    union = int(np.sum(mask_a | mask_b))
+    return float(inter) / max(float(union), 1.0)
+
 
 def _get_local_sam3_singleton() -> tuple[Any, Any]:
     """Lazy-load unsloth/sam3.1 model and processor onto CPU as a singleton."""
@@ -161,14 +224,15 @@ def _resolve_object_id(
 
     if raw_id:
         return raw_id
-    return re.sub(r"[^a-z0-9_]+", "_", label.lower()).strip("_") or f"object_{idx}"
+    clean_lbl = re.sub(r"\bgrey\b", "gray", label.lower())
+    return re.sub(r"[^a-z0-9_]+", "_", clean_lbl).strip("_") or f"object_{idx}"
 
 
 def _deduplicate_tracks(
     tracks: list[ObjectMaskTrack],
     object_ids: list[str] | None,
 ) -> list[ObjectMaskTrack]:
-    """Deduplicate tracks by object_id, keeping only canonical IDs when specified."""
+    """Deduplicate tracks by object_id and spatial mask overlap."""
     by_id: dict[str, ObjectMaskTrack] = {}
     allowed = set(object_ids) if object_ids else None
     for t in tracks:
@@ -177,7 +241,16 @@ def _deduplicate_tracks(
         prev = by_id.get(t.object_id)
         if prev is None or int(np.sum(t.frame0_mask)) > int(np.sum(prev.frame0_mask)):
             by_id[t.object_id] = t
-    return list(by_id.values()) if by_id else tracks
+    deduped = list(by_id.values()) if by_id else tracks
+    if object_ids is not None:
+        return deduped
+
+    unique_spatial: list[ObjectMaskTrack] = []
+    for t in deduped:
+        if any(_mask_iou(t.frame0_mask, u.frame0_mask) > 0.45 for u in unique_spatial):
+            continue
+        unique_spatial.append(t)
+    return unique_spatial
 
 
 def _propagate_mask_over_frames(
@@ -387,22 +460,17 @@ class SAM31Tracker:
 
     @staticmethod
     def _crop_and_resize(rgb: np.ndarray, target_size: tuple[int, int]) -> np.ndarray:
-        """Center-crop to preserve aspect ratio before resizing to target_size (w, h)."""
+        """Resize to target_size (w, h) while preserving the full horizontal field of view."""
         tw, th = target_size
         h, w = rgb.shape[:2]
         if w == tw and h == th:
             return rgb
         target_aspect = tw / max(th, 1)
         src_aspect = w / max(h, 1)
-        if abs(src_aspect - target_aspect) > 0.02:
-            if src_aspect > target_aspect:
-                new_w = int(round(h * target_aspect))
-                x0 = max(0, (w - new_w) // 2)
-                rgb = rgb[:, x0 : x0 + new_w]
-            else:
-                new_h = int(round(w / target_aspect))
-                y0 = max(0, (h - new_h) // 2)
-                rgb = rgb[y0 : y0 + new_h, :]
+        if src_aspect < target_aspect - 0.02:
+            new_h = int(round(w / target_aspect))
+            y0 = max(0, (h - new_h) // 2)
+            rgb = rgb[y0 : y0 + new_h, :]
         return cv2.resize(rgb, (tw, th), interpolation=cv2.INTER_AREA)
 
     @classmethod
@@ -437,7 +505,138 @@ class SAM31Tracker:
         return [raw_frames[int(i)] for i in indices]
 
     @staticmethod
+    def _extract_sheet_foreground_components(
+        rgb: np.ndarray,
+        hsv: np.ndarray,
+        lab: np.ndarray,
+    ) -> list[dict[str, Any]]:
+        """Segment objects resting on a bright calibration sheet (e.g. A4 paper) via corridor splitting."""
+        h, w = rgb.shape[:2]
+        roi_lab = lab[int(h * 0.48) : int(h * 0.74), int(w * 0.18) : int(w * 0.82)]
+        roi_hsv = hsv[int(h * 0.48) : int(h * 0.74), int(w * 0.18) : int(w * 0.82)]
+        if roi_lab.size == 0:
+            return []
+
+        med_hsv = np.median(roi_hsv, axis=(0, 1))
+        std_l = float(np.std(roi_lab[:, :, 0]))
+        if not (med_hsv[2] > 165.0 and med_hsv[1] < 25.0 and std_l < 18.0):
+            return []
+
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32)
+        g_minus_rb = rgb[:, :, 1].astype(np.float32) - 0.5 * (
+            rgb[:, :, 0].astype(np.float32) + rgb[:, :, 2].astype(np.float32)
+        )
+        mean_g = cv2.blur(gray, (9, 9))
+        local_std = np.sqrt(np.maximum(cv2.blur(gray * gray, (9, 9)) - mean_g * mean_g, 0.0))
+
+        is_paper_or_shadow = (
+            (hsv[:, :, 2] > 138.0)
+            & (hsv[:, :, 1] < 18.0)
+            & (g_minus_rb < 2.2)
+            & (local_std < 3.8)
+        )
+        num_p, p_labels, p_stats, _ = cv2.connectedComponentsWithStats(
+            is_paper_or_shadow.astype(np.uint8)
+        )
+        if num_p <= 1:
+            return []
+
+        largest_p = 1 + int(np.argmax(p_stats[1:, cv2.CC_STAT_AREA]))
+        if int(p_stats[largest_p, cv2.CC_STAT_AREA]) < (h * w) // 8:
+            return []
+
+        paper_cc = p_labels == largest_p
+        ys_p, _ = np.where(paper_cc)
+        if len(ys_p) < 100:
+            return []
+
+        y_min_p = int(np.percentile(ys_p, 1))
+        y_max_p = int(np.percentile(ys_p, 98))
+        y_obj_top = y_min_p
+        y_obj_bot = min(h - 30, int(y_min_p + 0.60 * (y_max_p - y_min_p)))
+        band_h = max(1, y_obj_bot - y_obj_top)
+        if band_h < 25:
+            return []
+
+        paper_col_ratio = np.sum(paper_cc[y_obj_top:y_obj_bot, :], axis=0) / float(band_h)
+        corridor_cols = paper_col_ratio > 0.55
+        is_dark_cloth = (hsv[:, :, 2] < 110.0) & (
+            (np.arange(w)[None, :] < 180) | (np.arange(w)[None, :] > w - 80)
+        )
+
+        obj_band = np.zeros((h, w), dtype=bool)
+        obj_band[y_obj_top:y_obj_bot, int(w * 0.07) : int(w * 0.96)] = True
+
+        fg = obj_band & (~paper_cc) & (~is_dark_cloth)
+        fg[:, corridor_cols] = False
+
+        fg_open = cv2.morphologyEx(
+            fg.astype(np.uint8),
+            cv2.MORPH_OPEN,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)),
+        )
+        fg_close = cv2.morphologyEx(
+            fg_open,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+        )
+
+        num_c, c_labels, c_stats, _ = cv2.connectedComponentsWithStats(fg_close)
+        sheet_comps: list[dict[str, Any]] = []
+        max_area = (h * w) // 4
+
+        for cid in range(1, num_c):
+            area = int(c_stats[cid, cv2.CC_STAT_AREA])
+            if area < 1200 or area > max_area:
+                continue
+            mask = c_labels == cid
+            ys_m, xs_m = np.where(mask)
+            if len(xs_m) == 0:
+                continue
+            x0_c, x1_c = int(xs_m.min()), int(xs_m.max())
+            obj_rgb_med = np.median(rgb[mask], axis=0)
+            upper_top = max(35, y_min_p - 32)
+            if upper_top < y_obj_top:
+                upper_slice = slice(upper_top, y_obj_top)
+                col_slice = slice(x0_c, x1_c + 1)
+                color_dist = np.linalg.norm(
+                    rgb[upper_slice, col_slice].astype(np.float32) - obj_rgb_med[None, None, :],
+                    axis=2,
+                )
+                upper_match = (color_dist < 32.0) & (~paper_cc[upper_slice, col_slice])
+                mask[upper_slice, col_slice] |= upper_match
+
+            pts = np.column_stack(np.where(mask))[:, ::-1]
+            hull = cv2.convexHull(pts)
+            hull_mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillConvexPoly(hull_mask, hull, 1)
+            hull_bool = hull_mask > 0
+            hull_area = int(np.sum(hull_bool))
+            if hull_area > max_area:
+                continue
+
+            centroid, bbox = compute_mask_centroid_and_bbox(hull_bool)
+            mean_rgb = np.mean(rgb[hull_bool], axis=0)
+            mean_hsv = np.mean(hsv[hull_bool], axis=0)
+            sheet_comps.append(
+                {
+                    "mask": hull_bool,
+                    "area": hull_area,
+                    "centroid": centroid,
+                    "bbox": bbox,
+                    "mean_rgb": mean_rgb,
+                    "mean_hsv": mean_hsv,
+                }
+            )
+
+        if len(sheet_comps) >= 2:
+            sheet_comps.sort(key=lambda c: c["area"], reverse=True)
+            return sheet_comps
+        return []
+
+    @classmethod
     def _extract_foreground_components(
+        cls,
         rgb: np.ndarray,
         min_area: int = 25,
     ) -> list[dict[str, Any]]:
@@ -445,6 +644,10 @@ class SAM31Tracker:
         h, w = rgb.shape[:2]
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
         lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2Lab).astype(np.float32)
+
+        sheet_comps = cls._extract_sheet_foreground_components(rgb, hsv, lab)
+        if len(sheet_comps) >= 2:
+            return sheet_comps
 
         # Estimate dominant tabletop background from lower-half border & interior median
         lower_half = slice(int(h * 0.22), int(h * 0.95))
@@ -510,21 +713,33 @@ class SAM31Tracker:
         for idx, comp in enumerate(components):
             if idx in used_indices:
                 continue
-            r, g, b = comp["mean_rgb"]
-            score = float(comp["area"]) * 0.01
+            r, g, b = float(comp["mean_rgb"][0]), float(comp["mean_rgb"][1]), float(comp["mean_rgb"][2])
+            sat = float(comp["mean_hsv"][1])
+            lum = (r + g + b) / 3.0
+            green_excess = g - 0.5 * (r + b)
+            cx = float(comp["centroid"][0])
+
+            score = float(comp["area"]) * 0.002
             if "red" in p_low:
-                score += (float(r) - max(float(g), float(b))) * 5.0
+                score += (r - max(g, b)) * 6.0
             elif "blue" in p_low:
-                score += (float(b) - max(float(r), float(g))) * 5.0
-            elif "green" in p_low:
-                score += (float(g) - max(float(r), float(b))) * 5.0
+                score += (b - max(r, g)) * 6.0
+            elif "green" in p_low or "mint" in p_low:
+                score += green_excess * 25.0
+            elif "white" in p_low or "bright" in p_low or "light" in p_low:
+                score += (lum - 125.0) * 6.0 - sat * 2.5 - max(0.0, green_excess) * 10.0
+            elif "gray" in p_low or "grey" in p_low or "silver" in p_low or "metal" in p_low:
+                score += (60.0 - abs(lum - 112.0)) * 5.0 - max(0.0, green_excess) * 12.0
             elif "yellow" in p_low or "wood" in p_low or "coaster" in p_low:
-                score += ((float(r) + float(g)) * 0.5 - float(b)) * 3.0
-            elif "rubber" in p_low or "dark" in p_low or "marker" in p_low:
-                score += (128.0 - (float(r) + float(g) + float(b)) / 3.0) * 3.0
-            elif "metal" in p_low:
-                sat = float(comp["mean_hsv"][1])
-                score += (60.0 - sat) * 2.0
+                score += ((r + g) * 0.5 - b) * 4.0
+            elif "rubber" in p_low or "dark" in p_low or "marker" in p_low or "black" in p_low:
+                score += (128.0 - lum) * 4.0
+            elif "left" in p_low:
+                score += (320.0 - cx) * 2.0
+            elif "center" in p_low or "middle" in p_low:
+                score += (200.0 - abs(cx - 320.0)) * 2.0
+            elif "right" in p_low:
+                score += (cx - 320.0) * 2.0
 
             if score > best_score:
                 best_score = score
@@ -756,6 +971,8 @@ class SAM31Tracker:
             or data.get("masks")
             or []
         )
+        max_mask_area = int(h * w * 0.25)
+        min_mask_area = 250 if object_ids is None else 20
 
         for idx, item in enumerate(raw_items):
             label = item.get("label", prompts[idx] if idx < len(prompts) else f"object_{idx}")
@@ -773,6 +990,10 @@ class SAM31Tracker:
             raw_mask = (mask_img > 127)
             if raw_mask.shape != (h, w):
                 raw_mask = cv2.resize(raw_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+
+            area = int(np.sum(raw_mask))
+            if object_ids is None and (area < min_mask_area or area > max_mask_area):
+                continue
 
             eroded = erode_mask(raw_mask, iterations=self.erosion_px)
 
@@ -801,6 +1022,13 @@ class SAM31Tracker:
             )
 
         tracks = _deduplicate_tracks(tracks, object_ids)
+
+        if object_ids is None and len(tracks) < len(prompts):
+            comps0 = self._extract_foreground_components(f0)
+            if len(comps0) >= len(prompts):
+                cv_res = self._segment_opencv_video(scene_id, frames_rgb, prompts, object_ids=None)
+                if len(cv_res.tracks) >= len(prompts):
+                    tracks = cv_res.tracks
 
         return SamTrackingResult(
             scene_id=scene_id,

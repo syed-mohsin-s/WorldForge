@@ -256,3 +256,53 @@ def test_multi_stack_reasoner_prompt_driven():
     assert synth.task.stack_order == ["particle_1", "particle_2", "particle_0"]
     assert "Center-of-Mass stability" in reasoner.last_reasoning_trace
     assert len(synth.task.waypoints) == 16
+
+def test_multi_stack_color_order_and_prompt_extraction():
+    """Verify SAM color prompt extraction and relative 'X on top of Y' stacking order."""
+    from src.perception.sam_tracker import extract_prompts_from_user_intent
+
+    prompt = "stack the object one by one gray on top of green and then white on top of grey with stability"
+    sam_prompts = extract_prompts_from_user_intent(prompt, ["red cube", "coaster"], is_stack_intent=True)
+    assert sam_prompts == ["gray object", "green object", "white object"]
+
+    geom = LiftedSceneGeometry(
+        scene_id="real_video_stack",
+        table_z=0.0,
+        camera=CameraSpec(pos=(0.6, -0.6, 0.8), lookat=(0.0, 0.0, 0.05)),
+        objects=[
+            LiftedObject(
+                id="gray_object",
+                label="gray object",
+                primitive="box",
+                size=[0.0276, 0.0276, 0.02],
+                position=(-0.0135, 0.0089, 0.021),
+                rgba=(0.52, 0.5, 0.48, 1.0),
+            ),
+            LiftedObject(
+                id="green_object",
+                label="green object",
+                primitive="box",
+                size=[0.028, 0.028, 0.02],
+                position=(0.0928, 0.0073, 0.021),
+                rgba=(0.46, 0.78, 0.56, 1.0),
+            ),
+            LiftedObject(
+                id="white_object",
+                label="white object",
+                primitive="box",
+                size=[0.0238, 0.0238, 0.02],
+                position=(-0.1085, 0.007, 0.021),
+                rgba=(0.92, 0.9, 0.9, 1.0),
+            ),
+        ],
+    )
+    reasoner = MuseSparkReasoner(provider="local")
+    synth = reasoner.synthesize_scene_graph(geom, user_prompt=prompt)
+    assert synth.task.task_type == "multi_stack"
+    assert synth.task.stack_order == ["green_object", "gray_object", "white_object"]
+    assert synth.task.manipulated_object_id == "white_object"
+    assert len(synth.task.waypoints) == 16
+    assert synth.objects[0].rgba == (0.52, 0.5, 0.48, 1.0)
+    assert synth.objects[1].rgba == (0.46, 0.78, 0.56, 1.0)
+    assert synth.objects[2].rgba == (0.92, 0.9, 0.9, 1.0)
+

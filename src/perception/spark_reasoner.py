@@ -59,6 +59,57 @@ def _object_half_height(obj: LiftedObject) -> float:
     return float(obj.size[0]) if len(obj.size) > 0 else 0.02
 
 
+def _resolve_prompt_stack_order(
+    candidates: list[LiftedObject],
+    prompt: str | None,
+) -> list[LiftedObject]:
+    """Order objects from bottom base [0] to top [N-1] using explicit prompt relations and footprint stability."""
+    sorted_by_area = sorted(candidates, key=_object_footprint_area, reverse=True)
+    if not prompt or not prompt.strip() or len(candidates) < 2:
+        return sorted_by_area
+
+    p_norm = re.sub(r"\bgrey\b", "gray", prompt.lower())
+
+    def _find_candidate(token: str) -> LiftedObject | None:
+        t_clean = token.strip().lower()
+        if not t_clean or t_clean in ("the", "a", "an", "object", "objects", "block", "blocks", "particle", "particles", "it", "one", "top"):
+            return None
+        for obj in sorted_by_area:
+            haystack = re.sub(r"\bgrey\b", "gray", f"{obj.id} {obj.label}".lower())
+            if re.search(rf"\b{re.escape(t_clean)}\b", haystack) or t_clean in haystack.split("_"):
+                return obj
+        return None
+
+    pair_pattern = re.compile(
+        r"\b([a-z0-9_]+)\s+(?:object\s+|block\s+|particle\s+)?(?:on\s+top\s+of|onto|over|above)\s+(?:the\s+|top\s+of\s+)?([a-z0-9_]+)"
+    )
+    below_to_above: dict[str, str] = {}
+    by_id = {o.id: o for o in sorted_by_area}
+
+    for match in pair_pattern.finditer(p_norm):
+        upper_obj = _find_candidate(match.group(1))
+        lower_obj = _find_candidate(match.group(2))
+        if upper_obj and lower_obj and upper_obj.id != lower_obj.id:
+            below_to_above[lower_obj.id] = upper_obj.id
+
+    if below_to_above:
+        above_set = set(below_to_above.values())
+        roots = [oid for oid in below_to_above if oid not in above_set]
+        start_id = roots[0] if roots else next(iter(below_to_above))
+        ordered_ids: list[str] = [start_id]
+        cur = start_id
+        while cur in below_to_above and below_to_above[cur] not in ordered_ids:
+            nxt = below_to_above[cur]
+            ordered_ids.append(nxt)
+            cur = nxt
+        for obj in sorted_by_area:
+            if obj.id not in ordered_ids:
+                ordered_ids.append(obj.id)
+        return [by_id[oid] for oid in ordered_ids if oid in by_id]
+
+    return sorted_by_area
+
+
 class MuseSparkReasoner:
     """Perception reasoner synthesizing strict SceneGraph objects from 3D geometry."""
 
@@ -220,7 +271,14 @@ class MuseSparkReasoner:
             raw_json = full_content[json_start : json_end + 1] if (json_start != -1 and json_end != -1) else ""
             if raw_json:
                 parsed_data = json.loads(raw_json)
-                return SceneGraph.model_validate(parsed_data)
+                parsed_sg = SceneGraph.model_validate(parsed_data)
+                if local_sg.task.task_type == "multi_stack":
+                    parsed_mats = {o.id: o.material for o in parsed_sg.objects if o.material in self._materials}
+                    for obj in local_sg.objects:
+                        if obj.id in parsed_mats:
+                            obj.material = parsed_mats[obj.id]
+                    return local_sg
+                return parsed_sg
         except Exception as parse_exc:
             logger.debug("Direct SceneGraph parse fallback (%s); retaining geometrically grounded graph.", parse_exc)
 
@@ -247,7 +305,9 @@ class MuseSparkReasoner:
                 damping=obj.joint_damping,
                 is_prior_guess=obj.is_prior_guess,
             )
-            rgba = (0.2, 0.45, 0.85, 1.0) if ("blue" in obj.label.lower() and mat == "plastic") else None
+            rgba = getattr(obj, "rgba", None)
+            if rgba is None and "blue" in obj.label.lower() and mat == "plastic":
+                rgba = (0.2, 0.45, 0.85, 1.0)
             object_nodes.append(
                 ObjectNode(
                     id=obj.id,
@@ -309,7 +369,7 @@ class MuseSparkReasoner:
     ) -> Literal["pick_and_place", "push_to_target", "articulate_joint", "multi_stack"]:
         if prompt:
             p_lower = prompt.lower()
-            if any(k in p_lower for k in ("stack", "tower", "one by one", "one-by-one", "pile")):
+            if any(k in p_lower for k in ("stack", "tower", "one by one", "one-by-one", "pile", "on top of")):
                 if len(geom.objects) >= 2 or explicit_task_type == "multi_stack":
                     return "multi_stack"
             if "pull" in p_lower or "drawer" in p_lower or "articulate" in p_lower or "open" in p_lower:
@@ -356,8 +416,7 @@ class MuseSparkReasoner:
         if len(candidates) < 2:
             return self._build_pick_place_task(geom, prompt)
 
-        # Sort descending by base footprint area w * d (widest base = index 0, then middle, then top)
-        sorted_objs = sorted(candidates, key=_object_footprint_area, reverse=True)
+        sorted_objs = _resolve_prompt_stack_order(candidates, prompt)
         if len(sorted_objs) == 2:
             obj_0, obj_1 = sorted_objs[0], sorted_objs[1]
             stack_order = [obj_0.id, obj_1.id]
@@ -560,12 +619,12 @@ class MuseSparkReasoner:
 
     def _infer_material(self, label: str, object_id: str) -> str:
         text = f"{label} {object_id}".lower()
-        if any(k in text for k in ("plastic", "cube", "cylinder")):
-            return "plastic"
-        if any(k in text for k in ("metal", "steel", "handle", "iron", "obstacle")):
-            return "metal"
-        if any(k in text for k in ("wood", "wooden", "coaster", "cabinet", "drawer")):
+        if any(k in text for k in ("wood", "wooden", "coaster", "cabinet", "drawer", "base_block")):
             return "wood"
+        if any(k in text for k in ("metal", "steel", "handle", "iron", "obstacle", "gray", "grey", "silver")):
+            return "metal"
+        if any(k in text for k in ("plastic", "cube", "cylinder", "mid_block", "top_block", "white", "green")):
+            return "plastic"
         if any(k in text for k in ("rubber", "pad", "marker", "mat")):
             return "rubber"
         if any(k in text for k in ("ceramic", "mug", "cup", "plate")):

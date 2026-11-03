@@ -183,7 +183,14 @@ def _resolve_safe_scene_path(scene_id: str, fallback_to_default: bool = False) -
 
 
 def _load_scene_graph(scene_id: str, fallback_to_default: bool = True) -> SceneGraph:
-    _, target = _resolve_safe_scene_path(scene_id, fallback_to_default=fallback_to_default)
+    clean_id, target = _resolve_safe_scene_path(scene_id, fallback_to_default=fallback_to_default)
+    recon_path = (OUTPUTS_ROOT / clean_id / "reconstructed_scene.json").resolve()
+    if recon_path.exists():
+        try:
+            with open(recon_path, "r", encoding="utf-8") as f:
+                return SceneGraph.model_validate(json.load(f))
+        except Exception as exc:
+            logger.warning("Could not load reconstructed_scene.json for %s: %s", clean_id, exc)
     with open(target, "r", encoding="utf-8") as f:
         data = json.load(f)
     return SceneGraph.model_validate(data)
@@ -357,7 +364,13 @@ def get_scene_preview(scene_id: str) -> dict[str, Any]:
 @app.get("/api/scenes/{scene_id}")
 def get_scene(scene_id: str) -> dict[str, Any]:
     """Retrieve full SceneGraph JSON for a given scene ID or file ID."""
-    _, target = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
+    clean_id, target = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
+    recon_path = (OUTPUTS_ROOT / clean_id / "reconstructed_scene.json").resolve()
+    if recon_path.exists():
+        try:
+            recon_path.unlink()
+        except OSError:
+            pass
 
     with open(target, "r", encoding="utf-8") as f:
         data = json.load(f)

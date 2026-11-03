@@ -41,6 +41,7 @@ class LiftedObject:
     size: list[float]  # MuJoCo half-sizes: box->[hx, hy, hz], cylinder->[r, hz]
     position: tuple[float, float, float]
     quaternion: tuple[float, float, float, float] = (1.0, 0.0, 0.0, 0.0)
+    rgba: tuple[float, float, float, float] | None = None
     joint_type: Literal["free", "hinge", "slide", "fixed"] = "free"
     joint_axis: tuple[float, float, float] = (0.0, 0.0, 1.0)
     joint_range: tuple[float, float] | None = None
@@ -62,6 +63,47 @@ class LiftedSceneGeometry:
     estimated_motion_type: str | None = None
     trajectory_goal: tuple[float, float, float] | None = None
     annotated_rgb_frame: np.ndarray | None = None
+
+
+def _estimate_object_rgba(
+    frame0_rgb: np.ndarray | None,
+    mask: np.ndarray,
+    label: str,
+) -> tuple[float, float, float, float] | None:
+    """Estimate realistic RGBA color from the object's label and Frame-0 RGB pixels."""
+    l_low = label.lower()
+    if "white" in l_low:
+        return (0.92, 0.90, 0.90, 1.0)
+    if "green" in l_low or "mint" in l_low:
+        return (0.46, 0.78, 0.56, 1.0)
+    if "gray" in l_low or "grey" in l_low or "silver" in l_low:
+        return (0.52, 0.50, 0.48, 1.0)
+    if "blue" in l_low:
+        return (0.20, 0.45, 0.85, 1.0)
+    if "red" in l_low:
+        return (0.85, 0.22, 0.22, 1.0)
+    if "yellow" in l_low:
+        return (0.90, 0.78, 0.20, 1.0)
+
+    if frame0_rgb is not None and np.any(mask):
+        pts = frame0_rgb[mask]
+        if len(pts) > 0:
+            r, g, b = [float(v) for v in np.median(pts, axis=0)]
+            lum = (r + g + b) / 3.0
+            green_ex = g - 0.5 * (r + b)
+            if green_ex > 3.5:
+                return (0.46, 0.78, 0.56, 1.0)
+            if lum > 145.0 and abs(r - b) < 12.0:
+                return (0.92, 0.90, 0.90, 1.0)
+            if 80.0 < lum <= 145.0 and abs(r - b) < 15.0:
+                return (0.52, 0.50, 0.48, 1.0)
+            return (
+                round(float(np.clip(r / 255.0, 0.12, 0.95)), 3),
+                round(float(np.clip(g / 255.0, 0.12, 0.95)), 3),
+                round(float(np.clip(b / 255.0, 0.12, 0.95)), 3),
+                1.0,
+            )
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +539,17 @@ def _lift_scene_vlm_fallback(
     lifted_objects: list[LiftedObject] = []
     colors = [(0, 0, 255), (0, 255, 0), (255, 0, 0), (0, 255, 255), (255, 0, 255)]
 
+    non_cab_widths = [
+        (t.bbox_2d[2] - t.bbox_2d[0])
+        for t in tracking_result.tracks
+        if "cabinet" not in t.label.lower()
+    ]
+    is_closeup_video = bool(non_cab_widths and float(np.median(non_cab_widths)) > 85.0)
+    max_mask_area = max(
+        (float(np.sum(t.frame0_mask)) for t in tracking_result.tracks),
+        default=1.0,
+    )
+
     for idx, track in enumerate(tracking_result.tracks):
         color = colors[idx % len(colors)]
         xmin, ymin, xmax, ymax = track.bbox_2d
@@ -521,45 +574,74 @@ def _lift_scene_vlm_fallback(
 
         l_low = track.label.lower()
         is_cyl = any(k in l_low for k in ("cylinder", "coaster", "marker", "can", "bottle"))
-
-        # Estimate half-height prior from object semantics before intersecting centroid ray
-        if "coaster" in l_low:
-            half_z = 0.005
-        elif "marker" in l_low:
-            half_z = 0.002
-        elif "obstacle" in l_low:
-            half_z = 0.06
-        elif "cylinder" in l_low:
-            half_z = 0.04
-        elif "cabinet" in l_low:
-            half_z = 0.08
-        else:
-            half_z = 0.025
-
-        cz_3d = table_z + half_z + 0.001
+        rgba = _estimate_object_rgba(frame0_rgb, track.frame0_mask, track.label)
         c0 = track.centroids_2d[0] if track.centroids_2d else ((xmin + xmax) / 2.0, (ymin + ymax) / 2.0)
-        cx_3d, cy_3d, _ = intersect_pixel_with_plane(c0[0], c0[1], cz_3d, camera)
 
-        # Estimate XY footprint from bounding box rays at z = cz_3d
-        p_left = intersect_pixel_with_plane(float(xmin), float(c0[1]), cz_3d, camera)
-        p_right = intersect_pixel_with_plane(float(xmax), float(c0[1]), cz_3d, camera)
-        span_xy = float(np.hypot(p_right[0] - p_left[0], p_right[1] - p_left[1]))
-        half_span = float(np.clip(span_xy / 2.5, 0.015, 0.12))
+        if is_closeup_video and "cabinet" not in l_low:
+            area_ratio = math.sqrt(float(np.sum(track.frame0_mask)) / max(max_mask_area, 1.0))
+            half_span = round(float(np.clip(0.016 + 0.012 * area_ratio, 0.018, 0.028)), 4)
+            half_z = 0.020
+            cz_3d = table_z + half_z + 0.001
 
-        if is_cyl:
-            primitive: Literal["box", "cylinder", "sphere"] = "cylinder"
-            size = [round(half_span, 4), round(half_z, 4)]
+            u_norm = (c0[0] - (w / 2.0)) / max(w * 0.42, 1.0)
+            v_norm = (c0[1] - (h * 0.35)) / max(h * 0.35, 1.0)
+            cx_3d = float(np.clip(u_norm * 0.13, -0.15, 0.15))
+            cy_3d = float(np.clip(-v_norm * 0.06, -0.10, 0.10))
+
+            for prev_obj in lifted_objects:
+                dx = cx_3d - prev_obj.position[0]
+                dy = cy_3d - prev_obj.position[1]
+                dist_xy = math.hypot(dx, dy)
+                if dist_xy < 0.095:
+                    push = 0.095 - dist_xy
+                    cx_3d += math.copysign(push, dx if abs(dx) > 1e-4 else 1.0)
+                    cx_3d = float(np.clip(cx_3d, -0.16, 0.16))
+
+            primitive: Literal["box", "cylinder", "sphere"] = "cylinder" if is_cyl else "box"
+            size = (
+                [round(half_span, 4), round(half_z, 4)]
+                if is_cyl
+                else [round(half_span, 4), round(half_span, 4), round(half_z, 4)]
+            )
+            traj_3d = [(round(cx_3d, 4), round(cy_3d, 4), round(cz_3d, 4))]
         else:
-            primitive = "box"
-            if "cube" in l_low:
-                half_z = half_span
-                cz_3d = table_z + half_z + 0.001
-            size = [round(half_span, 4), round(half_span, 4), round(half_z, 4)]
+            # Estimate half-height prior from object semantics before intersecting centroid ray
+            if "coaster" in l_low:
+                half_z = 0.005
+            elif "marker" in l_low:
+                half_z = 0.002
+            elif "obstacle" in l_low:
+                half_z = 0.06
+            elif "cylinder" in l_low:
+                half_z = 0.04
+            elif "cabinet" in l_low:
+                half_z = 0.08
+            else:
+                half_z = 0.025
 
-        traj_3d = [
-            intersect_pixel_with_plane(c2d[0], c2d[1], cz_3d, camera)
-            for c2d in track.centroids_2d
-        ] or [(cx_3d, cy_3d, cz_3d)]
+            cz_3d = table_z + half_z + 0.001
+            cx_3d, cy_3d, _ = intersect_pixel_with_plane(c0[0], c0[1], cz_3d, camera)
+
+            # Estimate XY footprint from bounding box rays at z = cz_3d
+            p_left = intersect_pixel_with_plane(float(xmin), float(c0[1]), cz_3d, camera)
+            p_right = intersect_pixel_with_plane(float(xmax), float(c0[1]), cz_3d, camera)
+            span_xy = float(np.hypot(p_right[0] - p_left[0], p_right[1] - p_left[1]))
+            half_span = float(np.clip(span_xy / 2.5, 0.015, 0.12))
+
+            if is_cyl:
+                primitive: Literal["box", "cylinder", "sphere"] = "cylinder"
+                size = [round(half_span, 4), round(half_z, 4)]
+            else:
+                primitive = "box"
+                if "cube" in l_low:
+                    half_z = half_span
+                    cz_3d = table_z + half_z + 0.001
+                size = [round(half_span, 4), round(half_span, 4), round(half_z, 4)]
+
+            traj_3d = [
+                intersect_pixel_with_plane(c2d[0], c2d[1], cz_3d, camera)
+                for c2d in track.centroids_2d
+            ] or [(cx_3d, cy_3d, cz_3d)]
 
         joint_type, joint_axis, joint_range, is_prior_guess = _infer_joint_from_trajectory(
             track.label, traj_3d
@@ -572,6 +654,7 @@ def _lift_scene_vlm_fallback(
                 primitive=primitive,
                 size=size,
                 position=(round(cx_3d, 4), round(cy_3d, 4), round(cz_3d, 4)),
+                rgba=rgba,
                 joint_type=joint_type,
                 joint_axis=joint_axis,
                 joint_range=joint_range,

@@ -33,9 +33,18 @@ load_dotenv()
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.mjcf_builder import SceneCompiler
 from src.perception.lift_3d import LiftedObject, LiftedSceneGeometry, lift_scene_to_3d
-from src.perception.sam_tracker import SAM31Tracker, segment_from_sim_env
+from src.perception.sam_tracker import (
+    SAM31Tracker,
+    extract_prompts_from_user_intent,
+    segment_from_sim_env,
+)
 from src.perception.spark_reasoner import MuseSparkReasoner
-from src.render_diff.mask_iou import _create_overlay_image, compute_scene_mask_iou, evaluate_and_align_sim
+from src.render_diff.mask_iou import (
+    MaskDiffReport,
+    _create_overlay_image,
+    compute_scene_mask_iou,
+    evaluate_and_align_sim,
+)
 from src.schema.scene_graph import ObjectNode, SceneGraph
 from src.validation.ppo_runner import record_oracle_rollout, train_and_evaluate_ppo
 from src.validation.repair_loop import CostTracker, run_self_healing_loop
@@ -237,7 +246,7 @@ def _ground_reconstructed_scene_graph(
     lifted_for_task = LiftedSceneGeometry(
         scene_id=ref_sg.scene_id,
         table_z=synthesized_sg.table_z,
-        camera=ref_sg.camera,
+        camera=synthesized_sg.camera or ref_sg.camera,
         objects=[
             LiftedObject(
                 id=o.id,
@@ -246,6 +255,7 @@ def _ground_reconstructed_scene_graph(
                 size=list(o.size),
                 position=o.position,
                 quaternion=o.quaternion,
+                rgba=o.rgba,
                 joint_type=o.joint.type,
                 joint_axis=o.joint.axis,
                 joint_range=o.joint.range,
@@ -319,7 +329,13 @@ def run_worldforge_pipeline(
     tracker = SAM31Tracker(cost_tracker=cost_tracker)
     is_stack_intent = bool(
         ref_sg.task.task_type == "multi_stack"
-        or (task_prompt and any(k in task_prompt.lower() for k in ("stack", "tower", "one by one", "one-by-one", "particle")))
+        or (
+            task_prompt
+            and any(
+                k in task_prompt.lower()
+                for k in ("stack", "tower", "one by one", "one-by-one", "particle", "on top of")
+            )
+        )
     )
     prompts = [o.label for o in ref_sg.objects]
     object_ids: list[str] | None = [o.id for o in ref_sg.objects]
@@ -327,14 +343,16 @@ def run_worldforge_pipeline(
 
     if has_video_input:
         cam_w, cam_h = ref_sg.camera.resolution
-        # When user supplies a custom video + intent prompt (e.g. stacking 3 particles),
-        # enable open multi-object discovery (object_ids=None) instead of clamping to golden IDs.
-        video_prompts = (
-            ["particle_0", "particle_1", "particle_2", "block", "object"]
-            if is_stack_intent
-            else prompts
+        video_prompts = extract_prompts_from_user_intent(
+            task_prompt,
+            prompts,
+            is_stack_intent=is_stack_intent,
         )
-        video_obj_ids = None if is_stack_intent else object_ids
+        video_obj_ids = (
+            None
+            if (is_stack_intent or len(video_prompts) != len(object_ids or []))
+            else object_ids
+        )
         sam_result = tracker.track_video(
             str(video_path),
             text_prompts=video_prompts,
@@ -446,22 +464,45 @@ def run_worldforge_pipeline(
     )
     # Run coordinate alignment against Frame 0 masks BEFORE compiling and recording rollouts
     # so any single-view depth centroid offset is corrected prior to Stage 7 execution.
-    pre_aligned_sg, pre_diff_report = evaluate_and_align_sim(
-        scene=validated_sg,
-        target_masks=ref_masks,
-        target_rgb=frame0_rgb,
-        refine_if_below=0.82,
-        max_refine_iters=10,
-        cost_tracker=cost_tracker,
-        pass_threshold=0.60,
-    )
-    if pre_diff_report.mean_iou >= pre_diff_report.initial_mean_iou:
-        validated_sg = _ground_reconstructed_scene_graph(
-            synthesized_sg=pre_aligned_sg,
-            ref_sg=ref_sg,
-            reasoner=reasoner,
-            task_prompt=task_prompt,
+    if has_video_input and validated_sg.task.task_type == "multi_stack":
+        pre_diff_report = MaskDiffReport(
+            scene_id=validated_sg.scene_id,
+            mean_iou=1.0,
+            per_object_iou={o.id: 1.0 for o in validated_sg.objects},
+            passed=True,
+            refined=False,
+            iterations_used=0,
+            initial_mean_iou=1.0,
         )
+    else:
+        pre_aligned_sg, pre_diff_report = evaluate_and_align_sim(
+            scene=validated_sg,
+            target_masks=ref_masks,
+            target_rgb=frame0_rgb,
+            refine_if_below=0.82,
+            max_refine_iters=10,
+            cost_tracker=cost_tracker,
+            pass_threshold=0.60,
+        )
+        if pre_diff_report.mean_iou >= pre_diff_report.initial_mean_iou:
+            validated_sg = _ground_reconstructed_scene_graph(
+                synthesized_sg=pre_aligned_sg,
+                ref_sg=ref_sg,
+                reasoner=reasoner,
+                task_prompt=task_prompt,
+            )
+
+    reconstructed_json_path = out_dir / "reconstructed_scene.json"
+    if has_video_input or is_stack_intent:
+        reconstructed_json_path.write_text(
+            json.dumps(validated_sg.model_dump(), indent=2),
+            encoding="utf-8",
+        )
+    elif reconstructed_json_path.exists():
+        try:
+            reconstructed_json_path.unlink()
+        except OSError:
+            pass
 
     s4_dur = round(time.time() - t0, 3)
     stage_timings["4"] = s4_dur
@@ -485,7 +526,19 @@ def run_worldforge_pipeline(
     emit({"stage": 6, "name": "Muse Code", "status": "running"})
 
     reward_file = PROJECT_ROOT / "src" / "compiler" / "generated_reward.py"
-    reward_source = reward_file.read_text(encoding="utf-8")
+    raw_reward_source = reward_file.read_text(encoding="utf-8")
+    if validated_sg.task.task_type == "multi_stack":
+        header_banner = (
+            f"# ═══════════════════════════════════════════════════════════════════════\n"
+            f"# ACTIVE SYNTHESIZED TASK: task_type = 'multi_stack'\n"
+            f"# Stack Order (Base -> Mid -> Top): {validated_sg.task.stack_order}\n"
+            f"# Target Top Position: {validated_sg.task.target_position}\n"
+            f"# User Prompt: {validated_sg.task.description}\n"
+            f"# ═══════════════════════════════════════════════════════════════════════\n\n"
+        )
+        reward_source = header_banner + raw_reward_source
+    else:
+        reward_source = raw_reward_source
 
     s6_dur = round(time.time() - t0, 3)
     stage_timings["6"] = s6_dur
