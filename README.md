@@ -12,6 +12,15 @@
 
 ---
 
+<p align="center">
+  <img src="docs/assets/image.png" alt="WorldForge Studio 2.0 Live Cockpit" width="100%">
+</p>
+<p align="center">
+  <em><b>Figure 1: WorldForge Studio 2.0 Live Cockpit</b> — Interactive Three.js WebGL PBR stage, 8-Stage Autonomous Pipeline execution with live SSE streaming, real-time MuJoCo 3.17 Cartesian physics controls, and 1-click Gymnasium package export.</em>
+</p>
+
+---
+
 ## What is WorldForge?
 
 **WorldForge** transforms uncalibrated monocular tabletop videos or natural language task intents into fully grounded, physics-accurate, and trainable **MuJoCo 3.17 Gymnasium RL environments** in under 30 seconds. By automating vision tracking, metric 3D lifting, physical spatial reasoning, MJCF compilation, dense reward generation, and multi-gate physics verification, WorldForge reduces manual robot simulation setup time from **~6 hours to under 30 seconds** (a **>700× acceleration**).
@@ -38,6 +47,13 @@ Uncalibrated Video / Prompt  ──►  WorldForge Studio  ──►  Deployable
 ---
 
 ## 8-Stage Autonomous Pipeline Architecture
+
+<p align="center">
+  <img src="docs/assets/studio_walkthrough.png" alt="WorldForge Studio Pipeline Walkthrough" width="90%">
+</p>
+<p align="center">
+  <em><b>Figure 2: Autonomous Pipeline Walkthrough</b> — End-to-end video ingestion, SAM 3.1 multiplexed tracking, 3D metric lifting with A4 solvePnP calibration, Muse Spark CoM stability reasoning, and self-healing validation gates.</em>
+</p>
 
 ```
 Uncalibrated Monocular Video / Natural Language Prompt
@@ -81,6 +97,17 @@ Uncalibrated Monocular Video / Natural Language Prompt
          ▼
  1-Click Exportable Gymnasium Environment Package (.zip) & 4.0s Verification MP4
 ```
+
+---
+
+## Visual Alignment & Render-Diff Verification (Stage 8)
+
+WorldForge renders the synthesized MuJoCo environment offscreen from the calibrated camera pose and evaluates pixel-level **Mask IoU** against video Frame 0 to guarantee spatial and visual fidelity before acceptance:
+
+| Golden Scene 1: Pick & Place | Golden Scene 2: Push Obstacle | Golden Scene 3: Articulated Drawer |
+|:---:|:---:|:---:|
+| <img src="outputs/scene1_pick_place/diff_overlay.png" width="300" alt="Scene 1 Diff Overlay"> | <img src="outputs/scene2_push_obstacle/diff_overlay.png" width="300" alt="Scene 2 Diff Overlay"> | <img src="outputs/scene3_articulated_drawer/diff_overlay.png" width="300" alt="Scene 3 Diff Overlay"> |
+| **Mask IoU: 100.0%** *(Green Overlap)* | **Mask IoU: 95.8%** *(Refined Fit)* | **Mask IoU: 88.4%** *(Kinematic Alignment)* |
 
 ---
 
@@ -158,6 +185,8 @@ WorldForge-RL/
 │       ├── scene1_pick_place.json      # Golden Scene 1 specification
 │       ├── scene2_push_obstacle.json   # Golden Scene 2 specification
 │       └── scene3_articulated_drawer.json # Golden Scene 3 specification
+├── docs/
+│   └── assets/                         # Studio 2.0 screenshots & walkthrough visual assets
 ├── src/
 │   ├── api/
 │   │   └── server.py                   # FastAPI REST, SSE streaming & live MuJoCo 3.17 simulation
