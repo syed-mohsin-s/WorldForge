@@ -29,12 +29,7 @@ class CameraSpec(BaseModel):
 # Joint
 # ---------------------------------------------------------------------------
 class JointSpec(BaseModel):
-    """Joint attached to an ObjectNode body.
-
-    ``is_prior_guess`` flags joints whose type/axis was inferred by the VLM
-    rather than measured from video tracks — downstream validators may
-    apply extra checks or domain-randomize these.
-    """
+    """Joint attached to an ObjectNode body."""
 
     type: Literal["free", "hinge", "slide", "fixed"] = "free"
     axis: tuple[float, float, float] = (0, 0, 1)
@@ -140,18 +135,16 @@ class SceneGraph(BaseModel):
     objects: list[ObjectNode]
     task: TaskSpec
 
-    # -- Graph integrity & auto-snap validator -------------------------------
     @model_validator(mode="after")
     def _validate_and_snap_objects(self) -> "SceneGraph":
         """Validate object IDs, parent hierarchy acyclicity, manipulated object
-        existence, and snap resting objects to ``table_z + ε``."""
+        existence, stack_order references, and snap resting objects to ``table_z + ε``."""
         obj_map: dict[str, ObjectNode] = {}
         for obj in self.objects:
             if obj.id in obj_map:
                 raise ValueError(f"Duplicate object id '{obj.id}' in scene '{self.scene_id}'")
             obj_map[obj.id] = obj
 
-        # Validate parent references and check for cycles
         for obj in self.objects:
             if obj.parent_id is not None:
                 if obj.parent_id not in obj_map:
@@ -171,7 +164,6 @@ class SceneGraph(BaseModel):
                     visited.add(curr)
                     curr = obj_map[curr].parent_id
 
-        # Validate task.manipulated_object_id exists when objects are present
         if self.objects and self.task.manipulated_object_id not in obj_map:
             raise ValueError(
                 f"task.manipulated_object_id '{self.task.manipulated_object_id}' "
@@ -188,7 +180,7 @@ class SceneGraph(BaseModel):
         eps = 0.001  # 1 mm clearance
         for obj in self.objects:
             if obj.parent_id is not None:
-                continue  # child bodies are positioned relative to parent
+                continue
 
             half_h = _half_height(obj)
             floor = self.table_z + half_h + eps
@@ -198,9 +190,6 @@ class SceneGraph(BaseModel):
         return self
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 def _half_height(obj: ObjectNode) -> float:
     """Return the half-height of *obj* along its local Z axis."""
     prim = obj.primitive

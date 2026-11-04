@@ -7,13 +7,11 @@ Design notes
 * Gripper control: a ``<body mocap="true">`` named ``ee_mocap`` is welded to
   ``gripper_base`` via an equality constraint. The weld's ``solref="0.01 1"``
   gives a stiff-but-damped spring so the gripper tracks the mocap target
-  without exciting the contact solver.  ``solimp`` is left at defaults —
-  MuJoCo 3.x's implicit-fast integrator handles it well.
-* Contact: ``condim="4"`` on the floor geom enables tangential + torsional
-  friction for realistic sliding/pivoting.  Object geoms use ``condim="3"``
-  (tangential only) by default.
-* Every object centroid and the task target position get a ``<site>`` marker
-  for reward computation / visualization.
+  without exciting the contact solver.
+* Gripper fingers: mounted at ``y = ∓0.005`` with half-thickness ``0.005`` and
+  slide range ``[0, 0.04]`` along ``∓Y``, so ``ctrl = 0`` closes the inner
+  finger pads completely flush (0.0 cm gap) and ``ctrl = 0.04`` opens them to
+  an 8.0 cm span.
 """
 
 from __future__ import annotations
@@ -28,9 +26,6 @@ import yaml
 if TYPE_CHECKING:
     from src.schema.scene_graph import SceneGraph
 
-# ---------------------------------------------------------------------------
-# Material look-up
-# ---------------------------------------------------------------------------
 _MATERIALS_PATH = Path(__file__).resolve().parents[2] / "configs" / "materials.yaml"
 
 
@@ -38,10 +33,6 @@ def _load_materials() -> dict:
     with open(_MATERIALS_PATH) as f:
         return yaml.safe_load(f)
 
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
 
 def compile_scene_to_mjcf(
     scene: "SceneGraph",
@@ -156,7 +147,7 @@ def compile_scene_to_mjcf(
         name="table",
         type="plane",
         pos=f"0 0 {scene.table_z}",
-        size="1 1 0.02",
+        size="2.5 2.5 0.02",
         material="table_mat",
         condim="4",
         friction="0.6 0.005 0.0001",
@@ -179,7 +170,6 @@ def compile_scene_to_mjcf(
 
         info = mat_db.get(obj.material, mat_db["plastic"])
 
-        # Density / friction
         if randomize:
             density = random.uniform(*info["density_range"])
             friction_t = random.uniform(*info["sliding_friction_range"])
@@ -196,10 +186,9 @@ def compile_scene_to_mjcf(
             quat=_v4(obj.quaternion),
         )
 
-        # Joint
         jt = obj.joint
         if obj.is_static or jt.type == "fixed":
-            pass  # no joint → welded to world / parent
+            pass
         elif jt.type == "free":
             ET.SubElement(body, "freejoint", name=f"{obj.id}_free")
         else:
@@ -214,7 +203,6 @@ def compile_scene_to_mjcf(
                 jattrs["limited"] = "true"
             ET.SubElement(body, "joint", **jattrs)
 
-        # Geom
         geom_attrs: dict[str, str] = {
             "name": f"{obj.id}_geom",
             "type": obj.primitive,
@@ -232,7 +220,6 @@ def compile_scene_to_mjcf(
 
         ET.SubElement(body, "geom", **geom_attrs)
 
-        # Centroid site (at body origin — which IS the centroid for MuJoCo prims)
         ET.SubElement(
             body,
             "site",
@@ -242,7 +229,6 @@ def compile_scene_to_mjcf(
             rgba="1 0 0 0.5",
         )
 
-        # Recurse into children
         for child in children.get(obj.id, []):
             _add_body(body, child)
 
@@ -298,17 +284,17 @@ def compile_scene_to_mjcf(
         kp="300",
     )
 
-    # ── serialize ─────────────────────────────────────────────────────
     ET.indent(root, space="  ")
     return ET.tostring(root, encoding="unicode", xml_declaration=True)
 
 
-# ---------------------------------------------------------------------------
-# Gripper builder
-# ---------------------------------------------------------------------------
-
 def _build_gripper(worldbody: ET.Element) -> None:
-    """Add a two-finger parallel-jaw gripper driven by mocap weld."""
+    """Add a two-finger parallel-jaw gripper driven by mocap weld.
+
+    Fingers are mounted at y = ∓0.005 with half-thickness 0.005 so ctrl=0
+    closes the inner finger surfaces flush at y=0 (zero dead-zone gap) and
+    ctrl=0.04 opens them to an 8.0 cm span.
+    """
     mocap = ET.SubElement(
         worldbody,
         "body",
@@ -354,6 +340,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         diaginertia="0.001 0.001 0.001",
     )
 
+    # Left finger (mounted at y = -0.005 so inner pad touches y = 0 when closed)
     finger_l = ET.SubElement(
         gripper_base,
         "body",
@@ -381,6 +368,7 @@ def _build_gripper(worldbody: ET.Element) -> None:
         **{"class": "gripper"},
     )
 
+    # Right finger (mirror at y = +0.005)
     finger_r = ET.SubElement(
         gripper_base,
         "body",
@@ -408,10 +396,6 @@ def _build_gripper(worldbody: ET.Element) -> None:
         **{"class": "gripper"},
     )
 
-
-# ---------------------------------------------------------------------------
-# Math / formatting helpers
-# ---------------------------------------------------------------------------
 
 def _v3(v: tuple[float, float, float]) -> str:
     return f"{v[0]} {v[1]} {v[2]}"

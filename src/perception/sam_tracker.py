@@ -245,6 +245,7 @@ def _deduplicate_tracks(
     if object_ids is not None:
         return deduped
 
+    # In open discovery mode (object_ids=None), remove duplicate masks with IoU > 0.45
     unique_spatial: list[ObjectMaskTrack] = []
     for t in deduped:
         if any(_mask_iou(t.frame0_mask, u.frame0_mask) > 0.45 for u in unique_spatial):
@@ -268,7 +269,6 @@ def _propagate_mask_over_frames(
 
     prev_gray = cv2.cvtColor(frames_rgb[0], cv2.COLOR_RGB2GRAY)
     ys, xs = np.where(frame0_mask)
-    # Sample interior mask points for Lucas-Kanade tracking
     step = max(1, len(xs) // 80)
     pts = np.column_stack([xs[::step], ys[::step]]).astype(np.float32).reshape(-1, 1, 2)
     cur_mask = frame0_mask.copy()
@@ -467,6 +467,8 @@ class SAM31Tracker:
             return rgb
         target_aspect = tw / max(th, 1)
         src_aspect = w / max(h, 1)
+        # For portrait videos (taller than 4:3), center-crop vertically; for widescreen (16:9),
+        # keep the full horizontal width so objects near the left/right edges are never clipped.
         if src_aspect < target_aspect - 0.02:
             new_h = int(round(w / target_aspect))
             y0 = max(0, (h - new_h) // 2)
@@ -480,7 +482,7 @@ class SAM31Tracker:
         max_frames: int = 15,
         target_size: tuple[int, int] | None = (640, 480),
     ) -> list[np.ndarray]:
-        """Decode evenly spaced RGB frames from an MP4 file while preserving aspect ratio."""
+        """Decode evenly spaced RGB frames from an MP4 file while preserving full width."""
         if not video_path or not Path(video_path).exists():
             return []
         cap = cv2.VideoCapture(video_path)
@@ -488,7 +490,6 @@ class SAM31Tracker:
             return []
 
         raw_frames: list[np.ndarray] = []
-        # Read up to 300 frames and sample evenly so motion across the clip is captured
         while len(raw_frames) < max(max_frames, 150):
             ret, bgr = cap.read()
             if not ret:
@@ -645,6 +646,7 @@ class SAM31Tracker:
         hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV).astype(np.float32)
         lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2Lab).astype(np.float32)
 
+        # First check for objects resting on an A4 calibration sheet / bright workspace mat
         sheet_comps = cls._extract_sheet_foreground_components(rgb, hsv, lab)
         if len(sheet_comps) >= 2:
             return sheet_comps
@@ -682,7 +684,6 @@ class SAM31Tracker:
                 continue
             mask = labels_im == comp_id
             centroid, bbox = compute_mask_centroid_and_bbox(mask)
-            # Ignore gripper assembly hovering near top-center (y < 0.35*h and low saturation)
             mean_rgb = np.mean(rgb[mask], axis=0)
             mean_hsv = np.mean(hsv[mask], axis=0)
             if centroid[1] < h * 0.34 and mean_hsv[1] < 35.0:
@@ -705,7 +706,7 @@ class SAM31Tracker:
         components: list[dict[str, Any]],
         used_indices: set[int],
     ) -> int | None:
-        """Match a prompt/label to the best unused connected component using color and size cues."""
+        """Match a prompt/label to the best unused connected component using color, spatial, and size cues."""
         p_low = prompt.lower()
         best_idx: int | None = None
         best_score = -1e9
@@ -778,7 +779,6 @@ class SAM31Tracker:
             bbox0 = c_info["bbox"]
             ref_rgb = c_info["mean_rgb"]
 
-            # Track across frames 1..T-1 by nearest centroid + color similarity
             centroids_over_time: list[tuple[float, float]] = [c0]
             masks_over_time: list[np.ndarray] = [raw_mask0]
             prev_c = c0
@@ -971,6 +971,7 @@ class SAM31Tracker:
             or data.get("masks")
             or []
         )
+
         max_mask_area = int(h * w * 0.25)
         min_mask_area = 250 if object_ids is None else 20
 
@@ -1023,9 +1024,15 @@ class SAM31Tracker:
 
         tracks = _deduplicate_tracks(tracks, object_ids)
 
+        # In open multi-object discovery (e.g. multi_stack video with 3 objects), if the
+        # single-argmax Colab endpoint returned fewer distinct objects than requested prompts,
+        # supplement the missing prompts from adaptive foreground components.
         if object_ids is None and len(tracks) < len(prompts):
             comps0 = self._extract_foreground_components(f0)
             if len(comps0) >= len(prompts):
+                # Re-match all prompts cleanly against the extracted foreground components
+                # so color-specific prompts ("gray object", "green object", "white object")
+                # map 1-to-1 to the right physical objects without duplicate/shifted labels.
                 cv_res = self._segment_opencv_video(scene_id, frames_rgb, prompts, object_ids=None)
                 if len(cv_res.tracks) >= len(prompts):
                     tracks = cv_res.tracks

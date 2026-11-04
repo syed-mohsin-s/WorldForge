@@ -1,18 +1,4 @@
-"""WorldForge Muse Spark Reasoner — Stage 3 of the front-end perception pipeline.
-
-Interfaces with:
-1. Baseten's OpenAI-compatible endpoint hosting ``meta-models/muse-spark-open-1026``
-   (Hackathon Grant at https://inference.baseten.co/v1).
-2. Meta Model API (``muse-spark-1.2``).
-3. Deterministic local physics synthesis fallback when API keys are not set.
-
-Features:
-- Live streaming reasoning traces (`reasoning_content` and `<think>...</think>`).
-- Strict material priors assignment from ``configs/materials.yaml``.
-- Joint hierarchy & oracle waypoint synthesis with schema-grounded JSON parsing.
-- Validated Pydantic V2 ``SceneGraph`` emission.
-- Accurate API token and compute tracking in ``CostTracker`` (zero phantom tokens on local runs).
-"""
+"""WorldForge Muse Spark Reasoner — Stage 3 of the front-end perception pipeline."""
 
 from __future__ import annotations
 
@@ -59,12 +45,33 @@ def _object_half_height(obj: LiftedObject) -> float:
     return float(obj.size[0]) if len(obj.size) > 0 else 0.02
 
 
+def _visual_tiebreak_key(candidates: list[LiftedObject]) -> list[LiftedObject]:
+    """Sort by 3D footprint area, breaking near-ties (within 10%) using 2D mask area and fill ratio."""
+    from functools import cmp_to_key
+
+    def _cmp(a: LiftedObject, b: LiftedObject) -> int:
+        area_a = _object_footprint_area(a)
+        area_b = _object_footprint_area(b)
+        max_ab = max(area_a, area_b, 1e-8)
+        if abs(area_a - area_b) / max_ab <= 0.10:
+            # Within 10% 3D footprint tie: decide using image mask area & contour fill ratio
+            vis_a = float(getattr(a, "mask_area_px", 0)) * float(getattr(a, "fill_ratio", 1.0))
+            vis_b = float(getattr(b, "mask_area_px", 0)) * float(getattr(b, "fill_ratio", 1.0))
+            if abs(vis_a - vis_b) > 1.0:
+                return -1 if vis_a > vis_b else 1
+        if area_a != area_b:
+            return -1 if area_a > area_b else 1
+        return 0
+
+    return sorted(candidates, key=cmp_to_key(_cmp))
+
+
 def _resolve_prompt_stack_order(
     candidates: list[LiftedObject],
     prompt: str | None,
 ) -> list[LiftedObject]:
     """Order objects from bottom base [0] to top [N-1] using explicit prompt relations and footprint stability."""
-    sorted_by_area = sorted(candidates, key=_object_footprint_area, reverse=True)
+    sorted_by_area = _visual_tiebreak_key(candidates)
     if not prompt or not prompt.strip() or len(candidates) < 2:
         return sorted_by_area
 
@@ -80,6 +87,7 @@ def _resolve_prompt_stack_order(
                 return obj
         return None
 
+    # Parse "<upper> on top of <lower>" or "<upper> onto <lower>" clauses
     pair_pattern = re.compile(
         r"\b([a-z0-9_]+)\s+(?:object\s+|block\s+|particle\s+)?(?:on\s+top\s+of|onto|over|above)\s+(?:the\s+|top\s+of\s+)?([a-z0-9_]+)"
     )
@@ -146,10 +154,6 @@ class MuseSparkReasoner:
                 return list(data.keys())
         return ["plastic", "metal", "wood", "ceramic", "rubber", "cardboard"]
 
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
     def synthesize_scene_graph(
         self,
         geometry: LiftedSceneGeometry,
@@ -175,10 +179,6 @@ class MuseSparkReasoner:
 
         return self._synthesize_local(geometry, effective_prompt, task_type)
 
-    # ------------------------------------------------------------------
-    # Baseten OpenAI-Compatible API (meta-models/muse-spark-open-1026)
-    # ------------------------------------------------------------------
-
     def _call_baseten_api(
         self,
         geometry: LiftedSceneGeometry,
@@ -200,13 +200,13 @@ class MuseSparkReasoner:
         user_content = (
             f"Scene ID: {geometry.scene_id}\n"
             f"Table height z_table: {geometry.table_z:.3f}m\n"
-            f"Task prompt: {prompt or local_sg.task.description}\n"
+            f"User intent prompt: {prompt or local_sg.task.description}\n"
             f"Allowed materials: {self._materials}\n\n"
             f"Initial Lifted SceneGraph Candidate:\n{json.dumps(baseline_json, indent=2)}\n\n"
             f"Pydantic V2 SceneGraph JSON Schema:\n{json.dumps(schema_json)}\n\n"
             "Instructions:\n"
-            "1. Reason step-by-step about object materials, masses/densities, joint damping, "
-            "parent-child kinematic chains, and collision-free 4-DoF oracle waypoints [x, y, z, grip_cmd].\n"
+            "1. Reason step-by-step about object materials, masses/densities, base footprint areas (w * d), "
+            "Center-of-Mass stability for multi-object stacking, and collision-free 4-DoF oracle waypoints [x, y, z, grip_cmd].\n"
             "2. Emit the final refined SceneGraph JSON strictly conforming to the schema above."
         )
 
@@ -220,8 +220,8 @@ class MuseSparkReasoner:
                     "role": "system",
                     "content": (
                         "You are Muse Spark, an expert robot manipulation and physical scene reasoning model. "
-                        "Analyze the lifted 3D tabletop scene geometry, refine materials, joint hierarchies, and "
-                        "oracle waypoints, and return a schema-valid SceneGraph JSON."
+                        "Analyze the lifted 3D tabletop scene geometry, evaluate Center-of-Mass stability and footprint areas, "
+                        "refine materials, joint hierarchies, and oracle waypoints, and return a schema-valid SceneGraph JSON."
                     ),
                 },
                 {"role": "user", "content": user_content},
@@ -254,7 +254,19 @@ class MuseSparkReasoner:
                     full_reasoning = extracted_think
                 full_content = re.sub(r"<think>.*?</think>", "", full_content, flags=re.DOTALL).strip()
 
-        self.last_reasoning_trace = full_reasoning.strip() or full_content.strip()
+        raw_trace = full_reasoning.strip() or full_content.strip()
+        summary_header = local_sg.task.description
+        if local_sg.task.task_type == "multi_stack":
+            extents_summary = [
+                f"{o.id} ({o.size[0]*200:.1f}x{o.size[1]*200:.1f}x{o.size[2]*200:.1f}cm, mat={o.material})"
+                for o in local_sg.objects
+            ]
+            summary_header = (
+                f"[Executive Summary] Calibrated Camera Pose: pos={local_sg.camera.pos}, lookat={local_sg.camera.lookat}. "
+                f"Detected Objects: {', '.join(extents_summary)}. "
+                f"Resolved Stability Stack Order (Base -> Top): {local_sg.task.stack_order}.\n\n"
+            )
+        self.last_reasoning_trace = summary_header + raw_trace
 
         in_tokens = max(len(user_content) // 4, 300)
         out_tokens = max((len(full_reasoning) + len(full_content)) // 4, 150)
@@ -273,6 +285,8 @@ class MuseSparkReasoner:
                 parsed_data = json.loads(raw_json)
                 parsed_sg = SceneGraph.model_validate(parsed_data)
                 if local_sg.task.task_type == "multi_stack":
+                    # Retain kinematically calibrated multi_stack waypoints, stack_order, and RGB colors
+                    # while applying valid LLM material refinements
                     parsed_mats = {o.id: o.material for o in parsed_sg.objects if o.material in self._materials}
                     for obj in local_sg.objects:
                         if obj.id in parsed_mats:
@@ -284,10 +298,6 @@ class MuseSparkReasoner:
 
         return local_sg
 
-    # ------------------------------------------------------------------
-    # Local Deterministic Synthesis (Offline Fallback)
-    # ------------------------------------------------------------------
-
     def _synthesize_local(
         self,
         geom: LiftedSceneGeometry,
@@ -297,7 +307,7 @@ class MuseSparkReasoner:
         """Deterministic rule-based synthesis for offline testing and fallback (zero API tokens logged)."""
         object_nodes: list[ObjectNode] = []
         for obj in geom.objects:
-            mat = self._infer_material(obj.label, obj.id)
+            mat = self._infer_material(obj.label, obj.id, getattr(obj, "rgba", None))
             joint = JointSpec(
                 type=obj.joint_type,
                 axis=obj.joint_axis,
@@ -336,8 +346,8 @@ class MuseSparkReasoner:
                 self.last_reasoning_trace = (
                     f"Analyzing 3D scene '{geom.scene_id}' for multi-object stacking: grounded tabletop at z={geom.table_z:.3f}m. "
                     f"Evaluated 3D-lifted bounding extents and base footprint areas (cm^2, height cm): {footprint_info}. "
-                    f"Center-of-Mass stability reasoning: sorted stack order {task_spec.stack_order} from widest base support polygon "
-                    f"to smallest top object so vertical CoM projection stays strictly inside each support footprint. "
+                    f"Center-of-Mass stability reasoning: resolved stack order {task_spec.stack_order} from base support polygon "
+                    f"to top object so vertical CoM projection stays strictly inside each support footprint. "
                     f"Implicitly spawned 4-DoF parallel-jaw gripper and synthesized {len(task_spec.waypoints)} two-stage stacking waypoints."
                 )
             else:
@@ -356,10 +366,6 @@ class MuseSparkReasoner:
             objects=object_nodes,
             task=task_spec,
         )
-
-    # ------------------------------------------------------------------
-    # Task & Waypoint Synthesis
-    # ------------------------------------------------------------------
 
     def _infer_task_type(
         self,
@@ -409,7 +415,7 @@ class MuseSparkReasoner:
             return self._build_pick_place_task(geom, prompt)
 
     def _build_multi_stack_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
-        """Sort perceived objects by 3D base footprint area (w * d) for CoM stability and chain stacking waypoints."""
+        """Order perceived objects by user prompt and 3D base footprint area (w * d) for CoM stability."""
         candidates = [o for o in geom.objects if o.parent_id is None and not o.is_static]
         if len(candidates) < 2:
             candidates = [o for o in geom.objects if o.parent_id is None]
@@ -458,11 +464,9 @@ class MuseSparkReasoner:
         hz_1 = _object_half_height(obj_1)
         hz_2 = _object_half_height(obj_2)
 
-        # Center Z of obj_1 when resting on top of obj_0, and obj_2 when resting on top of obj_1
         z_center_1_on_0 = z0 + hz_0 + hz_1 + 0.002
         z_center_2_on_1 = z_center_1_on_0 + hz_1 + hz_2 + 0.002
 
-        # Mocap gripper Z offset above object center for parallel-jaw pinch (+0.027m)
         grasp_z1 = round(max(z1 + 0.026, 0.042), 4)
         place_z1 = round(z_center_1_on_0 + 0.025, 4)
 
@@ -507,7 +511,7 @@ class MuseSparkReasoner:
 
     def _build_pick_place_task(self, geom: LiftedSceneGeometry, prompt: str | None) -> TaskSpec:
         fallback_obj = geom.objects[0] if geom.objects else LiftedObject(
-            id="manipulated_object", label="manipulated object", primitive="box", size=[0.025, 0.025, 0.025], position=(0.0, 0.0, 0.026)
+            id="manipulated_object", label="manipulated object", primitive="box", size=[0.025, 0.025, 0.025], position=(0.15, 0.0, 0.026)
         )
         manipulated = next((o for o in geom.objects if not o.is_static and o.parent_id is None), fallback_obj)
         target_obj = next((o for o in geom.objects if o.is_static and o.id != manipulated.id), None)
@@ -594,7 +598,6 @@ class MuseSparkReasoner:
         manipulated = next((o for o in geom.objects if o.joint_type in ("slide", "hinge")), fallback_obj)
         target_delta = 0.10
 
-        # Waypoint 0 clears the cabinet roof (z=0.22 > 0.161) to y=-0.15 before lowering to the handle
         waypoints: list[tuple[float, float, float, float]] = [
             (0.0, -0.15, 0.22, 1.0),
             (0.0, -0.125, 0.105, 1.0),
@@ -613,29 +616,28 @@ class MuseSparkReasoner:
             waypoints=waypoints,
         )
 
-    # ------------------------------------------------------------------
-    # Material Prior Assignment
-    # ------------------------------------------------------------------
-
-    def _infer_material(self, label: str, object_id: str) -> str:
+    def _infer_material(
+        self,
+        label: str,
+        object_id: str,
+        rgba: tuple[float, float, float, float] | None = None,
+    ) -> str:
         text = f"{label} {object_id}".lower()
+        if rgba is not None and abs(rgba[0] - 0.52) < 0.05 and abs(rgba[1] - 0.50) < 0.05:
+            return "metal" 
         if any(k in text for k in ("wood", "wooden", "coaster", "cabinet", "drawer", "base_block")):
             return "wood"
         if any(k in text for k in ("metal", "steel", "handle", "iron", "obstacle", "gray", "grey", "silver")):
             return "metal"
-        if any(k in text for k in ("plastic", "cube", "cylinder", "mid_block", "top_block", "white", "green")):
-            return "plastic"
         if any(k in text for k in ("rubber", "pad", "marker", "mat")):
             return "rubber"
         if any(k in text for k in ("ceramic", "mug", "cup", "plate")):
             return "ceramic"
         if any(k in text for k in ("cardboard", "box", "package")):
             return "cardboard"
+        if any(k in text for k in ("plastic", "cube", "cylinder", "mid_block", "top_block", "white", "green")):
+            return "plastic"
         return "plastic"
-
-    # ------------------------------------------------------------------
-    # Meta Model API (Legacy Endpoint)
-    # ------------------------------------------------------------------
 
     def _call_spark_api(
         self,
@@ -643,9 +645,10 @@ class MuseSparkReasoner:
         prompt: str | None,
         task_type: str | None,
     ) -> SceneGraph:
-        """Call Muse Spark 1.2 API for unified reasoning."""
+        """Call Meta OpenAI-compatible Chat Completions API (https://api.meta.ai/v1/chat/completions)."""
         import httpx
 
+        local_sg = self._synthesize_local(geometry, prompt, task_type)
         api_url = os.environ.get("META_SPARK_API_URL", "https://api.meta.ai/v1/chat/completions")
         headers = {
             "Authorization": f"Bearer {self.meta_api_key}",
@@ -653,20 +656,17 @@ class MuseSparkReasoner:
         }
         payload = {
             "model": "muse-spark-1.2",
-            "tier": self.tier,
-            "scene_id": geometry.scene_id,
-            "task_prompt": prompt,
-            "task_type": task_type,
-            "objects": [
+            "messages": [
                 {
-                    "id": o.id,
-                    "label": o.label,
-                    "size": o.size,
-                    "position": o.position,
-                    "joint_type": o.joint_type,
-                }
-                for o in geometry.objects
+                    "role": "system",
+                    "content": "Return a valid WorldForge SceneGraph JSON object.",
+                },
+                {
+                    "role": "user",
+                    "content": json.dumps(local_sg.model_dump()),
+                },
             ],
+            "temperature": 0.2,
         }
 
         with httpx.Client(timeout=30.0) as client:
@@ -683,4 +683,10 @@ class MuseSparkReasoner:
                 model="muse_spark_1.2",
                 purpose="scene_graph_synthesis",
             )
-            return SceneGraph(**data)
+            if isinstance(data, dict) and "choices" in data and data["choices"]:
+                content = data["choices"][0].get("message", {}).get("content", "")
+                j0, j1 = content.find("{"), content.rfind("}")
+                if j0 != -1 and j1 != -1:
+                    return SceneGraph.model_validate(json.loads(content[j0 : j1 + 1]))
+                return local_sg
+            return SceneGraph.model_validate(data)

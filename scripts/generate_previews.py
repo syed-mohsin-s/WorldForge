@@ -1,5 +1,5 @@
 """
-Regenerate 4-second (120-frame @ 30 FPS) preview assets for all 3 golden scenes:
+Regenerate preview assets for all 3 golden scenes:
 - outputs/{scene_id}/frame0_masks.png (SAM 3.1 4px eroded masks)
 - outputs/{scene_id}/diff_overlay.png (Render + Diff IoU composite)
 - outputs/{scene_id}/oracle_rollout.mp4 (Pure Waypoint Oracle baseline)

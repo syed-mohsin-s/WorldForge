@@ -1551,7 +1551,7 @@ export function App() {
           if (ev.repair_diff) {
             setRepairDiff(ev.repair_diff);
           }
-          if (ev.repair_attempts) {
+          if (ev.repair_attempts && ev.repair_attempts > 1) {
             setSelfHealingRetries(ev.repair_attempts);
           }
         } else if (ev.stage === 'complete' && ev.summary) {
@@ -1568,7 +1568,7 @@ export function App() {
             });
           setLiveGateResults(ev.summary.gate_results);
           if (ev.summary.repair_diff) setRepairDiff(ev.summary.repair_diff);
-          if (ev.summary.repair_attempts) setSelfHealingRetries(ev.summary.repair_attempts);
+          if (ev.summary.repair_attempts && ev.summary.repair_attempts > 1) setSelfHealingRetries(ev.summary.repair_attempts);
           setCompletedStages([1, 2, 3, 4, 5, 6, 7, 8]);
           setActiveStage(null);
           setIsRunning(false);
@@ -1727,7 +1727,7 @@ export function App() {
               <span>Self-Healing Retries: {selfHealingRetries} / 4 (Gate 3 Fix In-Flight)</span>
             </div>
           )}
-          {!isRunning && (runResult?.self_healing_applied || selfHealingRetries > 0) && (
+          {!isRunning && ((runResult?.self_healing_applied && (runResult?.repairs_applied?.length ?? 0) > 0) || selfHealingRetries > 1) && (
             <div className="px-3 py-1.5 rounded-full bg-emerald-950/80 border border-emerald-600/80 text-emerald-200 font-mono font-semibold flex items-center gap-1.5 shadow-sm">
               <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
               <span>Self-Healing: Patched on Retry {runResult?.repair_attempts || selfHealingRetries} / 4 ✓</span>
@@ -1751,10 +1751,22 @@ export function App() {
           </div>
 
           {/* Mask IoU */}
-          <div className="px-3 py-1.5 rounded-full bg-emerald-950/40 border border-emerald-800/60 flex items-center gap-2 shadow-sm">
-            <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+          <div
+            className={`px-3 py-1.5 rounded-full flex items-center gap-2 shadow-sm ${
+              currentIoU >= 60
+                ? 'bg-emerald-950/40 border border-emerald-800/60'
+                : 'bg-red-950/60 border border-red-700/80'
+            }`}
+          >
+            {currentIoU >= 60 ? (
+              <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+            ) : (
+              <AlertTriangle className="h-3.5 w-3.5 text-red-400" />
+            )}
             <span className="text-zinc-400">IoU:</span>
-            <span className="font-mono font-bold text-emerald-300">{currentIoU}%</span>
+            <span className={`font-mono font-bold ${currentIoU >= 60 ? 'text-emerald-300' : 'text-red-300'}`}>
+              {currentIoU}%
+            </span>
           </div>
         </div>
       </header>
@@ -1821,7 +1833,7 @@ export function App() {
                   Self-Healing Loop in Flight (Gate 3 Retrying {selfHealingRetries}/4)...
                 </div>
               )}
-              {!isRunning && (runResult?.self_healing_applied || selfHealingRetries > 0) && (
+              {!isRunning && ((runResult?.self_healing_applied && (runResult?.repairs_applied?.length ?? 0) > 0) || selfHealingRetries > 1) && (
                 <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-600/70 text-emerald-300 text-[11px] font-mono">
                   <CheckCircle2 className="h-3 w-3 text-emerald-400" />
                   Self-Healing: Patched on Retry {runResult?.repair_attempts || selfHealingRetries} / 4 ✓
@@ -2094,7 +2106,7 @@ export function App() {
                     <Layers className="h-4 w-4 text-emerald-400" />
                     Stage 8: Render + Diff Mask IoU
                   </h2>
-                  <span className="text-[10px] font-mono text-emerald-400 font-bold">
+                  <span className={`text-[10px] font-mono font-bold ${currentIoU >= 60 ? 'text-emerald-400' : 'text-red-400'}`}>
                     {runResult?.scene_id === selectedSceneId
                       ? `${Math.round(runResult.render_diff.mean_iou * 1000) / 10}% IoU`
                       : selectedSceneId === 'scene1_pick_place'
@@ -2366,7 +2378,7 @@ export function App() {
                   { num: 2, name: 'Static Equilibrium', desc: '250 Steps · Resting Drift < 2mm' },
                   { num: 3, name: 'Reward Variance', desc: 'σ > 1e-4 · Non-Degenerate Reward' },
                   { num: 4, name: 'Waypoint Oracle', desc: 'Closed-Loop Success Nominal' },
-                  { num: 5, name: 'PPO Convergence', desc: 'Eval Mean Beats Random Baseline' },
+                  { num: 5, name: 'Oracle + Residual Smoke Test', desc: '512-Step Policy + Oracle Beats Random Baseline' },
                 ].map((g) => {
                   const gateInfo = liveGateResults[String(g.num)] ?? runResult?.gate_results?.[String(g.num)];
                   const isFailed = gateInfo?.passed === false;
@@ -2410,7 +2422,7 @@ export function App() {
               {/* Interactive Recharts Learning Curve */}
               <div className="p-3 rounded-xl bg-zinc-900 border border-zinc-800">
                 <div className="flex items-center justify-between text-xs mb-2">
-                  <span className="font-semibold text-zinc-300">PPO Learning Curve (Timesteps vs Return)</span>
+                  <span className="font-semibold text-zinc-300">Short PPO Smoke Test (Timesteps vs Return)</span>
                   <span className="text-[10px] font-mono text-emerald-400">
                     Mean: +{runResult ? runResult.ppo_results.eval_mean_return.toFixed(1) : '48.2'}
                   </span>

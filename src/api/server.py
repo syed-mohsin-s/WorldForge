@@ -34,7 +34,6 @@ import numpy as np
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.generated_reward import compute_reward
 from src.compiler.mjcf_builder import SceneCompiler
-from collections import OrderedDict
 from src.pipeline import (
     OUTPUTS_ROOT,
     SCENES_DIR,
@@ -50,6 +49,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _ALLOWED_VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mov", ".avi", ".mkv"})
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024  # 25 MB upload limit
 _SAFE_FILENAME_RE = re.compile(r"[^a-zA-Z0-9_.-]+")
 
 
@@ -141,7 +141,7 @@ class RunRequest(BaseModel):
 class SimActionRequest(BaseModel):
     """Real MuJoCo 3.17 simulation action request."""
     scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
-    session_id: str = Field(default="default", description="Client session ID for physics isolation")
+    session_id: str = Field(default="default", max_length=64, description="Client session identifier")
     action: tuple[float, float, float, float] = Field(
         default=(0.0, 0.0, 0.0, 1.0),
         description="4-DoF [dx, dy, dz, grip_cmd] action executed by MuJoCo 3.17 mocap weld",
@@ -151,12 +151,10 @@ class SimActionRequest(BaseModel):
 class SimResetRequest(BaseModel):
     """Real MuJoCo 3.17 simulation reset request."""
     scene_id: str = Field(default="scene1_pick_place", description="Target scene ID")
-    session_id: str = Field(default="default", description="Client session ID for physics isolation")
+    session_id: str = Field(default="default", max_length=64, description="Client session identifier")
 
 
-active_sim_sessions: OrderedDict[str, dict[str, Any]] = OrderedDict()
-_SIM_SESSIONS_LOCK = threading.Lock()
-_MAX_SIM_SESSIONS = 32
+active_sim_sessions: dict[str, dict[str, Any]] = {}
 
 
 def _resolve_safe_scene_path(scene_id: str, fallback_to_default: bool = False) -> tuple[str, Path]:
@@ -391,54 +389,47 @@ def get_scene(scene_id: str) -> dict[str, Any]:
 def sim_reset(req: SimResetRequest) -> dict[str, Any]:
     """Reset the live MuJoCo 3.17 simulation environment and return ground-truth state."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
+    sess_key = f"{req.session_id}:{clean_id}"
     sg = _load_scene_graph(clean_id)
-    session_key = f"{req.session_id}:{clean_id}"
-
-    with _SIM_SESSIONS_LOCK:
-        prev = active_sim_sessions.get(session_key)
+    prev = active_sim_sessions.get(sess_key)
+    lock = prev["lock"] if (prev and "lock" in prev) else threading.Lock()
+    with lock:
         if prev and "env" in prev:
             try:
                 prev["env"].close()
             except Exception:
                 pass
-
-        if len(active_sim_sessions) >= _MAX_SIM_SESSIONS and session_key not in active_sim_sessions:
-            _, oldest = active_sim_sessions.popitem(last=False)
-            if "env" in oldest:
+        if len(active_sim_sessions) >= 32 and sess_key not in active_sim_sessions:
+            oldest_key = next(iter(active_sim_sessions))
+            old_sess = active_sim_sessions.pop(oldest_key, None)
+            if old_sess and "env" in old_sess:
                 try:
-                    oldest["env"].close()
+                    old_sess["env"].close()
                 except Exception:
                     pass
-
-        lock = threading.Lock()
-        with lock:
-            env = WorldForgeEnv(sg)
-            env.reset(seed=42)
-            ctrl = OracleController(sg.task.waypoints)
-            active_sim_sessions[session_key] = {
-                "env": env,
-                "sg": sg,
-                "ctrl": ctrl,
-                "step": 0,
-                "grip_cmd": 1.0,
-                "lock": lock,
-            }
-            active_sim_sessions.move_to_end(session_key)
-            return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
+        env = WorldForgeEnv(sg)
+        env.reset(seed=42)
+        ctrl = OracleController(sg.task.waypoints)
+        active_sim_sessions[sess_key] = {
+            "env": env,
+            "sg": sg,
+            "ctrl": ctrl,
+            "step": 0,
+            "grip_cmd": 1.0,
+            "lock": lock,
+        }
+        return _extract_sim_state(env, sg, step=0, grip_cmd=1.0)
 
 
 @app.post("/api/sim/step")
 def sim_step(req: SimActionRequest) -> dict[str, Any]:
     """Execute a single real physics step in MuJoCo 3.17 with the given 4-DoF action."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
-    session_key = f"{req.session_id}:{clean_id}"
+    sess_key = f"{req.session_id}:{clean_id}"
+    if sess_key not in active_sim_sessions:
+        sim_reset(SimResetRequest(scene_id=clean_id, session_id=req.session_id))
 
-    with _SIM_SESSIONS_LOCK:
-        if session_key not in active_sim_sessions:
-            sim_reset(SimResetRequest(scene_id=clean_id, session_id=req.session_id))
-        session = active_sim_sessions[session_key]
-        active_sim_sessions.move_to_end(session_key)
-
+    session = active_sim_sessions[sess_key]
     with session["lock"]:
         env: WorldForgeEnv = session["env"]
         sg: SceneGraph = session["sg"]
@@ -455,14 +446,11 @@ def sim_step(req: SimActionRequest) -> dict[str, Any]:
 def sim_oracle_step(req: SimResetRequest) -> dict[str, Any]:
     """Step the deterministic Waypoint Oracle controller inside MuJoCo 3.17."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=True)
-    session_key = f"{req.session_id}:{clean_id}"
+    sess_key = f"{req.session_id}:{clean_id}"
+    if sess_key not in active_sim_sessions:
+        sim_reset(SimResetRequest(scene_id=clean_id, session_id=req.session_id))
 
-    with _SIM_SESSIONS_LOCK:
-        if session_key not in active_sim_sessions:
-            sim_reset(SimResetRequest(scene_id=clean_id, session_id=req.session_id))
-        session = active_sim_sessions[session_key]
-        active_sim_sessions.move_to_end(session_key)
-
+    session = active_sim_sessions[sess_key]
     with session["lock"]:
         env: WorldForgeEnv = session["env"]
         sg: SceneGraph = session["sg"]
@@ -515,11 +503,6 @@ def sim_trajectory(
 def run_pipeline(req: RunRequest) -> dict[str, Any]:
     """Execute the complete 8-stage pipeline synchronously and return all telemetry."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=False)
-    if req.video_path:
-        try:
-            validate_safe_video_path(req.video_path)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
     try:
         result = run_worldforge_pipeline(
             scene_id=clean_id,
@@ -550,11 +533,10 @@ def stream_pipeline_get(
 ):
     """Stream the 8-stage pipeline as Server-Sent Events (SSE)."""
     clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
-    if video_path:
-        try:
-            validate_safe_video_path(video_path)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        validate_safe_video_path(video_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StreamingResponse(
         stream_worldforge_pipeline(
             scene_id=clean_id,
@@ -577,11 +559,10 @@ def stream_pipeline_get(
 def stream_pipeline_post(req: RunRequest):
     """Stream the 8-stage pipeline via POST as Server-Sent Events (SSE)."""
     clean_id, _ = _resolve_safe_scene_path(req.scene_id, fallback_to_default=False)
-    if req.video_path:
-        try:
-            validate_safe_video_path(req.video_path)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        validate_safe_video_path(req.video_path)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return StreamingResponse(
         stream_worldforge_pipeline(
             scene_id=clean_id,
@@ -606,21 +587,57 @@ def export_gym_package(scene_id: str) -> Response:
     clean_id, _ = _resolve_safe_scene_path(scene_id, fallback_to_default=False)
     sg = _load_scene_graph(clean_id, fallback_to_default=False)
     out_dir = (OUTPUTS_ROOT / clean_id).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    mjcf_path = out_dir / "environment.xml"
-    if mjcf_path.exists():
-        mjcf_xml = mjcf_path.read_text(encoding="utf-8")
-    else:
-        mjcf_xml = SceneCompiler(sg).compile()
+    # Always compile fresh MJCF XML matching the exported SceneGraph
+    mjcf_xml = SceneCompiler(sg).compile()
+    (out_dir / "environment.xml").write_text(mjcf_xml, encoding="utf-8")
 
     reward_src_path = Path(__file__).resolve().parents[1] / "compiler" / "generated_reward.py"
     reward_code = reward_src_path.read_text(encoding="utf-8") if reward_src_path.exists() else ""
+
+    readme_md = f"""# WorldForge-RL Exported Gymnasium Package (`{sg.scene_id}`)
+
+Self-contained MuJoCo 3.x + Gymnasium reinforcement learning environment synthesized by **WorldForge Studio 2.0**.
+
+- **Scene ID**: `{sg.scene_id}`
+- **Task Type**: `{sg.task.task_type}`
+- **Task Description**: {sg.task.description}
+- **Stack Order (Base -> Top)**: `{sg.task.stack_order}`
+- **Max Episode Steps**: `400`
+- **Success Criterion**: Staged task completion + open gripper (`aperture > 0.045`) + 10 consecutive settled physics steps (`speed < 0.10 m/s`, `<= 1.8 cm` XY alignment).
+
+## Quickstart
+
+```bash
+pip install -r requirements.txt
+python run_standalone.py
+```
+
+## Using with `gymnasium.make`
+
+```python
+import gymnasium as gym
+import run_standalone  # registers WorldForge-{sg.scene_id}-v0
+
+env = gym.make("WorldForge-{sg.scene_id}-v0")
+obs, info = env.reset(seed=42)
+for _ in range(400):
+    obs, reward, terminated, truncated, info = env.step(env.action_space.sample())
+    if terminated or truncated:
+        break
+env.close()
+```
+"""
+
+    requirements_txt = "mujoco>=3.1.0\ngymnasium>=1.0.0\nnumpy>=1.26.0\n"
 
     standalone_runner = f'''"""Standalone WorldForge-RL Gymnasium Environment ({sg.scene_id})."""
 from __future__ import annotations
 
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -629,6 +646,10 @@ import mujoco
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from reward_code import compute_reward
 
 
 class WorldForgeStandaloneEnv(gym.Env):
@@ -643,11 +664,19 @@ class WorldForgeStandaloneEnv(gym.Env):
         render_mode: str | None = None,
         n_substeps: int = 10,
         max_delta_m: float = 0.02,
+        max_episode_steps: int = 400,
+        settle_steps_required: int = 10,
+        randomize_reset: bool = True,
     ) -> None:
         super().__init__()
         self.render_mode = render_mode
         self.n_substeps = n_substeps
         self.max_delta = max_delta_m
+        self.max_episode_steps = max_episode_steps
+        self.settle_steps_required = settle_steps_required
+        self.randomize_reset = randomize_reset
+        self._elapsed_steps = 0
+        self._settle_steps = 0
 
         with open(scene_json_path, "r", encoding="utf-8") as f:
             self.scene_data = json.load(f)
@@ -656,10 +685,15 @@ class WorldForgeStandaloneEnv(gym.Env):
         self.data = mujoco.MjData(self.model)
 
         self._obj_body_ids = []
+        self._free_qpos_addrs = []
         for obj in self.scene_data.get("objects", []):
             bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, obj["id"])
             if bid >= 0:
                 self._obj_body_ids.append(bid)
+            jname = f"{{obj['id']}}_free"
+            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
+            if jid >= 0:
+                self._free_qpos_addrs.append(int(self.model.jnt_qposadr[jid]))
 
         n_objs = len(self._obj_body_ids)
         obs_dim = 3 + 2 + 3 * n_objs + 6 * n_objs + 3
@@ -692,32 +726,40 @@ class WorldForgeStandaloneEnv(gym.Env):
         return np.concatenate(parts).astype(np.float32)
 
     def _compute_reward(self) -> tuple[float, bool, dict[str, Any]]:
-        task = self.scene_data.get("task", {{}})
-        obj_id = task.get("manipulated_object_id", "")
-        bid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, obj_id)
-        obj_pos = self.data.xpos[bid].copy() if bid >= 0 else np.zeros(3)
-        grip_pos = self.data.mocap_pos[self._mocap_id].copy()
-        d_reach = float(np.linalg.norm(grip_pos - obj_pos))
-        r_reach = 1.0 - math.tanh(4.0 * d_reach)
-
-        target = task.get("target_position")
-        if target is not None:
-            d_goal = float(np.linalg.norm(obj_pos - np.array(target, dtype=np.float64)))
-            r_goal = 1.0 - math.tanh(4.0 * d_goal)
-            terminated = d_goal < 0.04
-            reward = 0.3 * r_reach + 0.7 * r_goal + (10.0 if terminated else 0.0)
+        raw_reward, raw_term, info = compute_reward(self.model, self.data, self.scene_data)
+        if raw_term:
+            self._settle_steps += 1
         else:
-            terminated = False
-            reward = r_reach
-        return float(reward), bool(terminated), {{"d_reach": d_reach}}
+            self._settle_steps = 0
+
+        settled_term = bool(self._settle_steps >= self.settle_steps_required)
+        if raw_term and not settled_term:
+            # Hold back the +10.0 terminal bonus until the tower has remained settled for 10 steps
+            raw_reward -= 10.0
+
+        info["settle_steps"] = self._settle_steps
+        info["success"] = settled_term
+        info["is_success"] = settled_term
+        return float(raw_reward), settled_term, info
 
     def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
         super().reset(seed=seed)
+        self._elapsed_steps = 0
+        self._settle_steps = 0
         mujoco.mj_resetData(self.model, self.data)
+        deterministic = bool(options and options.get("deterministic", False))
+        if self.randomize_reset and not deterministic:
+            for qadr in self._free_qpos_addrs:
+                jitter_xy = self.np_random.uniform(-0.01, 0.01, size=2)
+                self.data.qpos[qadr : qadr + 2] += jitter_xy
         mujoco.mj_forward(self.model, self.data)
-        return self._obs(), {{}}
+        self.data.mocap_pos[self._mocap_id] = self.data.xpos[
+            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "gripper_base")
+        ].copy()
+        return self._obs(), {{"success": False, "is_success": False}}
 
     def step(self, action: np.ndarray):
+        self._elapsed_steps += 1
         action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
         self.data.mocap_pos[self._mocap_id] += action[:3] * self.max_delta
         grip_target = float((action[3] + 1.0) / 2.0 * 0.04)
@@ -727,7 +769,8 @@ class WorldForgeStandaloneEnv(gym.Env):
             mujoco.mj_step(self.model, self.data)
         obs = self._obs()
         reward, terminated, info = self._compute_reward()
-        return obs, reward, terminated, False, info
+        truncated = bool(self._elapsed_steps >= self.max_episode_steps)
+        return obs, reward, terminated, truncated, info
 
     def render(self) -> np.ndarray | None:
         if self.render_mode != "rgb_array":
@@ -745,18 +788,31 @@ class WorldForgeStandaloneEnv(gym.Env):
             self._renderer = None
 
 
+try:
+    gym.register(
+        id="WorldForge-{sg.scene_id}-v0",
+        entry_point="run_standalone:WorldForgeStandaloneEnv",
+        max_episode_steps=400,
+    )
+except Exception:
+    pass
+
+
 if __name__ == "__main__":
     env = WorldForgeStandaloneEnv()
     obs, _ = env.reset(seed=42)
     total_return = 0.0
+    success_count = 0
     for step in range(250):
         action = env.action_space.sample()
         obs, reward, terminated, truncated, info = env.step(action)
         total_return += reward
+        if info.get("success"):
+            success_count += 1
         if terminated or truncated:
             obs, _ = env.reset()
     env.close()
-    print(f"Simulated 250 Gymnasium steps of {sg.scene_id} (return={{total_return:.2f}})")
+    print(f"Simulated 250 Gymnasium steps of {sg.scene_id} (return={{total_return:.2f}}, successes={{success_count}})")
 '''
 
     buf = io.BytesIO()
@@ -765,6 +821,8 @@ if __name__ == "__main__":
         zf.writestr(f"{clean_id}/scene_graph.json", json.dumps(sg.model_dump(), indent=2))
         zf.writestr(f"{clean_id}/reward_code.py", reward_code)
         zf.writestr(f"{clean_id}/run_standalone.py", standalone_runner)
+        zf.writestr(f"{clean_id}/README.md", readme_md)
+        zf.writestr(f"{clean_id}/requirements.txt", requirements_txt)
         if (out_dir / "frame0_masks.png").exists():
             zf.write(out_dir / "frame0_masks.png", arcname=f"{clean_id}/frame0_masks.png")
         if (out_dir / "diff_overlay.png").exists():
@@ -813,22 +871,22 @@ async def upload_video(file: UploadFile = File(...)) -> dict[str, Any]:
     if dest_path.parent != uploads_dir:
         raise HTTPException(status_code=400, detail="Invalid upload filename")
 
-    max_bytes = 25 * 1024 * 1024  # 25 MB cap
     total_bytes = 0
+    chunk_size = 64 * 1024
     try:
         with open(dest_path, "wb") as buffer:
             while True:
-                chunk = await file.read(65536)
+                chunk = await file.read(chunk_size)
                 if not chunk:
                     break
                 total_bytes += len(chunk)
-                if total_bytes > max_bytes:
+                if total_bytes > _MAX_UPLOAD_BYTES:
                     raise HTTPException(
                         status_code=413,
-                        detail="File exceeds maximum allowed upload size of 25 MB",
+                        detail=f"Uploaded video exceeds maximum allowed size of {_MAX_UPLOAD_BYTES // (1024 * 1024)} MB.",
                     )
                 buffer.write(chunk)
-    except Exception:
+    except HTTPException:
         if dest_path.exists():
             try:
                 dest_path.unlink()

@@ -54,7 +54,7 @@ class ModalSandboxRunner:
 
     def is_cloud_available(self) -> bool:
         """Return True if Modal authentication token is present in the environment."""
-        return bool(os.environ.get("MODAL_TOKEN_ID")) and os.environ.get("MODAL_REMOTE_EXEC", "").lower() in ("1", "true", "yes")
+        return bool(os.environ.get("MODAL_TOKEN_ID"))
 
     def _check_budget(self) -> None:
         """Check if total spent exceeds max_budget_usd; raise BudgetExceededError if so."""

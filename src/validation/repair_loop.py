@@ -172,10 +172,33 @@ _FORBIDDEN_NAMES = frozenset({
 })
 
 _FORBIDDEN_ATTRS = frozenset({
-    "format", "format_map", "load", "loads", "save", "savez", "savez_compressed",
-    "savetxt", "loadtxt", "genfromtxt", "fromregex", "fromfile", "tofile",
-    "memmap", "DataSource", "ctypeslib", "f2py", "testing", "distutils", "lib",
-    "pickle", "allow_pickle", "system", "popen", "spawn", "exec", "eval",
+    "format",
+    "format_map",
+    "load",
+    "loads",
+    "save",
+    "savez",
+    "savez_compressed",
+    "savetxt",
+    "loadtxt",
+    "genfromtxt",
+    "fromregex",
+    "fromfile",
+    "tofile",
+    "memmap",
+    "DataSource",
+    "ctypeslib",
+    "f2py",
+    "testing",
+    "distutils",
+    "lib",
+    "pickle",
+    "allow_pickle",
+    "system",
+    "popen",
+    "spawn",
+    "exec",
+    "eval",
 })
 
 _SAFE_BUILTINS: dict[str, Any] = {
@@ -190,7 +213,6 @@ _SAFE_BUILTINS: dict[str, Any] = {
     "float": float,
     "int": int,
     "bool": bool,
-    "str": str,
     "dict": dict,
     "list": list,
     "tuple": tuple,
@@ -203,69 +225,6 @@ _SAFE_BUILTINS: dict[str, Any] = {
     "False": False,
     "None": None,
 }
-
-
-def _extract_python_code(raw_reply: str) -> str:
-    """Extract Python source code from a raw or markdown-fenced LLM reply."""
-    text = raw_reply.strip()
-    if "&lt;think&gt;" in text and "&lt;/think&gt;" in text:
-        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
-
-    fence_match = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
-    if fence_match:
-        return fence_match.group(1).strip()
-
-    if text.startswith("```") and text.endswith("```"):
-        lines = text.splitlines()
-        return "\n".join(lines[1:-1]).strip()
-
-    return text
-
-
-def _validate_safe_reward_ast(tree: ast.AST) -> None:
-    """Validate that an AST contains only safe numeric/reward computation nodes."""
-    has_compute_reward = False
-    for node in ast.walk(tree):
-        if isinstance(node, _FORBIDDEN_AST_NODES):
-            raise ValueError(f"Disallowed AST construct in synthesized reward: {type(node).__name__}")
-        if isinstance(node, ast.FunctionDef) and node.name == "compute_reward":
-            has_compute_reward = True
-        if isinstance(node, ast.Name):
-            if node.id in _FORBIDDEN_NAMES or node.id.startswith("__"):
-                raise ValueError(f"Disallowed identifier '{node.id}' in synthesized reward")
-        if isinstance(node, ast.Attribute):
-            if node.attr.startswith("_") or node.attr in _FORBIDDEN_ATTRS:
-                raise ValueError(f"Disallowed attribute access '.{node.attr}' in synthesized reward")
-    if not has_compute_reward:
-        raise ValueError("Synthesized code must define `def compute_reward(model, data, scene):`")
-
-
-def _verify_reward_in_scrubbed_subprocess(candidate_code: str) -> None:
-    """Run candidate code in an isolated subprocess with sanitized environment to catch syntax or sandbox breaches."""
-    import subprocess
-    import sys
-
-    # Strip any sensitive keys (BASETEN, META, OPENAI, MODAL, etc.) from env
-    scrubbed_env = {
-        k: v for k, v in os.environ.items()
-        if not any(token in k.upper() for token in ("KEY", "SECRET", "TOKEN", "AUTH", "PASS"))
-    }
-    verify_script = (
-        "import ast, sys\n"
-        "code = sys.stdin.read()\n"
-        "tree = ast.parse(code, mode='exec')\n"
-        "compile(tree, '<test>', 'exec')\n"
-    )
-    res = subprocess.run(
-        [sys.executable, "-I", "-c", verify_script],
-        input=candidate_code,
-        text=True,
-        capture_output=True,
-        env=scrubbed_env,
-        timeout=5.0,
-    )
-    if res.returncode != 0:
-        raise ValueError(f"Reward code verification failed in scrubbed subprocess: {res.stderr.strip()}")
 
 
 def _build_scrubbed_proxies() -> tuple[Any, Any, Any]:
@@ -326,13 +285,21 @@ def _build_scrubbed_proxies() -> tuple[Any, Any, Any]:
         isfinite=np.isfinite,
         float64=np.float64,
         float32=np.float32,
-        ndarray=np.ndarray,
         pi=float(math.pi),
     )
     safe_math = types.SimpleNamespace(
-        tanh=math.tanh, sqrt=math.sqrt, exp=math.exp, log=math.log,
-        sin=math.sin, cos=math.cos, acos=math.acos, atan2=math.atan2,
-        fabs=math.fabs, hypot=math.hypot, isfinite=math.isfinite, isnan=math.isnan,
+        tanh=math.tanh,
+        sqrt=math.sqrt,
+        exp=math.exp,
+        log=math.log,
+        sin=math.sin,
+        cos=math.cos,
+        acos=math.acos,
+        atan2=math.atan2,
+        fabs=math.fabs,
+        hypot=math.hypot,
+        isfinite=math.isfinite,
+        isnan=math.isnan,
         pi=float(math.pi),
     )
     mjt_obj = getattr(mujoco, "mjtObj", None)
@@ -343,17 +310,212 @@ def _build_scrubbed_proxies() -> tuple[Any, Any, Any]:
     return safe_math, safe_np, safe_mujoco
 
 
+def _extract_python_code(raw_reply: str) -> str:
+    """Extract Python source code from a raw or markdown-fenced LLM reply."""
+    text = raw_reply.strip()
+    if "<think>" in text and "</think>" in text:
+        text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    fence_match = re.search(r"```(?:python|py)?\s*\n(.*?)```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fence_match:
+        return fence_match.group(1).strip()
+
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        return "\n".join(lines[1:-1]).strip()
+
+    return text
+
+
+def _validate_safe_reward_ast(tree: ast.AST) -> None:
+    """Validate that an AST contains only safe numeric/reward computation nodes."""
+    has_compute_reward = False
+    for node in ast.walk(tree):
+        if isinstance(node, _FORBIDDEN_AST_NODES):
+            raise ValueError(f"Disallowed AST construct in synthesized reward: {type(node).__name__}")
+        if isinstance(node, ast.FunctionDef) and node.name == "compute_reward":
+            has_compute_reward = True
+        if isinstance(node, ast.Name):
+            if node.id in _FORBIDDEN_NAMES or node.id.startswith("__"):
+                raise ValueError(f"Disallowed identifier '{node.id}' in synthesized reward")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("_") or node.attr in _FORBIDDEN_ATTRS:
+                raise ValueError(f"Disallowed attribute access '.{node.attr}' in synthesized reward")
+        if isinstance(node, ast.Call):
+            for kw in node.keywords:
+                if kw.arg == "allow_pickle" or (kw.arg and kw.arg.startswith("_")):
+                    raise ValueError(f"Disallowed keyword argument '{kw.arg}' in synthesized reward")
+    if not has_compute_reward:
+        raise ValueError("Synthesized code must define `def compute_reward(model, data, scene):`")
+
+
+# Maximum wall-clock seconds a single synthesized compute_reward() call may run.
+_REWARD_CALL_TIMEOUT_S = 5.0
+
+
+class RewardTimeoutError(RuntimeError):
+    """Raised when a synthesized compute_reward call exceeds _REWARD_CALL_TIMEOUT_S."""
+    pass
+
+
+def _verify_reward_in_scrubbed_subprocess(candidate_code: str) -> None:
+    """Compile and smoke-test candidate reward code in an out-of-process subprocess with a scrubbed environment."""
+    import subprocess
+    import sys
+
+    scrubbed_env: dict[str, str] = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+    for safe_key in ("SYSTEMROOT", "LD_LIBRARY_PATH"):
+        if safe_key in os.environ:
+            scrubbed_env[safe_key] = os.environ[safe_key]
+
+    check_lines = [
+        "import ast, math, os, signal, sys, types, numpy as _np",
+        "assert 'BASETEN_API_KEY' not in os.environ and 'META_API_KEY' not in os.environ",
+        "if hasattr(signal, 'SIGALRM') and hasattr(signal, 'setitimer'):",
+        "    signal.signal(signal.SIGALRM, lambda s, f: (_ for _ in ()).throw(TimeoutError('compute_reward timed out')))",
+        "    signal.setitimer(signal.ITIMER_REAL, 2.5)",
+        "code = sys.stdin.read()",
+        "tree = ast.parse(code, mode='exec')",
+        "safe_linalg = types.SimpleNamespace(norm=lambda x, axis=None: float(_np.linalg.norm(_np.asarray(x, dtype=_np.float64), axis=axis)))",
+        "safe_np = types.SimpleNamespace(array=lambda x, dtype=_np.float64: _np.asarray(x, dtype=_np.float64), asarray=lambda x, dtype=_np.float64: _np.asarray(x, dtype=_np.float64), clip=_np.clip, linalg=safe_linalg, mean=_np.mean, sum=_np.sum, min=_np.min, max=_np.max, dot=_np.dot, zeros=_np.zeros, ones=_np.ones, tanh=_np.tanh, sqrt=_np.sqrt, exp=_np.exp, abs=_np.abs, minimum=_np.minimum, maximum=_np.maximum, hypot=_np.hypot, isfinite=_np.isfinite, float64=_np.float64, float32=_np.float32, pi=float(math.pi))",
+        "safe_math = types.SimpleNamespace(tanh=math.tanh, sqrt=math.sqrt, exp=math.exp, log=math.log, sin=math.sin, cos=math.cos, acos=math.acos, atan2=math.atan2, fabs=math.fabs, hypot=math.hypot, isfinite=math.isfinite, isnan=math.isnan, pi=float(math.pi))",
+        "safe_mj = types.SimpleNamespace(mj_name2id=lambda m, t, n: 1, mjtObj=types.SimpleNamespace(mjOBJ_BODY=1, mjOBJ_SITE=6, mjOBJ_JOINT=3, mjOBJ_GEOM=5))",
+        "ns = {'__builtins__': {'abs': abs, 'min': min, 'max': max, 'sum': sum, 'len': len, 'range': range, 'enumerate': enumerate, 'zip': zip, 'float': float, 'int': int, 'bool': bool, 'dict': dict, 'list': list, 'tuple': tuple, 'set': set, 'round': round, 'isinstance': isinstance, 'any': any, 'all': all, 'True': True, 'False': False, 'None': None}, 'math': safe_math, 'np': safe_np, 'mujoco': safe_mj}",
+        "exec(compile(tree, '<sandbox_subproc>', 'exec'), ns, ns)",
+        "fn = ns.get('compute_reward')",
+        "assert callable(fn)",
+        "dummy_model = types.SimpleNamespace(jnt_qposadr=_np.zeros(8, dtype=int), jnt_range=_np.tile([-1.0, 1.0], (8, 1)))",
+        "dummy_data = types.SimpleNamespace(xpos=_np.zeros((8, 3)), site_xpos=_np.zeros((8, 3)), mocap_pos=_np.zeros((4, 3)), qpos=_np.zeros(16), qvel=_np.zeros(16), cvel=_np.zeros((8, 6)), ctrl=_np.zeros(8), time=0.0)",
+        "dummy_obj = types.SimpleNamespace(id='obj_0', size=[0.03, 0.03, 0.03], is_static=False)",
+        "dummy_task = types.SimpleNamespace(task_type='pick_and_place', target_object_id='obj_0', goal_pos=[0.1, 0.0, 0.03], stack_order=['obj_0', 'obj_1', 'obj_2'])",
+        "dummy_scene = types.SimpleNamespace(objects=[dummy_obj, dummy_obj, dummy_obj], task=dummy_task, table_z=0.0)",
+        "try:",
+        "    res = fn(dummy_model, dummy_data, dummy_scene)",
+        "    assert isinstance(res, tuple) and len(res) == 3",
+        "except (AttributeError, KeyError, IndexError, TypeError):",
+        "    pass",
+    ]
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", "\n".join(check_lines)],
+            input=candidate_code,
+            env=scrubbed_env,
+            capture_output=True,
+            text=True,
+            timeout=_REWARD_CALL_TIMEOUT_S,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RewardTimeoutError(
+            f"Synthesized compute_reward exceeded {_REWARD_CALL_TIMEOUT_S:.1f}s subprocess timeout"
+        ) from exc
+    if proc.returncode != 0:
+        if "TimeoutError" in (proc.stderr or ""):
+            raise RewardTimeoutError(
+                "Synthesized compute_reward timed out under SIGALRM in subprocess sandbox"
+            )
+        raise ValueError("Subprocess sandbox validation rejected synthesized reward code")
+
+
+class _TimeoutRewardWrapper:
+    """Wraps a synthesized compute_reward function with a hard per-call timeout.
+
+    * On the POSIX main thread, enforces the deadline via ``signal.SIGALRM`` /
+      ``signal.setitimer(signal.ITIMER_REAL, timeout)`` so infinite loops inside
+      ``compute_reward(model, data, scene)`` are immediately interrupted in-place
+      without leaving a runaway background thread.
+    * When invoked from a worker thread (or on Windows where ``SIGALRM`` is
+      unavailable), uses a daemon thread + ``threading.Event`` deadline and
+      latches ``_permanently_timed_out = True`` on the first timeout so subsequent
+      simulation steps return ``(-1.0, False, {"timeout": True})`` immediately.
+    """
+
+    __slots__ = ("_fn", "_timeout", "_violation_count", "_permanently_timed_out")
+
+    def __init__(self, fn: Callable, timeout: float = _REWARD_CALL_TIMEOUT_S) -> None:
+        self._fn = fn
+        self._timeout = timeout
+        self._violation_count = 0
+        self._permanently_timed_out = False
+
+    def __call__(self, model: Any, data: Any, scene: Any) -> tuple[float, bool, dict[str, Any]]:
+        if self._permanently_timed_out:
+            return -1.0, False, {"timeout": True}
+
+        import signal as _sig
+        import threading as _th
+
+        can_use_sigalrm = (
+            hasattr(_sig, "SIGALRM")
+            and hasattr(_sig, "setitimer")
+            and _th.current_thread() is _th.main_thread()
+        )
+        if can_use_sigalrm:
+            def _alarm_handler(signum: int, frame: Any) -> None:
+                raise RewardTimeoutError(f"compute_reward exceeded {self._timeout:.1f}s timeout")
+
+            prev_handler = _sig.getsignal(_sig.SIGALRM)
+            try:
+                _sig.signal(_sig.SIGALRM, _alarm_handler)
+                _sig.setitimer(_sig.ITIMER_REAL, self._timeout)
+                return self._fn(model, data, scene)
+            except RewardTimeoutError:
+                self._violation_count += 1
+                self._permanently_timed_out = True
+                logger.warning(
+                    "Synthesized compute_reward exceeded %.1fs SIGALRM timeout (violation #%d); "
+                    "returning penalty reward.",
+                    self._timeout,
+                    self._violation_count,
+                )
+                return -1.0, False, {"timeout": True}
+            finally:
+                _sig.setitimer(_sig.ITIMER_REAL, 0.0)
+                _sig.signal(_sig.SIGALRM, prev_handler)
+
+        result_box: list[tuple[float, bool, dict[str, Any]]] = []
+        error_box: list[BaseException] = []
+        done = _th.Event()
+
+        def _target() -> None:
+            try:
+                result_box.append(self._fn(model, data, scene))
+            except BaseException as exc:
+                error_box.append(exc)
+            finally:
+                done.set()
+
+        worker = _th.Thread(target=_target, daemon=True)
+        worker.start()
+
+        if done.wait(timeout=self._timeout):
+            if error_box:
+                raise error_box[0]
+            return result_box[0]
+        else:
+            self._violation_count += 1
+            self._permanently_timed_out = True
+            logger.warning(
+                "Synthesized compute_reward exceeded %.1fs timeout (violation #%d); "
+                "returning penalty reward.",
+                self._timeout,
+                self._violation_count,
+            )
+            return -1.0, False, {"timeout": True}
+
+
 def _compile_safe_reward_fn(raw_reply: str) -> tuple[Callable, str]:
-    """Strip markdown fences, AST-validate, and compile a restricted reward function."""
+    """Strip markdown fences, AST-validate, verify in a scrubbed subprocess, and compile with proxy namespaces."""
     candidate_code = _extract_python_code(raw_reply)
     tree = ast.parse(candidate_code, mode="exec")
     _validate_safe_reward_ast(tree)
-
     _verify_reward_in_scrubbed_subprocess(candidate_code)
 
-    safe_math, safe_np, safe_mujoco = _build_scrubbed_proxies()
-
     code_obj = compile(tree, filename="<synthesized_reward>", mode="exec")
+    safe_math, safe_np, safe_mujoco = _build_scrubbed_proxies()
     safe_ns: dict[str, Any] = {
         "__builtins__": dict(_SAFE_BUILTINS),
         "math": safe_math,
@@ -364,7 +526,7 @@ def _compile_safe_reward_fn(raw_reply: str) -> tuple[Callable, str]:
     fn = safe_ns.get("compute_reward")
     if not callable(fn):
         raise ValueError("Compiled namespace did not produce a callable `compute_reward`")
-    return fn, candidate_code
+    return _TimeoutRewardWrapper(fn, timeout=_REWARD_CALL_TIMEOUT_S), candidate_code
 
 
 # ─── Repair Strategies ────────────────────────────────────────────────
@@ -432,19 +594,19 @@ _DETERMINISTIC_REPAIRS: dict[int, RepairFn] = {
 def _build_unified_diff(
     before_src: str,
     after_src: str,
-    fromfile: str = "before",
-    tofile: str = "after",
-    from_label: str | None = None,
-    to_label: str | None = None,
+    from_label: str = "before",
+    to_label: str = "after",
+    fromfile: str | None = None,
+    tofile: str | None = None,
 ) -> str:
-    from_name = from_label if from_label is not None else fromfile
-    to_name = to_label if to_label is not None else tofile
+    fl = fromfile if fromfile is not None else from_label
+    tl = tofile if tofile is not None else to_label
     return "".join(
         difflib.unified_diff(
             before_src.splitlines(keepends=True),
             after_src.splitlines(keepends=True),
-            fromfile=from_name,
-            tofile=to_name,
+            fromfile=fl,
+            tofile=tl,
         )
     )
 

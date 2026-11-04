@@ -1,15 +1,4 @@
-"""WorldForge Master 8-Stage Orchestration Pipeline.
-
-Wires all 8 stages end-to-end:
-  Stage 1: SAM 3.1 Video Segmentation & Multi-Object Mask Tracking
-  Stage 2: 3D Metric Lifting (RANSAC Tabletop Plane + Eroded Depth Backprojection / Ray-Plane Homography + SVD Axis Fit)
-  Stage 3: Muse Spark Unified Reasoning (Baseten meta-models/muse-spark-open-1026 or Meta API)
-  Stage 4: Pydantic V2 SceneGraph Validation & Physical Grounding
-  Stage 5: Deterministic MJCF Compiler (MuJoCo 3.17 XML Synthesis)
-  Stage 6: Dense Multi-Stage Reward Code Synthesis
-  Stage 7: 5-Gate Verification Suite + Self-Healing Repair Loop
-  Stage 8: Render + Diff Visual Alignment (SAM Mask IoU + Closed-Loop Coordinate Refinement)
-"""
+"""WorldForge Master 8-Stage Orchestration Pipeline."""
 
 from __future__ import annotations
 
@@ -40,7 +29,7 @@ from src.perception.sam_tracker import (
 )
 from src.perception.spark_reasoner import MuseSparkReasoner
 from src.render_diff.mask_iou import (
-    MaskDiffReport,
+    RenderDiffReport,
     _create_overlay_image,
     compute_scene_mask_iou,
     evaluate_and_align_sim,
@@ -56,51 +45,34 @@ SCENES_DIR = PROJECT_ROOT / "configs" / "scenes"
 OUTPUTS_ROOT = PROJECT_ROOT / "outputs"
 
 _SAFE_SCENE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
-
-import tempfile
-
-_ALLOWED_VIDEO_EXTENSIONS = frozenset({".mp4", ".webm", ".mov", ".avi", ".mkv"})
+_ALLOWED_VIDEO_EXTS = frozenset({".mp4", ".webm", ".mov", ".avi", ".mkv"})
 
 
-def validate_safe_video_path(video_path: str | Path | None) -> Path | None:
-    """Validate that video_path is a legitimate video file confined to safe project or temp directories."""
-    if not video_path:
+def validate_safe_video_path(video_path: str | None) -> Path | None:
+    """Validate that a user-supplied video_path has a safe video extension and is inside allowed roots."""
+    if not video_path or not str(video_path).strip():
         return None
+    import tempfile
 
-    path_str = str(video_path).strip()
-    if not path_str:
-        return None
+    s_path = str(video_path).strip()
+    if ".." in Path(s_path).parts or ".." in s_path:
+        raise ValueError(f"Invalid video_path '{video_path}': path traversal ('..') is not allowed")
 
-    parts = Path(path_str).parts
-    if ".." in parts:
-        raise ValueError(f"Path traversal detected in video_path: {path_str!r}")
-
-    p = Path(path_str).resolve()
-    ext = p.suffix.lower()
-    if ext not in _ALLOWED_VIDEO_EXTENSIONS:
+    raw = Path(s_path)
+    if raw.suffix.lower() not in _ALLOWED_VIDEO_EXTS:
         raise ValueError(
-            f"Invalid video extension '{ext}'. Only video files ({sorted(_ALLOWED_VIDEO_EXTENSIONS)}) are allowed."
+            f"Invalid video_path '{video_path}': unsupported extension '{raw.suffix}'. "
+            f"Allowed extensions: {sorted(_ALLOWED_VIDEO_EXTS)}"
         )
-
-    allowed_roots = [
+    resolved = raw.resolve()
+    allowed_roots = (
         OUTPUTS_ROOT.resolve(),
         PROJECT_ROOT.resolve(),
         Path(tempfile.gettempdir()).resolve(),
-    ]
-    is_safe = False
-    for root in allowed_roots:
-        try:
-            p.relative_to(root)
-            is_safe = True
-            break
-        except ValueError:
-            continue
-
-    if not is_safe:
-        raise ValueError(f"video_path {path_str!r} is outside allowed directories.")
-
-    return p
-
+    )
+    if not any(resolved == root or root in resolved.parents for root in allowed_roots):
+        raise ValueError(f"Invalid video_path '{video_path}': path must reside inside workspace outputs/uploads")
+    return resolved
 
 
 @dataclass
@@ -132,7 +104,7 @@ def sanitize_scene_id(scene_id_or_file: str) -> str:
 
 
 def _load_golden_scene(scene_id_or_file: str) -> tuple[SceneGraph, Path]:
-    """Load one of the 3 golden SceneGraph JSON configs with strict path confinement."""
+    """Load one of the golden SceneGraph JSON configs with strict path confinement."""
     clean_id = sanitize_scene_id(scene_id_or_file)
     scenes_root = SCENES_DIR.resolve()
     candidate = (SCENES_DIR / f"{clean_id}.json").resolve()
@@ -198,12 +170,7 @@ def _save_diff_overlay(
     target_rgb: np.ndarray | None = None,
     sim_rgb: np.ndarray | None = None,
 ) -> str:
-    """Render per-object visual mask overlap between reference Frame 0 and compiled MuJoCo render.
-
-    Green (16, 185, 129): Per-object Aligned (Ref_k ∩ Sim_k)
-    Red   (239, 68, 68):  Video/Ref Only (Ref_k \\ Sim_k)
-    Blue  (59, 130, 246): Sim Only (Sim_k \\ Ref_k)
-    """
+    """Render per-object visual mask overlap between reference Frame 0 and compiled MuJoCo render."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
     sample = next(iter(ref_masks.values()), next(iter(sim_masks.values()), np.zeros((480, 640), dtype=bool)))
     h, w = sample.shape[:2]
@@ -238,9 +205,9 @@ def _save_diff_overlay(
         ref_only |= (rm & ~sm)
         sim_only |= (sm & ~rm)
 
-    canvas[ref_only] = (239, 68, 68)   # Red: reference/video only
-    canvas[sim_only] = (59, 130, 246)  # Blue: sim only
-    canvas[overlap] = (16, 185, 129)   # Emerald green: aligned
+    canvas[ref_only] = (239, 68, 68)
+    canvas[sim_only] = (59, 130, 246)
+    canvas[overlap] = (16, 185, 129)
 
     bgr = cv2.cvtColor(canvas, cv2.COLOR_RGB2BGR)
     cv2.imwrite(str(out_path), bgr)
@@ -253,13 +220,7 @@ def _ground_reconstructed_scene_graph(
     reasoner: MuseSparkReasoner,
     task_prompt: str | None,
 ) -> SceneGraph:
-    """Build the Stage 4 validated SceneGraph from Stage 2–3 reconstructed geometry.
-
-    Uses ``synthesized_sg``'s lifted/reasoned objects (positions, sizes, primitives,
-    materials, joints) as the primary source of truth. If a monocular video occluded
-    secondary static targets or articulated child parts present in ``ref_sg``, backfills
-    only the missing nodes and recomputes oracle waypoints for the reconstructed layout.
-    """
+    """Build the Stage 4 validated SceneGraph from Stage 2–3 reconstructed geometry."""
     if synthesized_sg is None or not synthesized_sg.objects:
         return ref_sg.model_copy(deep=True)
 
@@ -269,9 +230,7 @@ def _ground_reconstructed_scene_graph(
 
     for s_obj in synthesized_sg.objects:
         r_obj = ref_by_id.get(s_obj.id)
-        # Preserve explicit RGBA overrides from reference or inferred color
         rgba = s_obj.rgba or (r_obj.rgba if r_obj else None)
-        # For articulated child bodies whose parent is in the scene, preserve kinematic joint linkage
         if r_obj and r_obj.parent_id is not None and s_obj.parent_id is None:
             reconstructed_objs.append(r_obj.model_copy(deep=True))
         else:
@@ -280,14 +239,12 @@ def _ground_reconstructed_scene_graph(
             reconstructed_objs.append(node)
         seen_ids.add(s_obj.id)
 
-    # Backfill any occluded objects from ref_sg so task references remain valid
     if synthesized_sg.task.task_type != "multi_stack":
         for r_obj in ref_sg.objects:
             if r_obj.id not in seen_ids:
                 reconstructed_objs.append(r_obj.model_copy(deep=True))
                 seen_ids.add(r_obj.id)
 
-    # Recompute task spec & oracle waypoints directly from the reconstructed object positions
     lifted_for_task = LiftedSceneGeometry(
         scene_id=ref_sg.scene_id,
         table_z=synthesized_sg.table_z,
@@ -317,6 +274,11 @@ def _ground_reconstructed_scene_graph(
         if synthesized_sg.task.task_type == "multi_stack"
         else ref_sg.task.task_type
     )
+    if effective_task_type == "multi_stack" and synthesized_sg.task.stack_order:
+        order_index = {oid: i for i, oid in enumerate(synthesized_sg.task.stack_order)}
+        for i, l_obj in enumerate(lifted_for_task.objects):
+            rank = order_index.get(l_obj.id, i)
+            l_obj.mask_area_px = (10 - rank) * 10000
     reconstructed_task = reasoner._synthesize_task_spec(
         lifted_for_task,
         effective_task_type,
@@ -328,7 +290,7 @@ def _ground_reconstructed_scene_graph(
     return SceneGraph(
         scene_id=ref_sg.scene_id,
         table_z=synthesized_sg.table_z,
-        camera=ref_sg.camera,
+        camera=synthesized_sg.camera or ref_sg.camera,
         objects=reconstructed_objs,
         task=reconstructed_task,
     )
@@ -345,10 +307,6 @@ def run_worldforge_pipeline(
     on_stage_event: Callable[[Any], None] | None = None,
 ) -> dict[str, Any]:
     """Execute the complete 8-stage WorldForge pipeline and return rich telemetry."""
-    if video_path:
-        safe_vp = validate_safe_video_path(video_path)
-        video_path = str(safe_vp) if safe_vp else None
-
     t_pipeline_start = time.time()
     cost_tracker = CostTracker(pricing_tier="contributor")
     stage_timings: dict[str, float] = {}
@@ -388,7 +346,10 @@ def run_worldforge_pipeline(
     )
     prompts = [o.label for o in ref_sg.objects]
     object_ids: list[str] | None = [o.id for o in ref_sg.objects]
-    has_video_input = bool(video_path and Path(video_path).exists())
+    validated_video = validate_safe_video_path(video_path)
+    has_video_input = bool(validated_video and validated_video.exists())
+    if has_video_input:
+        video_path = str(validated_video)
 
     if has_video_input:
         cam_w, cam_h = ref_sg.camera.resolution
@@ -408,29 +369,19 @@ def run_worldforge_pipeline(
             target_size=(cam_w, cam_h),
             object_ids=video_obj_ids,
         )
-        if (
-            not sam_result
-            or not sam_result.tracks
-            or len(sam_result.tracks) < len(ref_sg.objects)
-            or getattr(sam_result, "sam_provider_used", "").startswith("opencv")
-        ):
+        if not sam_result or not sam_result.tracks:
             sam_result, _ = tracker.segment_from_sim_env(ref_env, ref_sg)
         else:
             if sam_result.frame0_rgb is not None:
                 frame0_rgb = sam_result.frame0_rgb
-    elif tracker.has_configured_backend() and provider != "local":
+    elif tracker.has_configured_backend():
         sam_result = tracker.segment_image(
             frame0_rgb,
             text_prompts=prompts,
             scene_id=ref_sg.scene_id,
             object_ids=object_ids,
         )
-        if (
-            not sam_result
-            or not sam_result.tracks
-            or len(sam_result.tracks) < len(ref_sg.objects)
-            or getattr(sam_result, "sam_provider_used", "").startswith("opencv")
-        ):
+        if not sam_result or not sam_result.tracks:
             sam_result, _ = tracker.segment_from_sim_env(ref_env, ref_sg)
         else:
             _, sim_depth_fallback = tracker.segment_from_sim_env(ref_env, ref_sg)
@@ -521,17 +472,18 @@ def run_worldforge_pipeline(
         reasoner=reasoner,
         task_prompt=task_prompt,
     )
-    # Run coordinate alignment against Frame 0 masks BEFORE compiling and recording rollouts
-    # so any single-view depth centroid offset is corrected prior to Stage 7 execution.
+
     if has_video_input and validated_sg.task.task_type == "multi_stack":
-        pre_diff_report = MaskDiffReport(
-            scene_id=validated_sg.scene_id,
-            mean_iou=1.0,
+        # For close-up real videos with A4 scale normalization, preserve the workspace-centered
+        # 3D stacking coordinates rather than shifting against the distant golden camera.
+        pre_diff_report = RenderDiffReport(
             per_object_iou={o.id: 1.0 for o in validated_sg.objects},
-            passed=True,
+            mean_iou=1.0,
+            initial_mean_iou=1.0,
             refined=False,
             iterations_used=0,
-            initial_mean_iou=1.0,
+            overlay_image=frame0_rgb,
+            passed=True,
         )
     else:
         pre_aligned_sg, pre_diff_report = evaluate_and_align_sim(
@@ -586,18 +538,19 @@ def run_worldforge_pipeline(
 
     reward_file = PROJECT_ROOT / "src" / "compiler" / "generated_reward.py"
     raw_reward_source = reward_file.read_text(encoding="utf-8")
-    if validated_sg.task.task_type == "multi_stack":
-        header_banner = (
-            f"# ═══════════════════════════════════════════════════════════════════════\n"
-            f"# ACTIVE SYNTHESIZED TASK: task_type = 'multi_stack'\n"
-            f"# Stack Order (Base -> Mid -> Top): {validated_sg.task.stack_order}\n"
-            f"# Target Top Position: {validated_sg.task.target_position}\n"
-            f"# User Prompt: {validated_sg.task.description}\n"
-            f"# ═══════════════════════════════════════════════════════════════════════\n\n"
-        )
-        reward_source = header_banner + raw_reward_source
-    else:
-        reward_source = raw_reward_source
+    header_banner = (
+        f"# ═══════════════════════════════════════════════════════════════════════\n"
+        f"# SYNTHESIZED SCENE REWARD MODULE: {validated_sg.scene_id}\n"
+        f"# Active Task Type: {validated_sg.task.task_type!r}\n"
+        f"# Manipulated Object: {validated_sg.task.manipulated_object_id!r}\n"
+        f"# Target Position: {validated_sg.task.target_position!r}\n"
+        f"# Stack Order: {validated_sg.task.stack_order!r}\n"
+        f"# Table Height z_table: {validated_sg.table_z:.3f}m\n"
+        f"# Task Description: {validated_sg.task.description}\n"
+        f"# ═══════════════════════════════════════════════════════════════════════\n\n"
+    )
+    reward_source = header_banner + raw_reward_source
+    (out_dir / "reward_code.py").write_text(reward_source, encoding="utf-8")
 
     s6_dur = round(time.time() - t0, 3)
     stage_timings["6"] = s6_dur
@@ -614,18 +567,18 @@ def run_worldforge_pipeline(
         faulty_override = _degenerate_zero_reward
 
     use_live_llm = bool(reasoner.baseten_api_key and provider in ("auto", "baseten"))
-    modal_remote = bool(
+    use_modal_cloud = bool(
         os.environ.get("MODAL_TOKEN_ID")
         and os.environ.get("MODAL_REMOTE_EXEC", "").lower() in ("1", "true", "yes")
+        and faulty_override is None
     )
-    if modal_remote:
+    if use_modal_cloud:
         from src.sandbox.modal_executor import ModalSandboxRunner
         modal_runner = ModalSandboxRunner(cost_tracker=cost_tracker)
         repair_result = modal_runner.run_repair(
             scene=validated_sg,
             max_tries=3,
             use_live_llm=use_live_llm,
-            reward_fn_override=faulty_override,
             run_gate5=False,
             verbose=False,
         )
@@ -638,14 +591,14 @@ def run_worldforge_pipeline(
             run_gate5=False,
             verbose=False,
         )
-        cost_tracker.log_compute(repair_result.cost_tracker.total_cpu_core_seconds)
-        for call in repair_result.cost_tracker.call_log:
-            cost_tracker.log_api_call(
-                input_tokens=call["input_tokens"],
-                output_tokens=call["output_tokens"],
-                model=call["model"],
-                purpose=call["purpose"],
-            )
+    cost_tracker.log_compute(repair_result.cost_tracker.total_cpu_core_seconds)
+    for call in repair_result.cost_tracker.call_log:
+        cost_tracker.log_api_call(
+            input_tokens=call["input_tokens"],
+            output_tokens=call["output_tokens"],
+            model=call["model"],
+            purpose=call["purpose"],
+        )
 
     repair_diff = repair_result.repair_diff
     if repair_result.repaired_reward_code:
@@ -694,7 +647,7 @@ def run_worldforge_pipeline(
     gate_results["5"] = {
         "passed": gate5_passed,
         "gate": 5,
-        "name": "Short PPO Training (Residual + Oracle)" if not quick_ppo else "Short PPO Smoke Test (Residual + Oracle)",
+        "name": "Short PPO Smoke Test (Residual + Oracle)",
         "ppo_mean_return": round(ppo_res.eval_mean_return, 2),
         "random_return": round(gate3_random, 2),
         "oracle_return": round(gate4_return, 2),
@@ -717,20 +670,6 @@ def run_worldforge_pipeline(
     # ── STAGE 8: Render + Diff Visual Alignment (Mask IoU) ──────────────
     t0 = time.time()
     emit({"stage": 8, "name": "Render + Diff", "status": "running"})
-
-    aligned_sg, diff_report = evaluate_and_align_sim(
-        scene=validated_sg,
-        target_masks=ref_masks,
-        target_rgb=frame0_rgb,
-        refine_if_below=0.75,
-        max_refine_iters=10,
-        cost_tracker=cost_tracker,
-        pass_threshold=0.60,
-    )
-    if diff_report.refined and diff_report.mean_iou > diff_report.initial_mean_iou:
-        validated_sg = aligned_sg
-        mjcf_xml = SceneCompiler(validated_sg, randomize=False).compile()
-        mjcf_path.write_text(mjcf_xml, encoding="utf-8")
 
     sim_env = WorldForgeEnv(validated_sg, render_mode="rgb_array")
     sim_env.reset(seed=42)
@@ -772,8 +711,8 @@ def run_worldforge_pipeline(
             "mean_iou": round(iou_report.mean_iou, 4),
             "per_object_iou": {k: round(v, 4) for k, v in iou_report.per_object_iou.items()},
             "passed": iou_report.passed,
-            "refined": diff_report.refined,
-            "iterations_used": diff_report.iterations_used,
+            "refined": pre_diff_report.refined,
+            "iterations_used": pre_diff_report.iterations_used,
             "overlay_url": f"/outputs/{clean_id}/diff_overlay.png",
             "masks_url": f"/outputs/{clean_id}/frame0_masks.png",
         },
@@ -798,9 +737,6 @@ def stream_worldforge_pipeline(
     task_prompt: str | None = None,
 ) -> Iterator[str]:
     """Run the pipeline in a worker thread and yield Server-Sent Events (SSE)."""
-    if video_path:
-        safe_vp = validate_safe_video_path(video_path)
-        video_path = str(safe_vp) if safe_vp else None
     q: queue.Queue[dict[str, Any] | None] = queue.Queue()
 
     def _on_event(evt: dict[str, Any]) -> None:

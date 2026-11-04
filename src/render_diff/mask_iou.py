@@ -13,7 +13,7 @@ Stage 8 of the pipeline:
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import cv2
@@ -41,20 +41,6 @@ class RenderDiffReport:
     iterations_used: int
     overlay_image: np.ndarray  # (H, W, 3) uint8 composite
     passed: bool = True
-
-
-@dataclass
-class MaskDiffReport:
-    """Lightweight mask diff report for reconstructed multi-stack scenes."""
-
-    scene_id: str = ""
-    mean_iou: float = 1.0
-    per_object_iou: dict[str, float] = field(default_factory=dict)
-    passed: bool = True
-    refined: bool = False
-    iterations_used: int = 0
-    initial_mean_iou: float = 1.0
-    overlay_image: np.ndarray | None = None
 
 
 # ---------------------------------------------------------------------------

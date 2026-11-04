@@ -1,16 +1,7 @@
-"""WorldForge PPO Runner — short training + evaluation + optional video.
-
-Provides ``train_and_evaluate_ppo`` which:
-1. Creates a ``DummyVecEnv`` of ``ResidualOracleEnv`` instances.
-2. Trains ``PPO("MlpPolicy", ...)`` for a configurable number of timesteps.
-3. Evaluates the trained policy and returns mean return.
-4. Optionally records a ~4-second (100–120 frame at 30 FPS) rollout video (MP4).
-"""
+"""WorldForge PPO Runner — short training + evaluation + optional video."""
 
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -122,7 +113,12 @@ class OracleController:
 
 
 class ResidualOracleEnv(gym.Wrapper):
-    """Gym wrapper wrapping WorldForgeEnv with bounded oracle residual action."""
+    """Gym wrapper wrapping WorldForgeEnv with bounded oracle residual action.
+
+    Preserves the discrete gripper open/close command from the oracle and
+    suppresses XYZ residual drift during grasp/release dwell steps so short-horizon
+    PPO policies do not shake grasped objects loose.
+    """
 
     def __init__(
         self,
@@ -178,7 +174,6 @@ def train_and_evaluate_ppo(
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv
 
-    # ── Build vectorized residual env ──────────────────────────────────
     def _make_env(idx: int):
         def _init():
             base_e = WorldForgeEnv(scene, reward_fn=reward_fn, render_mode=None)
@@ -188,33 +183,39 @@ def train_and_evaluate_ppo(
 
     vec_env = DummyVecEnv([_make_env(i) for i in range(n_envs)])
 
-    # ── Learning curve callback ───────────────────────────────────────
     learning_curve: list[dict[str, float]] = []
+
+    record_interval = max(total_timesteps // 8, 64)
 
     class _CurveCallback(BaseCallback):
         def __init__(self):
             super().__init__(verbose=0)
             self._episode_rewards: list[float] = []
+            self._step_rewards: list[float] = []
             self._current_rewards = np.zeros(n_envs)
 
         def _on_step(self) -> bool:
-            self._current_rewards += self.locals["rewards"]
+            step_r = self.locals["rewards"]
+            self._current_rewards += step_r
+            self._step_rewards.append(float(np.mean(step_r)))
             for i, done in enumerate(self.locals["dones"]):
                 if done:
                     self._episode_rewards.append(float(self._current_rewards[i]))
                     self._current_rewards[i] = 0.0
 
-            if self.num_timesteps % 256 == 0 and self._episode_rewards:
-                mean_r = float(np.mean(self._episode_rewards[-10:]))
+            if self.num_timesteps % record_interval == 0:
+                if self._episode_rewards:
+                    mean_r = float(np.mean(self._episode_rewards[-5:]))
+                else:
+                    mean_r = float(np.sum(self._step_rewards[-32:]))
                 learning_curve.append({
-                    "timesteps": self.num_timesteps,
-                    "mean_reward": mean_r,
+                    "timesteps": int(self.num_timesteps),
+                    "mean_reward": round(mean_r, 2),
                 })
             return True
 
     callback = _CurveCallback()
 
-    # ── Train ─────────────────────────────────────────────────────────
     model = PPO(
         "MlpPolicy",
         vec_env,
@@ -234,7 +235,6 @@ def train_and_evaluate_ppo(
             "mean_reward": float(np.mean(callback._episode_rewards[-10:])),
         })
 
-    # ── Evaluate ──────────────────────────────────────────────────────
     eval_base_env = WorldForgeEnv(
         scene,
         reward_fn=reward_fn,
@@ -277,7 +277,6 @@ def train_and_evaluate_ppo(
 
     eval_env.close()
 
-    # ── Save video ────────────────────────────────────────────────────
     video_path_out: str | None = None
     if rollout_video_path and video_frames:
         fps_out = 20 if render_stride == 2 else 30
