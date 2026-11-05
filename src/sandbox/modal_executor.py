@@ -2,11 +2,11 @@
 
 Executes validation, self-healing repair loops, and PPO training inside a Modal
 Linux container (modal.Sandbox with MUJOCO_GL=egl, 4 CPU cores, 8 GiB RAM) when
-MODAL_TOKEN_ID is configured, or falls back seamlessly to local execution on
-Windows/Linux when offline.
+MODAL_TOKEN_ID and MODAL_REMOTE_EXEC=true are configured, or runs locally on
+Windows/Linux when offline without leaking idle cloud sandboxes.
 
 Key Features:
-- Seamless cloud vs local fallback.
+- Clean lifecycle management (`sb.terminate()` in `finally:` blocks).
 - Cost accounting: Modal CPU core-seconds ($0.00003942 / core-sec) and
   GiB-seconds ($0.00000667 / GiB-sec) tracked via CostTracker.
 - Hard budget enforcement: max_budget_usd (default $2.00) raises BudgetExceededError
@@ -15,11 +15,12 @@ Key Features:
 
 from __future__ import annotations
 
-import copy
+import json
 import logging
 import os
 import time
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 from src.schema.scene_graph import SceneGraph
 from src.validation.gates import ValidationReport, ValidationSuite
@@ -27,6 +28,8 @@ from src.validation.ppo_runner import PPOResult, train_and_evaluate_ppo
 from src.validation.repair_loop import CostTracker, RepairResult, run_self_healing_loop
 
 logger = logging.getLogger(__name__)
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 class BudgetExceededError(RuntimeError):
@@ -100,7 +103,6 @@ class ModalSandboxRunner:
         elapsed = time.time() - t0
         self.cost_tracker.log_compute(elapsed * self.cpu_cores, elapsed * self.memory_gib)
 
-        # Merge token usage and call log from internal loop if any
         if result.cost_tracker is not None:
             self.cost_tracker.total_input_tokens += result.cost_tracker.total_input_tokens
             self.cost_tracker.total_output_tokens += result.cost_tracker.total_output_tokens
@@ -178,41 +180,74 @@ class ModalSandboxRunner:
     # Modal Cloud execution implementations
     # -----------------------------------------------------------------------
 
+    def _create_modal_sandbox(self) -> Any:
+        import modal
+
+        app = modal.App.lookup("worldforge-sandbox", create_if_missing=True)
+        image = (
+            modal.Image.debian_slim(python_version="3.12")
+            .apt_install("libgl1", "libgl1-mesa-dri", "libegl1", "libegl-mesa0", "libgbm1", "libosmesa6")
+            .pip_install(
+                "mujoco>=3.1.0",
+                "gymnasium>=1.0.0",
+                "pydantic>=2.0.0",
+                "numpy>=1.26.0",
+                "pyyaml>=6.0",
+                "stable-baselines3>=2.5.0",
+                "imageio[ffmpeg]>=2.36.0",
+            )
+            .add_local_dir(str(PROJECT_ROOT / "src"), remote_path="/workspace/src")
+            .add_local_dir(str(PROJECT_ROOT / "configs"), remote_path="/workspace/configs")
+        )
+        return modal.Sandbox.create(
+            image=image,
+            cpu=self.cpu_cores,
+            memory=self.memory_gib * 1024,
+            app=app,
+            workdir="/workspace",
+            env={"MUJOCO_GL": "egl", "PYTHONPATH": "/workspace"},
+        )
+
     def _run_validation_cloud(
         self,
         suite_or_scene: ValidationSuite | SceneGraph,
         run_gate5: bool = False,
         **kwargs: Any,
     ) -> ValidationReport:
+        scene = suite_or_scene.scene if isinstance(suite_or_scene, ValidationSuite) else suite_or_scene
+        sb = None
         try:
-            import modal
-            app = modal.App.lookup("worldforge-sandbox", create_if_missing=True)
-            image = (
-                modal.Image.debian_slim(python_version="3.12")
-                .apt_install("libgl1-mesa-glx", "libosmesa6-dev", "libegl1-mesa-dev")
-                .pip_install(
-                    "mujoco>=3.1.0",
-                    "gymnasium>=1.0.0",
-                    "pydantic>=2.0.0",
-                    "numpy>=1.26.0",
-                    "pyyaml>=6.0",
-                    "stable-baselines3>=2.5.0",
-                    "imageio[ffmpeg]>=2.36.0",
+            sb = self._create_modal_sandbox()
+            scene_json = json.dumps(scene.model_dump())
+            cmd = (
+                "import json; from src.schema.scene_graph import SceneGraph; "
+                "from src.validation.gates import ValidationSuite; "
+                f"sg = SceneGraph.model_validate(json.loads({scene_json!r})); "
+                f"rep = ValidationSuite(sg).run_all(run_gate5={bool(run_gate5)!r}); "
+                "print(json.dumps({'passed': rep.passed, 'failed_gate': rep.failed_gate, "
+                "'gate_results': rep.gate_results, 'diagnostics': rep.diagnostics}))"
+            )
+            proc = sb.exec("python", "-c", cmd)
+            proc.wait()
+            out_lines = [line for line in proc.stdout.read().splitlines() if line.strip()]
+            if proc.returncode == 0 and out_lines:
+                payload = json.loads(out_lines[-1])
+                return ValidationReport(
+                    passed=bool(payload["passed"]),
+                    failed_gate=payload["failed_gate"],
+                    gate_results={int(k): v for k, v in payload["gate_results"].items()},
+                    diagnostics=payload.get("diagnostics", ""),
                 )
-            )
-            _ = modal.Sandbox.create(
-                image=image,
-                cpu=self.cpu_cores,
-                memory=self.memory_gib * 1024,
-                app=app,
-                env={"MUJOCO_GL": "egl"},
-            )
-            # In a live cloud container, execution runs remotely.
-            # Gracefully complete through local execution runner.
-            return self._run_validation_local(suite_or_scene, run_gate5=run_gate5, **kwargs)
+            raise RuntimeError(f"Modal validation process exited with code {proc.returncode}")
         except Exception as exc:
             logger.warning("Modal cloud execution encountered exception (%s); falling back to local.", exc)
             return self._run_validation_local(suite_or_scene, run_gate5=run_gate5, **kwargs)
+        finally:
+            if sb is not None:
+                try:
+                    sb.terminate()
+                except Exception:
+                    pass
 
     def _run_repair_cloud(
         self,
@@ -221,33 +256,52 @@ class ModalSandboxRunner:
         run_gate5: bool = False,
         **kwargs: Any,
     ) -> RepairResult:
-        try:
-            import modal
-            app = modal.App.lookup("worldforge-sandbox", create_if_missing=True)
-            image = (
-                modal.Image.debian_slim(python_version="3.12")
-                .apt_install("libgl1-mesa-glx", "libosmesa6-dev", "libegl1-mesa-dev")
-                .pip_install(
-                    "mujoco>=3.1.0",
-                    "gymnasium>=1.0.0",
-                    "pydantic>=2.0.0",
-                    "numpy>=1.26.0",
-                    "pyyaml>=6.0",
-                    "stable-baselines3>=2.5.0",
-                    "imageio[ffmpeg]>=2.36.0",
-                )
-            )
-            _ = modal.Sandbox.create(
-                image=image,
-                cpu=self.cpu_cores,
-                memory=self.memory_gib * 1024,
-                app=app,
-                env={"MUJOCO_GL": "egl"},
-            )
+        # Custom callables (like reward_fn_override or on_repair) cannot be serialized over CLI JSON
+        if kwargs.get("reward_fn_override") is not None or kwargs.get("on_repair") is not None:
             return self._run_repair_local(scene, max_tries=max_tries, run_gate5=run_gate5, **kwargs)
+
+        sb = None
+        try:
+            sb = self._create_modal_sandbox()
+            scene_json = json.dumps(scene.model_dump())
+            cmd = (
+                "import json; from src.schema.scene_graph import SceneGraph; "
+                "from src.validation.repair_loop import run_self_healing_loop; "
+                f"sg = SceneGraph.model_validate(json.loads({scene_json!r})); "
+                f"res = run_self_healing_loop(sg, max_tries={int(max_tries)}, run_gate5={bool(run_gate5)!r}); "
+                "print(json.dumps({'success': res.success, 'attempts': res.attempts, "
+                "'repairs_applied': res.repairs_applied, 'repair_diff': res.repair_diff, "
+                "'passed': res.final_report.passed, 'failed_gate': res.final_report.failed_gate, "
+                "'gate_results': res.final_report.gate_results, 'diagnostics': res.final_report.diagnostics}))"
+            )
+            proc = sb.exec("python", "-c", cmd)
+            proc.wait()
+            out_lines = [line for line in proc.stdout.read().splitlines() if line.strip()]
+            if proc.returncode == 0 and out_lines:
+                payload = json.loads(out_lines[-1])
+                rep = ValidationReport(
+                    passed=bool(payload["passed"]),
+                    failed_gate=payload["failed_gate"],
+                    gate_results={int(k): v for k, v in payload["gate_results"].items()},
+                    diagnostics=payload.get("diagnostics", ""),
+                )
+                return RepairResult(
+                    final_report=rep,
+                    attempts=int(payload["attempts"]),
+                    repairs_applied=list(payload["repairs_applied"]),
+                    success=bool(payload["success"]),
+                    repair_diff=str(payload.get("repair_diff", "")),
+                )
+            raise RuntimeError(f"Modal repair process exited with code {proc.returncode}")
         except Exception as exc:
             logger.warning("Modal cloud execution encountered exception (%s); falling back to local.", exc)
             return self._run_repair_local(scene, max_tries=max_tries, run_gate5=run_gate5, **kwargs)
+        finally:
+            if sb is not None:
+                try:
+                    sb.terminate()
+                except Exception:
+                    pass
 
     def _run_ppo_cloud(
         self,
@@ -256,31 +310,35 @@ class ModalSandboxRunner:
         n_envs: int = 4,
         **kwargs: Any,
     ) -> PPOResult:
+        sb = None
         try:
-            import modal
-            app = modal.App.lookup("worldforge-sandbox", create_if_missing=True)
-            image = (
-                modal.Image.debian_slim(python_version="3.12")
-                .apt_install("libgl1-mesa-glx", "libosmesa6-dev", "libegl1-mesa-dev")
-                .pip_install(
-                    "mujoco>=3.1.0",
-                    "gymnasium>=1.0.0",
-                    "pydantic>=2.0.0",
-                    "numpy>=1.26.0",
-                    "pyyaml>=6.0",
-                    "stable-baselines3>=2.5.0",
-                    "imageio[ffmpeg]>=2.36.0",
+            sb = self._create_modal_sandbox()
+            scene_json = json.dumps(scene.model_dump())
+            cmd = (
+                "import json; from src.schema.scene_graph import SceneGraph; "
+                "from src.validation.ppo_runner import train_and_evaluate_ppo; "
+                f"sg = SceneGraph.model_validate(json.loads({scene_json!r})); "
+                f"res = train_and_evaluate_ppo(sg, total_timesteps={int(total_timesteps)}, n_envs={int(n_envs)}); "
+                "print(json.dumps({'eval_mean_return': res.eval_mean_return, "
+                "'eval_std_return': res.eval_std_return, 'learning_curve': res.learning_curve}))"
+            )
+            proc = sb.exec("python", "-c", cmd)
+            proc.wait()
+            out_lines = [line for line in proc.stdout.read().splitlines() if line.strip()]
+            if proc.returncode == 0 and out_lines:
+                payload = json.loads(out_lines[-1])
+                return PPOResult(
+                    eval_mean_return=float(payload["eval_mean_return"]),
+                    eval_std_return=float(payload["eval_std_return"]),
+                    learning_curve=list(payload["learning_curve"]),
                 )
-            )
-            _ = modal.Sandbox.create(
-                image=image,
-                cpu=self.cpu_cores,
-                memory=self.memory_gib * 1024,
-                app=app,
-                env={"MUJOCO_GL": "egl"},
-            )
-            return self._run_ppo_local(scene, total_timesteps=total_timesteps, n_envs=n_envs, **kwargs)
+            raise RuntimeError(f"Modal PPO process exited with code {proc.returncode}")
         except Exception as exc:
             logger.warning("Modal cloud execution encountered exception (%s); falling back to local.", exc)
             return self._run_ppo_local(scene, total_timesteps=total_timesteps, n_envs=n_envs, **kwargs)
-
+        finally:
+            if sb is not None:
+                try:
+                    sb.terminate()
+                except Exception:
+                    pass

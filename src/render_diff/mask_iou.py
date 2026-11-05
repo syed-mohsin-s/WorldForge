@@ -6,14 +6,14 @@ Stage 8 of the pipeline:
 3. Computes per-object Mask IoU against target (real) video masks.
 4. If mean_iou < refine_if_below (default 0.75), runs iterative coordinate refinement
    over object (x, y) coordinates and scales to maximize Mask IoU.
-5. Generates an (H, W, 3) composite overlay image showing Real Frame 0, Sim Frame 0,
-   and Green=Overlap / Red=Mismatch mask differences.
+5. Generates an (H, W, 3) composite overlay image showing Green=Aligned,
+   Red=Video/Ref Only, and Blue=Sim Only mask differences per object.
 """
 
 from __future__ import annotations
 
 import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 import cv2
@@ -40,6 +40,7 @@ class RenderDiffReport:
     refined: bool
     iterations_used: int
     overlay_image: np.ndarray  # (H, W, 3) uint8 composite
+    passed: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -47,13 +48,7 @@ class RenderDiffReport:
 # ---------------------------------------------------------------------------
 
 def compute_mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
-    """Compute the Intersection-over-Union (Jaccard Index) of two binary masks.
-
-    Handles edge cases:
-    - If both masks are completely empty, returns 1.0 (perfect agreement).
-    - If one mask is empty and the other is not, returns 0.0.
-    - If disjoint non-empty masks, returns 0.0.
-    """
+    """Compute the Intersection-over-Union (Jaccard Index) of two binary masks."""
     a = mask_a.astype(bool)
     b = mask_b.astype(bool)
     if a.shape != b.shape:
@@ -106,7 +101,6 @@ def compute_scene_mask_iou(
     )
 
 
-
 # ---------------------------------------------------------------------------
 # Evaluate & Align Pipeline
 # ---------------------------------------------------------------------------
@@ -119,18 +113,16 @@ def evaluate_and_align_sim(
     max_refine_iters: int = 20,
     use_sam_resegment: bool = False,
     cost_tracker: CostTracker | None = None,
+    pass_threshold: float = 0.60,
 ) -> tuple[SceneGraph, RenderDiffReport]:
     """Evaluate visual alignment of a SceneGraph against target Frame 0 masks.
 
     If mean IoU is below ``refine_if_below``, iteratively refines object (x, y)
-    coordinates using camera back-projection displacement until aligned.
-
-    Returns (refined_scene, report).
+    coordinates and scales using camera back-projection displacement until aligned.
     """
     current_scene = copy.deepcopy(scene)
     w, h = current_scene.camera.resolution
 
-    # Helper to render masks and RGB for a scene
     def _render_scene(sg: SceneGraph) -> tuple[dict[str, np.ndarray], np.ndarray]:
         env = WorldForgeEnv(sg, render_mode="rgb_array")
         env.reset(seed=42)
@@ -142,7 +134,8 @@ def evaluate_and_align_sim(
             tracker = SAM31Tracker(cost_tracker=cost_tracker)
             if tracker.has_configured_backend():
                 prompts = [o.label for o in current_scene.objects]
-                res = tracker.segment_image(rgb, text_prompts=prompts)
+                obj_ids = [o.id for o in current_scene.objects]
+                res = tracker.segment_image(rgb, text_prompts=prompts, object_ids=obj_ids)
                 for track in res.tracks:
                     masks[track.object_id] = track.frame0_mask
             else:
@@ -150,7 +143,6 @@ def evaluate_and_align_sim(
                 for track in res.tracks:
                     masks[track.object_id] = track.frame0_mask
         else:
-            # Fast MuJoCo geom segmentation buffer
             renderer = mujoco.Renderer(env.model, height=h, width=w)
             renderer.enable_segmentation_rendering()
             renderer.update_scene(env.data, camera="render_cam")
@@ -166,34 +158,38 @@ def evaluate_and_align_sim(
         env.close()
         return masks, rgb
 
-    # Initial evaluation
     sim_masks, sim_rgb = _render_scene(current_scene)
 
+    all_keys = set(target_masks.keys()) | set(sim_masks.keys())
     per_obj_iou: dict[str, float] = {
-        obj_id: compute_mask_iou(sim_masks.get(obj_id, np.zeros((h, w), dtype=bool)), target_masks[obj_id])
-        for obj_id in target_masks
+        obj_id: compute_mask_iou(
+            sim_masks.get(obj_id, np.zeros((h, w), dtype=bool)),
+            target_masks.get(obj_id, np.zeros((h, w), dtype=bool)),
+        )
+        for obj_id in all_keys
     }
     initial_mean_iou = float(np.mean(list(per_obj_iou.values()))) if per_obj_iou else 1.0
 
     refined = False
     iterations_used = 0
 
-    # Camera math for projection-guided coordinate search
     fx, fy, cam_cx, cam_cy = derive_camera_intrinsics(current_scene.camera)
     R_cam, _ = derive_camera_extrinsics(current_scene.camera)
     Z_approx = float(np.linalg.norm(np.array(current_scene.camera.pos) - np.array(current_scene.camera.lookat)))
 
-    # Refinement loop
-    if initial_mean_iou < refine_if_below:
+    max_target_area = max((int(np.sum(m)) for m in target_masks.values()), default=0)
+    is_closeup_or_multistack = (
+        current_scene.task.task_type == "multi_stack" or max_target_area > 8000
+    )
+
+    if initial_mean_iou < refine_if_below and not is_closeup_or_multistack:
         refined = True
-        for it in range(max_refine_iters):
+        for _ in range(max_refine_iters):
             iterations_used += 1
 
-            # Check if all objects meet threshold
             if all(v >= refine_if_below for v in per_obj_iou.values()):
                 break
 
-            # Adjust each object whose IoU is below threshold
             scene_updated = False
             for obj_node in current_scene.objects:
                 obj_id = obj_node.id
@@ -206,13 +202,11 @@ def evaluate_and_align_sim(
                 if obj_iou >= refine_if_below or not np.any(t_mask) or not np.any(s_mask):
                     continue
 
-                # 2D centroid error in pixel space
                 yt, xt = np.where(t_mask)
                 ys, xs = np.where(s_mask)
                 du = float(np.mean(xt) - np.mean(xs))
                 dv = float(np.mean(yt) - np.mean(ys))
 
-                # Map to camera frame and rotate to world frame
                 dx_cam = du * Z_approx / fx
                 dy_cam = -dv * Z_approx / fy
                 dp_world = R_cam @ np.array([dx_cam, dy_cam, 0.0])
@@ -221,12 +215,10 @@ def evaluate_and_align_sim(
                 new_x = obj_node.position[0] + float(dp_world[0]) * step_scale
                 new_y = obj_node.position[1] + float(dp_world[1]) * step_scale
 
-                # Scale adjustment based on 2D mask pixel area ratio
                 area_ratio = float(t_mask.sum()) / max(float(s_mask.sum()), 1.0)
                 s_factor = float(np.clip(np.sqrt(area_ratio), 0.8, 1.25))
                 obj_node.size = [float(s * (1.0 + 0.6 * (s_factor - 1.0))) for s in obj_node.size]
 
-                # Keep height grounded to table
                 half_h = obj_node.size[2] if obj_node.primitive == "box" else obj_node.size[1]
                 new_z = current_scene.table_z + half_h + 0.001
 
@@ -236,16 +228,18 @@ def evaluate_and_align_sim(
             if not scene_updated:
                 break
 
-            # Re-render with updated scene
             sim_masks, sim_rgb = _render_scene(current_scene)
+            all_keys = set(target_masks.keys()) | set(sim_masks.keys())
             per_obj_iou = {
-                oid: compute_mask_iou(sim_masks.get(oid, np.zeros((h, w), dtype=bool)), target_masks[oid])
-                for oid in target_masks
+                oid: compute_mask_iou(
+                    sim_masks.get(oid, np.zeros((h, w), dtype=bool)),
+                    target_masks.get(oid, np.zeros((h, w), dtype=bool)),
+                )
+                for oid in all_keys
             }
 
     final_mean_iou = float(np.mean(list(per_obj_iou.values()))) if per_obj_iou else 1.0
 
-    # Generate composite overlay image
     overlay_image = _create_overlay_image(
         target_rgb=target_rgb,
         sim_rgb=sim_rgb,
@@ -261,6 +255,7 @@ def evaluate_and_align_sim(
         refined=refined,
         iterations_used=iterations_used,
         overlay_image=overlay_image,
+        passed=(final_mean_iou >= pass_threshold),
     )
     return current_scene, report
 
@@ -278,49 +273,60 @@ def _create_overlay_image(
 ) -> np.ndarray:
     """Generate (H, W, 3) uint8 composite showing Real Frame 0, Sim Frame 0, and Diff.
 
-    Green: Overlap (A ∩ B)
-    Red:   Mismatch (A ⊕ B)
-    Base:  Alpha blend of target RGB (Real) and sim RGB.
+    Green (16, 185, 129): Per-object Overlap (Ref_k ∩ Sim_k)
+    Red   (239, 68, 68):  Video/Ref Only (Ref_k \\ Sim_k)
+    Blue  (59, 130, 246): Sim Only (Sim_k \\ Ref_k)
     """
     w, h = resolution
     base_target = target_rgb if target_rgb is not None else sim_rgb.copy()
+    if base_target.shape[:2] != (h, w):
+        base_target = cv2.resize(base_target, (w, h), interpolation=cv2.INTER_AREA)
 
-    # Blend Real Frame 0 and Sim Frame 0 as background
-    composite = cv2.addWeighted(base_target, 0.5, sim_rgb, 0.5, 0.0)
+    composite = cv2.addWeighted(base_target, 0.45, sim_rgb, 0.45, 0.0)
 
-    # Accumulate global overlap and mismatch masks across all objects
     all_overlap = np.zeros((h, w), dtype=bool)
-    all_mismatch = np.zeros((h, w), dtype=bool)
+    all_ref_only = np.zeros((h, w), dtype=bool)
+    all_sim_only = np.zeros((h, w), dtype=bool)
 
-    for obj_id, t_mask in target_masks.items():
+    all_keys = set(target_masks.keys()) | set(sim_masks.keys())
+    for obj_id in all_keys:
+        t_mask = target_masks.get(obj_id, np.zeros((h, w), dtype=bool))
         s_mask = sim_masks.get(obj_id, np.zeros((h, w), dtype=bool))
+        if t_mask.shape != (h, w):
+            t_mask = cv2.resize(t_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+        if s_mask.shape != (h, w):
+            s_mask = cv2.resize(s_mask.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST) > 0
+
         all_overlap |= (t_mask & s_mask)
-        all_mismatch |= (t_mask ^ s_mask)
+        all_ref_only |= (t_mask & ~s_mask)
+        all_sim_only |= (s_mask & ~t_mask)
 
-    # Color overlay: Green for Overlap, Red for Mismatch
-    green = np.array([0, 255, 0], dtype=np.uint8)
-    red = np.array([255, 0, 0], dtype=np.uint8)
+    green = np.array([16, 185, 129], dtype=np.uint8)
+    red = np.array([239, 68, 68], dtype=np.uint8)
+    blue = np.array([59, 130, 246], dtype=np.uint8)
 
+    if np.any(all_ref_only):
+        composite[all_ref_only] = cv2.addWeighted(
+            composite[all_ref_only], 0.30, np.full_like(composite[all_ref_only], red), 0.70, 0.0
+        )
+    if np.any(all_sim_only):
+        composite[all_sim_only] = cv2.addWeighted(
+            composite[all_sim_only], 0.30, np.full_like(composite[all_sim_only], blue), 0.70, 0.0
+        )
     if np.any(all_overlap):
         composite[all_overlap] = cv2.addWeighted(
-            composite[all_overlap], 0.35, np.full_like(composite[all_overlap], green), 0.65, 0.0
-        )
-    if np.any(all_mismatch):
-        composite[all_mismatch] = cv2.addWeighted(
-            composite[all_mismatch], 0.35, np.full_like(composite[all_mismatch], red), 0.65, 0.0
+            composite[all_overlap], 0.30, np.full_like(composite[all_overlap], green), 0.70, 0.0
         )
 
-    # Watermark text
     cv2.putText(
         composite,
-        "Diff Overlay: Green=Overlap, Red=Mismatch",
+        "Diff Overlay: Green=Aligned, Red=Video-Only, Blue=Sim-Only",
         (15, 25),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
+        0.50,
         (255, 255, 255),
         1,
         cv2.LINE_AA,
     )
 
     return composite
-

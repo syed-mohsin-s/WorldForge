@@ -1,19 +1,10 @@
-"""WorldForge PPO Runner — short training + evaluation + optional video.
-
-Provides ``train_and_evaluate_ppo`` which:
-1. Creates a ``DummyVecEnv`` of ``ResidualOracleEnv`` instances.
-2. Trains ``PPO("MlpPolicy", ...)`` for a configurable number of timesteps.
-3. Evaluates the trained policy for 3 episodes and returns mean return.
-4. Optionally records a ~4-second (100–120 frame at 30 FPS) rollout video (MP4).
-"""
+"""WorldForge PPO Runner — short training + evaluation + optional video."""
 
 from __future__ import annotations
 
-import os
-import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -52,6 +43,34 @@ class OracleController:
 
         wx, wy, wz, grip_cmd = self.waypoints[self.wp_idx]
 
+        # For 3-object multi_stack (16 waypoints), dynamically lock pickup/placement XY
+        # to live body centers in MuJoCo so any millimeter shift in Stage A is compensated in Stage B.
+        scene_obj = getattr(env, "scene", None)
+        if (
+            scene_obj is not None
+            and getattr(scene_obj.task, "task_type", "") == "multi_stack"
+            and scene_obj.task.stack_order
+            and len(scene_obj.task.stack_order) >= 3
+            and len(self.waypoints) == 16
+        ):
+            try:
+                import mujoco
+                id_0, id_1, id_2 = scene_obj.task.stack_order[:3]
+                if self.wp_idx in (4, 5, 6, 7):
+                    bid0 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_0)
+                    if bid0 >= 0:
+                        wx, wy = float(env.data.xpos[bid0][0]), float(env.data.xpos[bid0][1])
+                elif self.wp_idx in (8, 9):
+                    bid2 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_2)
+                    if bid2 >= 0:
+                        wx, wy = float(env.data.xpos[bid2][0]), float(env.data.xpos[bid2][1])
+                elif self.wp_idx in (12, 13, 14, 15):
+                    bid1 = mujoco.mj_name2id(env.model, mujoco.mjtObj.mjOBJ_BODY, id_1)
+                    if bid1 >= 0:
+                        wx, wy = float(env.data.xpos[bid1][0]), float(env.data.xpos[bid1][1])
+            except Exception:
+                pass
+
         # Trigger 15-step dwell when grip command changes (e.g. open -> closed)
         if (
             self.prev_grip_cmd is not None
@@ -74,7 +93,7 @@ class OracleController:
         err = np.array([wx, wy, wz], dtype=np.float64) - grip_pos
         dist = float(np.linalg.norm(err))
 
-        if dist < 0.005 or self.step_in_wp >= 60:
+        if dist < 0.005 or self.step_in_wp >= 75:
             self.wp_idx += 1
             self.step_in_wp = 0
             if self.wp_idx >= len(self.waypoints):
@@ -94,7 +113,12 @@ class OracleController:
 
 
 class ResidualOracleEnv(gym.Wrapper):
-    """Gym wrapper wrapping WorldForgeEnv with bounded oracle residual action."""
+    """Gym wrapper wrapping WorldForgeEnv with bounded oracle residual action.
+
+    Preserves the discrete gripper open/close command from the oracle and
+    suppresses XYZ residual drift during grasp/release dwell steps so short-horizon
+    PPO policies do not shake grasped objects loose.
+    """
 
     def __init__(
         self,
@@ -112,7 +136,13 @@ class ResidualOracleEnv(gym.Wrapper):
 
     def step(self, action: np.ndarray) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         u_oracle = self.controller.get_action(self.env.unwrapped)
-        u_total = np.clip(u_oracle + self.residual_weight * action, -1.0, 1.0)
+        if self.controller.dwell_remaining > 0 or self.controller.completed:
+            u_total = u_oracle
+        else:
+            # Apply bounded residual to XYZ while keeping discrete gripper command authoritative
+            eff_weight = min(self.residual_weight, 0.08)
+            u_xyz = np.clip((1.0 - eff_weight) * u_oracle[:3] + eff_weight * action[:3], -1.0, 1.0)
+            u_total = np.array([u_xyz[0], u_xyz[1], u_xyz[2], u_oracle[3]], dtype=np.float32)
         return self.env.step(u_total)
 
 
@@ -132,8 +162,9 @@ def train_and_evaluate_ppo(
     n_envs: int = 4,
     rollout_video_path: str | None = None,
     eval_episodes: int = 1,
-    eval_steps: int = 120,
+    eval_steps: int = 150,
     render_stride: int = 2,
+    reward_fn: Callable | None = None,
 ) -> PPOResult:
     """Train PPO on a WorldForge scene and evaluate."""
     import gymnasium as gym
@@ -143,43 +174,48 @@ def train_and_evaluate_ppo(
     from stable_baselines3.common.callbacks import BaseCallback
     from stable_baselines3.common.vec_env import DummyVecEnv
 
-    # ── Build vectorized residual env ──────────────────────────────────
     def _make_env(idx: int):
         def _init():
-            base_e = WorldForgeEnv(scene, render_mode=None)
+            base_e = WorldForgeEnv(scene, reward_fn=reward_fn, render_mode=None)
             res_e = ResidualOracleEnv(base_e, scene.task.waypoints, residual_weight=0.15)
             return gym.wrappers.TimeLimit(res_e, max_episode_steps=eval_steps)
         return _init
 
     vec_env = DummyVecEnv([_make_env(i) for i in range(n_envs)])
 
-    # ── Learning curve callback ───────────────────────────────────────
     learning_curve: list[dict[str, float]] = []
+
+    record_interval = max(total_timesteps // 8, 64)
 
     class _CurveCallback(BaseCallback):
         def __init__(self):
             super().__init__(verbose=0)
             self._episode_rewards: list[float] = []
+            self._step_rewards: list[float] = []
             self._current_rewards = np.zeros(n_envs)
 
         def _on_step(self) -> bool:
-            self._current_rewards += self.locals["rewards"]
+            step_r = self.locals["rewards"]
+            self._current_rewards += step_r
+            self._step_rewards.append(float(np.mean(step_r)))
             for i, done in enumerate(self.locals["dones"]):
                 if done:
                     self._episode_rewards.append(float(self._current_rewards[i]))
                     self._current_rewards[i] = 0.0
 
-            if self.num_timesteps % 256 == 0 and self._episode_rewards:
-                mean_r = float(np.mean(self._episode_rewards[-10:]))
+            if self.num_timesteps % record_interval == 0:
+                if self._episode_rewards:
+                    mean_r = float(np.mean(self._episode_rewards[-5:]))
+                else:
+                    mean_r = float(np.sum(self._step_rewards[-32:]))
                 learning_curve.append({
-                    "timesteps": self.num_timesteps,
-                    "mean_reward": mean_r,
+                    "timesteps": int(self.num_timesteps),
+                    "mean_reward": round(mean_r, 2),
                 })
             return True
 
     callback = _CurveCallback()
 
-    # ── Train ─────────────────────────────────────────────────────────
     model = PPO(
         "MlpPolicy",
         vec_env,
@@ -199,9 +235,9 @@ def train_and_evaluate_ppo(
             "mean_reward": float(np.mean(callback._episode_rewards[-10:])),
         })
 
-    # ── Evaluate ──────────────────────────────────────────────────────
     eval_base_env = WorldForgeEnv(
         scene,
+        reward_fn=reward_fn,
         render_mode="rgb_array" if rollout_video_path else None,
     )
     eval_res_env = ResidualOracleEnv(eval_base_env, scene.task.waypoints, residual_weight=0.15)
@@ -223,7 +259,8 @@ def train_and_evaluate_ppo(
                 obs, reward, terminated, truncated, info = eval_env.step(action)
                 ep_return += reward
             elif ep == 0 and rollout_video_path:
-                eval_base_env.step(np.array([0.0, 0.0, 0.0, last_grip], dtype=np.float32))
+                u_after = eval_res_env.controller.get_action(eval_base_env)
+                eval_base_env.step(u_after)
 
             if ep == 0 and rollout_video_path and (step_i % render_stride == 0):
                 try:
@@ -240,7 +277,6 @@ def train_and_evaluate_ppo(
 
     eval_env.close()
 
-    # ── Save video ────────────────────────────────────────────────────
     video_path_out: str | None = None
     if rollout_video_path and video_frames:
         fps_out = 20 if render_stride == 2 else 30
@@ -257,7 +293,7 @@ def train_and_evaluate_ppo(
 def record_oracle_rollout(
     scene: SceneGraph,
     output_path: str,
-    max_steps: int = 120,
+    max_steps: int = 150,
     fps: int = 30,
     render_stride: int = 2,
 ) -> str:
@@ -270,7 +306,7 @@ def record_oracle_rollout(
     last_grip = scene.task.waypoints[-1][3] if scene.task.waypoints else 0.0
 
     for step_i in range(max_steps):
-        if not terminated:
+        if not controller.completed:
             action = controller.get_action(env)
             obs, reward, term, trunc, info = env.step(action)
             if term or trunc:

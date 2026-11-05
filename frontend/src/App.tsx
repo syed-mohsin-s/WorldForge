@@ -72,6 +72,7 @@ export interface SceneObject {
   position: [number, number, number];
   quaternion?: [number, number, number, number];
   material: string;
+  rgba?: [number, number, number, number] | null;
   is_static: boolean;
   parent_id: string | null;
   joint: {
@@ -94,7 +95,9 @@ export interface SceneGraph {
   };
   objects: SceneObject[];
   task: {
-    task_type: 'pick_and_place' | 'push_to_target' | 'articulate_joint';
+    task_type: 'pick_and_place' | 'push_to_target' | 'articulate_joint' | 'multi_stack';
+    stack_order?: string[] | null;
+    user_prompt?: string | null;
     description: string;
     manipulated_object_id: string;
     target_position?: [number, number, number] | null;
@@ -314,6 +317,7 @@ export function streamPipeline(
     provider: string;
     quick_ppo: boolean;
     video_path?: string | null;
+    task_prompt?: string | null;
   },
   onEvent: (ev: PipelineStageEvent) => void,
   onError: (err: any) => void,
@@ -327,6 +331,9 @@ export function streamPipeline(
   });
   if (params.video_path) {
     q.set('video_path', params.video_path);
+  }
+  if (params.task_prompt && params.task_prompt.trim()) {
+    q.set('task_prompt', params.task_prompt.trim());
   }
   const es = new EventSource(`${API_BASE}/api/run/stream?${q.toString()}`);
 
@@ -738,7 +745,8 @@ const SceneCanvas: React.FC<SceneCanvasProps> = ({
         if (obj.id === 'table') continue;
         const pos = st.objectPositions[obj.id] ?? obj.position;
         const matSpec = MATERIAL_DB[obj.material] ?? MATERIAL_DB.plastic;
-        const baseColor = new THREE.Color(matSpec.rgba[0], matSpec.rgba[1], matSpec.rgba[2]);
+        const rgbaSrc = obj.rgba ?? matSpec.rgba;
+        const baseColor = new THREE.Color(rgbaSrc[0], rgbaSrc[1], rgbaSrc[2]);
         const isManipulated = obj.id === sg.task.manipulated_object_id;
 
         const roughness =
@@ -1351,6 +1359,7 @@ export function App() {
   const [selectedSceneId, setSelectedSceneId] = useState<string>('scene1_pick_place');
   const [provider, setProvider] = useState<string>('auto');
   const [injectFault, setInjectFault] = useState<boolean>(false);
+  const [userPrompt, setUserPrompt] = useState<string>('');
   const [status, setStatus] = useState<SystemStatus | null>(null);
 
   // Video Upload State for Stage 1 SAM 3.1 Perception
@@ -1508,6 +1517,7 @@ export function App() {
         provider,
         quick_ppo: true,
         video_path: uploadedVideoPath,
+        task_prompt: userPrompt,
       },
       (ev: PipelineStageEvent) => {
         if (typeof ev.stage === 'number') {
@@ -1541,7 +1551,7 @@ export function App() {
           if (ev.repair_diff) {
             setRepairDiff(ev.repair_diff);
           }
-          if (ev.repair_attempts) {
+          if (ev.repair_attempts && ev.repair_attempts > 1) {
             setSelfHealingRetries(ev.repair_attempts);
           }
         } else if (ev.stage === 'complete' && ev.summary) {
@@ -1558,7 +1568,7 @@ export function App() {
             });
           setLiveGateResults(ev.summary.gate_results);
           if (ev.summary.repair_diff) setRepairDiff(ev.summary.repair_diff);
-          if (ev.summary.repair_attempts) setSelfHealingRetries(ev.summary.repair_attempts);
+          if (ev.summary.repair_attempts && ev.summary.repair_attempts > 1) setSelfHealingRetries(ev.summary.repair_attempts);
           setCompletedStages([1, 2, 3, 4, 5, 6, 7, 8]);
           setActiveStage(null);
           setIsRunning(false);
@@ -1604,7 +1614,7 @@ export function App() {
       setIsSimPlaying(false);
     } else {
       setIsSimPlaying(true);
-      fetchSimTrajectory(selectedSceneId, 120)
+      fetchSimTrajectory(selectedSceneId, activeSceneGraph.task.task_type === 'multi_stack' ? 220 : 120)
         .then((traj) => {
           let wpIdx = 0;
           playTimerRef.current = window.setInterval(() => {
@@ -1640,7 +1650,7 @@ export function App() {
   };
 
   const handleStepOracleEnd = () => {
-    fetchSimTrajectory(selectedSceneId, 120)
+    fetchSimTrajectory(selectedSceneId, activeSceneGraph.task.task_type === 'multi_stack' ? 220 : 120)
       .then((traj) => {
         if (traj.length > 0) {
           const finalState = traj[traj.length - 1];
@@ -1717,7 +1727,7 @@ export function App() {
               <span>Self-Healing Retries: {selfHealingRetries} / 4 (Gate 3 Fix In-Flight)</span>
             </div>
           )}
-          {!isRunning && (runResult?.self_healing_applied || selfHealingRetries > 0) && (
+          {!isRunning && ((runResult?.self_healing_applied && (runResult?.repairs_applied?.length ?? 0) > 0) || selfHealingRetries > 1) && (
             <div className="px-3 py-1.5 rounded-full bg-emerald-950/80 border border-emerald-600/80 text-emerald-200 font-mono font-semibold flex items-center gap-1.5 shadow-sm">
               <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
               <span>Self-Healing: Patched on Retry {runResult?.repair_attempts || selfHealingRetries} / 4 ✓</span>
@@ -1741,10 +1751,22 @@ export function App() {
           </div>
 
           {/* Mask IoU */}
-          <div className="px-3 py-1.5 rounded-full bg-emerald-950/40 border border-emerald-800/60 flex items-center gap-2 shadow-sm">
-            <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+          <div
+            className={`px-3 py-1.5 rounded-full flex items-center gap-2 shadow-sm ${
+              currentIoU >= 60
+                ? 'bg-emerald-950/40 border border-emerald-800/60'
+                : 'bg-red-950/60 border border-red-700/80'
+            }`}
+          >
+            {currentIoU >= 60 ? (
+              <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+            ) : (
+              <AlertTriangle className="h-3.5 w-3.5 text-red-400" />
+            )}
             <span className="text-zinc-400">IoU:</span>
-            <span className="font-mono font-bold text-emerald-300">{currentIoU}%</span>
+            <span className={`font-mono font-bold ${currentIoU >= 60 ? 'text-emerald-300' : 'text-red-300'}`}>
+              {currentIoU}%
+            </span>
           </div>
         </div>
       </header>
@@ -1811,7 +1833,7 @@ export function App() {
                   Self-Healing Loop in Flight (Gate 3 Retrying {selfHealingRetries}/4)...
                 </div>
               )}
-              {!isRunning && (runResult?.self_healing_applied || selfHealingRetries > 0) && (
+              {!isRunning && ((runResult?.self_healing_applied && (runResult?.repairs_applied?.length ?? 0) > 0) || selfHealingRetries > 1) && (
                 <div className="flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-emerald-950/80 border border-emerald-600/70 text-emerald-300 text-[11px] font-mono">
                   <CheckCircle2 className="h-3 w-3 text-emerald-400" />
                   Self-Healing: Patched on Retry {runResult?.repair_attempts || selfHealingRetries} / 4 ✓
@@ -1970,6 +1992,18 @@ export function App() {
                   </div>
                 )}
 
+                {/* User Intent Prompt Input Box */}
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="text"
+                    value={userPrompt}
+                    onChange={(e) => setUserPrompt(e.target.value)}
+                    disabled={isRunning}
+                    placeholder="Describe task intent (e.g., Stack the 3 objects by geometry stability)..."
+                    className="w-72 sm:w-80 bg-zinc-900 border border-zinc-700 rounded-lg px-3 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-500 focus:outline-none focus:border-violet-500"
+                  />
+                </div>
+
                 {/* 1-Click Gymnasium Package (.zip) Export Button */}
                 <a
                   href={`${API_BASE}/api/export/${encodeURIComponent(selectedSceneId)}`}
@@ -2072,7 +2106,7 @@ export function App() {
                     <Layers className="h-4 w-4 text-emerald-400" />
                     Stage 8: Render + Diff Mask IoU
                   </h2>
-                  <span className="text-[10px] font-mono text-emerald-400 font-bold">
+                  <span className={`text-[10px] font-mono font-bold ${currentIoU >= 60 ? 'text-emerald-400' : 'text-red-400'}`}>
                     {runResult?.scene_id === selectedSceneId
                       ? `${Math.round(runResult.render_diff.mean_iou * 1000) / 10}% IoU`
                       : selectedSceneId === 'scene1_pick_place'
@@ -2344,7 +2378,7 @@ export function App() {
                   { num: 2, name: 'Static Equilibrium', desc: '250 Steps · Resting Drift < 2mm' },
                   { num: 3, name: 'Reward Variance', desc: 'σ > 1e-4 · Non-Degenerate Reward' },
                   { num: 4, name: 'Waypoint Oracle', desc: 'Closed-Loop Success Nominal' },
-                  { num: 5, name: 'PPO Convergence', desc: 'Eval Mean Beats Random Baseline' },
+                  { num: 5, name: 'Oracle + Residual Smoke Test', desc: '512-Step Policy + Oracle Beats Random Baseline' },
                 ].map((g) => {
                   const gateInfo = liveGateResults[String(g.num)] ?? runResult?.gate_results?.[String(g.num)];
                   const isFailed = gateInfo?.passed === false;
@@ -2388,7 +2422,7 @@ export function App() {
               {/* Interactive Recharts Learning Curve */}
               <div className="p-3 rounded-xl bg-zinc-900 border border-zinc-800">
                 <div className="flex items-center justify-between text-xs mb-2">
-                  <span className="font-semibold text-zinc-300">PPO Learning Curve (Timesteps vs Return)</span>
+                  <span className="font-semibold text-zinc-300">Short PPO Smoke Test (Timesteps vs Return)</span>
                   <span className="text-[10px] font-mono text-emerald-400">
                     Mean: +{runResult ? runResult.ppo_results.eval_mean_return.toFixed(1) : '48.2'}
                   </span>

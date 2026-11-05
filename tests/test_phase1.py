@@ -5,6 +5,8 @@ For each of the 3 golden scenes:
   2. Compile to MJCF XML and check it parses with ``mujoco.MjModel``.
   3. Instantiate ``WorldForgeEnv``, step 500 times with random actions,
      and assert zero exceptions / NaN observations.
+  4. Verify strict schema rejection of cyclic parents, missing manipulated_object_id,
+     short box sizes, negative sizes, duplicate IDs, and zero quaternions.
 """
 
 from __future__ import annotations
@@ -16,6 +18,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 import pytest
+from pydantic import ValidationError
 
 from src.compiler.base_env import WorldForgeEnv
 from src.compiler.mjcf_builder import compile_scene_to_mjcf
@@ -30,23 +33,18 @@ GOLDEN_SCENES = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _load_scene(name: str) -> SceneGraph:
+def _load_scene_dict(name: str = "scene1_pick_place.json") -> dict:
     path = SCENE_DIR / name
     with open(path) as f:
-        data = json.load(f)
-    return SceneGraph(**data)
+        return json.load(f)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def _load_scene(name: str) -> SceneGraph:
+    return SceneGraph(**_load_scene_dict(name))
+
 
 class TestSceneGraphValidation:
-    """Pydantic model validation and auto-snap behaviour."""
+    """Pydantic model validation, schema hardening, and auto-snap behaviour."""
 
     @pytest.mark.parametrize("scene_file", GOLDEN_SCENES)
     def test_loads_without_error(self, scene_file: str) -> None:
@@ -59,7 +57,6 @@ class TestSceneGraphValidation:
         for obj in scene.objects:
             if obj.parent_id is not None:
                 continue
-            # bottom of object must be >= table_z + 0.001
             if obj.primitive == "box":
                 half_h = obj.size[2]
             elif obj.primitive == "cylinder":
@@ -71,6 +68,43 @@ class TestSceneGraphValidation:
                 f"Object {obj.id} bottom={bottom:.4f} is below table"
             )
 
+    def test_rejects_short_box_size(self) -> None:
+        data = _load_scene_dict()
+        data["objects"][0]["size"] = [0.025, 0.025]  # Missing 3rd dimension for box
+        with pytest.raises(ValidationError):
+            SceneGraph.model_validate(data)
+
+    def test_rejects_negative_or_zero_size(self) -> None:
+        data = _load_scene_dict()
+        data["objects"][0]["size"] = [0.025, -0.01, 0.025]
+        with pytest.raises(ValidationError):
+            SceneGraph.model_validate(data)
+
+    def test_rejects_zero_quaternion(self) -> None:
+        data = _load_scene_dict()
+        data["objects"][0]["quaternion"] = [0.0, 0.0, 0.0, 0.0]
+        with pytest.raises(ValidationError):
+            SceneGraph.model_validate(data)
+
+    def test_rejects_duplicate_object_ids(self) -> None:
+        data = _load_scene_dict()
+        data["objects"][1]["id"] = data["objects"][0]["id"]
+        with pytest.raises(ValidationError):
+            SceneGraph.model_validate(data)
+
+    def test_rejects_cyclic_parent_ids(self) -> None:
+        data = _load_scene_dict()
+        data["objects"][0]["parent_id"] = data["objects"][1]["id"]
+        data["objects"][1]["parent_id"] = data["objects"][0]["id"]
+        with pytest.raises(ValidationError):
+            SceneGraph.model_validate(data)
+
+    def test_rejects_nonexistent_manipulated_object_id(self) -> None:
+        data = _load_scene_dict()
+        data["task"]["manipulated_object_id"] = "ghost_object_id"
+        with pytest.raises(ValidationError):
+            SceneGraph.model_validate(data)
+
 
 class TestMJCFCompilation:
     """MJCF XML generation and MuJoCo loading."""
@@ -80,7 +114,6 @@ class TestMJCFCompilation:
         scene = _load_scene(scene_file)
         xml = compile_scene_to_mjcf(scene)
         assert xml.startswith("<?xml")
-        # Must load without error
         model = mujoco.MjModel.from_xml_string(xml)
         assert model.nq > 0
 
@@ -151,4 +184,3 @@ class TestWorldForgeEnv:
         assert np.allclose(env.action_space.low, -1.0)
         assert np.allclose(env.action_space.high, 1.0)
         env.close()
-

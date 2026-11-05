@@ -1,9 +1,9 @@
 """
-Regenerate 4-second (120-frame @ 30 FPS) preview assets for all 3 golden scenes:
+Regenerate preview assets for all 3 golden scenes:
 - outputs/{scene_id}/frame0_masks.png (SAM 3.1 4px eroded masks)
 - outputs/{scene_id}/diff_overlay.png (Render + Diff IoU composite)
-- outputs/{scene_id}/oracle_rollout.mp4 (Pure Waypoint Oracle baseline, 120 frames @ 30 FPS)
-- outputs/{scene_id}/rollout.mp4 (Residual PPO rollout, 120 frames @ 30 FPS)
+- outputs/{scene_id}/oracle_rollout.mp4 (Pure Waypoint Oracle baseline)
+- outputs/{scene_id}/rollout.mp4 (Residual PPO rollout)
 """
 
 import json
@@ -19,7 +19,6 @@ from src.compiler.base_env import WorldForgeEnv
 from src.perception.sam_tracker import SAM31Tracker
 from src.render_diff.mask_iou import evaluate_and_align_sim
 from src.validation.ppo_runner import (
-    OracleController,
     ResidualOracleEnv,
     _save_video,
     record_oracle_rollout,
@@ -45,7 +44,6 @@ def generate_scene_previews(scene_id: str, scenes_dir: Path, outputs_root: Path)
 
     print(f"Generating assets for {clean_id}...")
 
-    # 1. SAM 3.1 Segment from Sim Env + frame0_masks.png
     tracker = SAM31Tracker()
     ref_env = WorldForgeEnv(sg, render_mode="rgb_array")
     tracking_result, _ = tracker.segment_from_sim_env(ref_env, num_frames=10, execute_oracle=False)
@@ -80,7 +78,6 @@ def generate_scene_previews(scene_id: str, scenes_dir: Path, outputs_root: Path)
     )
     print(f"  [x] Saved {out_dir / 'frame0_masks.png'}")
 
-    # 2. Render + Diff Mask IoU overlay
     target_masks = {track.object_id: track.frame0_mask for track in tracking_result.tracks}
     _, diff_report = evaluate_and_align_sim(
         scene=sg,
@@ -95,24 +92,23 @@ def generate_scene_previews(scene_id: str, scenes_dir: Path, outputs_root: Path)
     )
     print(f"  [x] Saved {out_dir / 'diff_overlay.png'}")
 
-    # 3. Pure Waypoint Oracle baseline rollout MP4 (120 frames @ 30 FPS = 4.0 seconds)
     oracle_path = out_dir / "oracle_rollout.mp4"
-    record_oracle_rollout(sg, str(oracle_path), max_steps=120, fps=30)
+    record_oracle_rollout(sg, str(oracle_path), max_steps=150, fps=30)
     print(f"  [x] Saved {oracle_path}")
 
-    # 4. Residual PPO rollout MP4 (120 frames @ 30 FPS = 4.0 seconds)
     rollout_path = out_dir / "rollout.mp4"
-    record_residual_rollout(sg, str(rollout_path), max_steps=120, fps=30)
+    record_residual_rollout(sg, str(rollout_path), max_steps=150, fps=30)
     print(f"  [x] Saved {rollout_path}")
 
 
 def record_residual_rollout(
     scene: SceneGraph,
     output_path: str,
-    max_steps: int = 120,
+    max_steps: int = 150,
     fps: int = 30,
+    render_stride: int = 2,
 ) -> str:
-    """Record 4.0-second 120-frame Residual rollout video."""
+    """Record Residual rollout video with stable grasp dwell."""
     base_env = WorldForgeEnv(scene, render_mode="rgb_array")
     res_env = ResidualOracleEnv(base_env, scene.task.waypoints, residual_weight=0.10)
     obs, _ = res_env.reset(seed=101)
@@ -120,23 +116,24 @@ def record_residual_rollout(
     terminated = False
     last_grip = scene.task.waypoints[-1][3] if scene.task.waypoints else 0.0
 
-    for _ in range(max_steps):
+    for step_i in range(max_steps):
         if not terminated:
-            # Slight exploration jitter around oracle waypoint
             residual_action = np.random.uniform(-0.04, 0.04, size=4).astype(np.float32)
-            residual_action[3] = 0.0  # Keep gripper discrete
+            residual_action[3] = 0.0
             obs, reward, term, trunc, _ = res_env.step(residual_action)
             if term or trunc:
                 terminated = True
         else:
             base_env.step(np.array([0.0, 0.0, 0.0, last_grip], dtype=np.float32))
 
-        frame = base_env.render_camera()
-        if frame is not None:
-            frames.append(frame)
+        if step_i % render_stride == 0:
+            frame = base_env.render_camera()
+            if frame is not None:
+                frames.append(frame)
 
     base_env.close()
-    return _save_video(frames, output_path, fps=fps)
+    fps_out = 20 if render_stride == 2 else fps
+    return _save_video(frames, output_path, fps=fps_out)
 
 
 def main():
