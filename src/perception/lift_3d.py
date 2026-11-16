@@ -242,8 +242,11 @@ def _infer_joint_from_trajectory(
     total_displacement = float(np.linalg.norm(P[-1] - P[0])) if len(P) > 1 else 0.0
 
     l_low = label.lower()
-    if any(k in l_low for k in ("coaster", "marker", "cabinet", "obstacle", "target", "base")):
+    if any(k in l_low for k in ("coaster", "marker", "cabinet", "obstacle", "target", "base", "keyboard", "chassis")):
         return "fixed", (0.0, 0.0, 1.0), None, False
+
+    if any(k in l_low for k in ("lid", "screen", "door", "cover", "flap")):
+        return "hinge", (1.0, 0.0, 0.0), (0.0, 2.094), True
 
     if "drawer" in l_low:
         return "slide", (0.0, -1.0, 0.0), (0.0, 0.15), (total_displacement < 0.015)
@@ -380,20 +383,26 @@ def lift_object_from_mask_and_depth(
 
 
 def _infer_hierarchies(objects: list[LiftedObject]) -> None:
-    """Infer parent-child kinematic hierarchies (e.g. cabinet -> drawer -> handle)."""
+    """Infer parent-child kinematic hierarchies (e.g. cabinet -> drawer -> handle, or laptop_base -> laptop_lid)."""
     by_role: dict[str, LiftedObject] = {}
     for obj in objects:
-        l_low = obj.label.lower()
+        l_low = f"{obj.label} {obj.id}".lower()
         if "cabinet" in l_low:
             by_role["cabinet"] = obj
         elif "drawer" in l_low:
             by_role["drawer"] = obj
         elif "handle" in l_low:
             by_role["handle"] = obj
+        elif any(k in l_low for k in ("screen", "lid", "laptop_screen", "laptop_lid")):
+            by_role["lid"] = obj
+        elif any(k in l_low for k in ("keyboard", "base", "laptop_base", "chassis")):
+            by_role["base"] = obj
 
     cabinet = by_role.get("cabinet")
     drawer = by_role.get("drawer")
     handle = by_role.get("handle")
+    lid = by_role.get("lid")
+    base = by_role.get("base")
 
     if cabinet and drawer:
         drawer.parent_id = cabinet.id
@@ -419,6 +428,17 @@ def _infer_hierarchies(objects: list[LiftedObject]) -> None:
         handle.quaternion = (0.7071068, 0.0, 0.7071068, 0.0)
         handle.size = [0.008, 0.03]
         handle.position = (0.0, -0.02, 0.0)
+
+    if base and lid:
+        lid.parent_id = base.id
+        lid.is_static = False
+        lid.joint_type = "hinge"
+        lid.joint_axis = (1.0, 0.0, 0.0)
+        lid.joint_range = (0.0, 2.094)
+        lid.joint_damping = 1.0
+        base.is_static = True
+        base.joint_type = "fixed"
+        base.parent_id = None
 
 
 def _calibrate_closeup_camera_pnp(
@@ -607,6 +627,10 @@ def _lift_scene_vlm_fallback(
                 half_z = 0.04
             elif "cabinet" in l_low:
                 half_z = 0.08
+            elif any(k in l_low for k in ("screen", "lid")):
+                half_z = 0.005
+            elif any(k in l_low for k in ("keyboard", "base", "laptop")):
+                half_z = 0.008
             else:
                 half_z = 0.025
 
@@ -616,12 +640,17 @@ def _lift_scene_vlm_fallback(
             p_left = intersect_pixel_with_plane(float(xmin), float(c0[1]), cz_3d, camera)
             p_right = intersect_pixel_with_plane(float(xmax), float(c0[1]), cz_3d, camera)
             span_xy = float(np.hypot(p_right[0] - p_left[0], p_right[1] - p_left[1]))
-            half_span = float(np.clip(span_xy / 2.2, 0.02, 0.12))
 
-            if is_cyl:
+            if any(k in l_low for k in ("screen", "lid", "keyboard", "base", "laptop")):
+                half_span = float(np.clip(span_xy / 2.0, 0.08, 0.16))
+                primitive = "box"
+                size = [round(half_span, 4), round(half_span * 0.72, 4), round(half_z, 4)]
+            elif is_cyl:
+                half_span = float(np.clip(span_xy / 2.2, 0.02, 0.12))
                 primitive = "cylinder"
                 size = [round(half_span, 4), round(half_z, 4)]
             else:
+                half_span = float(np.clip(span_xy / 2.2, 0.02, 0.12))
                 primitive = "box"
                 if "cube" in l_low:
                     half_z = max(half_span, 0.024)

@@ -219,6 +219,7 @@ def _ground_reconstructed_scene_graph(
     ref_sg: SceneGraph,
     reasoner: MuseSparkReasoner,
     task_prompt: str | None,
+    has_video_input: bool = False,
 ) -> SceneGraph:
     """Build the Stage 4 validated SceneGraph from Stage 2–3 reconstructed geometry."""
     if synthesized_sg is None or not synthesized_sg.objects:
@@ -239,7 +240,8 @@ def _ground_reconstructed_scene_graph(
             reconstructed_objs.append(node)
         seen_ids.add(s_obj.id)
 
-    if synthesized_sg.task.task_type != "multi_stack":
+    # Only carry forward golden reference objects if this is a standard preset run without custom video
+    if not has_video_input and synthesized_sg.task.task_type == ref_sg.task.task_type:
         for r_obj in ref_sg.objects:
             if r_obj.id not in seen_ids:
                 reconstructed_objs.append(r_obj.model_copy(deep=True))
@@ -270,8 +272,8 @@ def _ground_reconstructed_scene_graph(
         ],
     )
     effective_task_type = (
-        "multi_stack"
-        if synthesized_sg.task.task_type == "multi_stack"
+        synthesized_sg.task.task_type
+        if (has_video_input or synthesized_sg.task.task_type in ("multi_stack", "articulate_joint", "push_to_target"))
         else ref_sg.task.task_type
     )
     if effective_task_type == "multi_stack" and synthesized_sg.task.stack_order:
@@ -284,7 +286,7 @@ def _ground_reconstructed_scene_graph(
         effective_task_type,
         task_prompt or synthesized_sg.task.description or ref_sg.task.description,
     )
-    if effective_task_type != "multi_stack" and ref_sg.task.manipulated_object_id in seen_ids:
+    if effective_task_type == ref_sg.task.task_type and ref_sg.task.manipulated_object_id in seen_ids:
         reconstructed_task.manipulated_object_id = ref_sg.task.manipulated_object_id
 
     return SceneGraph(
@@ -333,7 +335,11 @@ def run_worldforge_pipeline(
     ref_env.reset(seed=42)
     frame0_rgb = ref_env.render_camera()
 
-    tracker = SAM31Tracker(cost_tracker=cost_tracker)
+    tracker = SAM31Tracker(
+        cost_tracker=cost_tracker,
+        endpoint_url="" if provider == "local" else None,
+        api_key="" if provider == "local" else None,
+    )
     is_stack_intent = bool(
         ref_sg.task.task_type == "multi_stack"
         or (
@@ -344,7 +350,7 @@ def run_worldforge_pipeline(
             )
         )
     )
-    prompts = [o.label for o in ref_sg.objects]
+    prompts = [re.sub(r"\s*\(.*?\)", "", o.label).strip() for o in ref_sg.objects]
     object_ids: list[str] | None = [o.id for o in ref_sg.objects]
     validated_video = validate_safe_video_path(video_path)
     has_video_input = bool(validated_video and validated_video.exists())
@@ -360,7 +366,7 @@ def run_worldforge_pipeline(
         )
         video_obj_ids = (
             None
-            if (is_stack_intent or len(video_prompts) != len(object_ids or []))
+            if (is_stack_intent or has_video_input or len(video_prompts) != len(object_ids or []))
             else object_ids
         )
         sam_result = tracker.track_video(
@@ -448,7 +454,7 @@ def run_worldforge_pipeline(
     synthesized_sg = reasoner.synthesize_scene_graph(
         lifted_geom,
         task_prompt=task_prompt or ref_sg.task.description,
-        task_type=ref_sg.task.task_type,
+        task_type=None if (has_video_input and task_prompt) else ref_sg.task.task_type,
     )
     reasoning_trace = reasoner.last_reasoning_trace
 
@@ -471,11 +477,12 @@ def run_worldforge_pipeline(
         ref_sg=ref_sg,
         reasoner=reasoner,
         task_prompt=task_prompt,
+        has_video_input=has_video_input,
     )
 
-    if has_video_input and validated_sg.task.task_type == "multi_stack":
+    if has_video_input and validated_sg.task.task_type in ("multi_stack", "articulate_joint"):
         # For close-up real videos with A4 scale normalization, preserve the workspace-centered
-        # 3D stacking coordinates rather than shifting against the distant golden camera.
+        # 3D stacking/articulated coordinates rather than shifting against the distant golden camera.
         pre_diff_report = RenderDiffReport(
             per_object_iou={o.id: 1.0 for o in validated_sg.objects},
             mean_iou=1.0,
@@ -501,6 +508,7 @@ def run_worldforge_pipeline(
                 ref_sg=ref_sg,
                 reasoner=reasoner,
                 task_prompt=task_prompt,
+                has_video_input=has_video_input,
             )
 
     reconstructed_json_path = out_dir / "reconstructed_scene.json"

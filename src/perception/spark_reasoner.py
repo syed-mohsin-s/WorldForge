@@ -378,7 +378,7 @@ class MuseSparkReasoner:
             if any(k in p_lower for k in ("stack", "tower", "one by one", "one-by-one", "pile", "on top of")):
                 if len(geom.objects) >= 2 or explicit_task_type == "multi_stack":
                     return "multi_stack"
-            if "pull" in p_lower or "drawer" in p_lower or "articulate" in p_lower or "open" in p_lower:
+            if any(k in p_lower for k in ("fold", "unfold", "close", "shut", "pull", "drawer", "articulate", "open", "hinge", "laptop", "screen", "lid", "door")):
                 return "articulate_joint"
             if "push" in p_lower:
                 return "push_to_target"
@@ -596,19 +596,33 @@ class MuseSparkReasoner:
             id="drawer_panel", label="wooden drawer front panel", primitive="box", size=[0.10, 0.005, 0.06], position=(0.0, -0.105, 0.0), joint_type="slide"
         )
         manipulated = next((o for o in geom.objects if o.joint_type in ("slide", "hinge")), fallback_obj)
-        target_delta = 0.10
 
-        waypoints: list[tuple[float, float, float, float]] = [
-            (0.0, -0.15, 0.22, 1.0),
-            (0.0, -0.125, 0.105, 1.0),
-            (0.0, -0.125, 0.105, -1.0),
-            (0.0, -0.235, 0.105, -1.0),
-            (0.0, -0.235, 0.105, 1.0),
-        ]
+        if manipulated.joint_type == "hinge":
+            target_delta = 1.40
+            mx, my, mz = manipulated.position
+            # Waypoints for folding a hinge/lid: reach top of lid, contact, push forward/down
+            waypoints: list[tuple[float, float, float, float]] = [
+                (round(mx, 3), round(my - 0.05, 3), round(mz + 0.10, 3), 1.0),
+                (round(mx, 3), round(my, 3), round(mz + 0.04, 3), 1.0),
+                (round(mx, 3), round(my, 3), round(mz + 0.04, 3), -1.0),
+                (round(mx, 3), round(my + 0.06, 3), round(mz - 0.02, 3), -1.0),
+                (round(mx, 3), round(my + 0.06, 3), round(mz + 0.05, 3), 1.0),
+            ]
+            desc = prompt or f"Gradually fold the {manipulated.label} down onto the base."
+        else:
+            target_delta = 0.10
+            waypoints = [
+                (0.0, -0.15, 0.22, 1.0),
+                (0.0, -0.125, 0.105, 1.0),
+                (0.0, -0.125, 0.105, -1.0),
+                (0.0, -0.235, 0.105, -1.0),
+                (0.0, -0.235, 0.105, 1.0),
+            ]
+            desc = prompt or f"Grasp and pull open the {manipulated.label} by 10cm."
 
         return TaskSpec(
             task_type="articulate_joint",
-            description=prompt or f"Grasp and pull open the {manipulated.label} by 10cm.",
+            description=desc,
             manipulated_object_id=manipulated.id,
             target_position=None,
             target_joint_delta=target_delta,

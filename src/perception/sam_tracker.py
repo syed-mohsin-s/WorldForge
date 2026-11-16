@@ -65,7 +65,22 @@ def extract_prompts_from_user_intent(
             return ["left object", "center object", "right object"]
         return fallback_prompts
 
-    tokens = re.findall(r"[a-zA-Z]+", task_prompt.lower())
+    p_lower = task_prompt.lower()
+
+    # 1. Articulated object keywords & structural pairings
+    if "laptop" in p_lower:
+        return ["laptop screen", "laptop keyboard"]
+    if "drawer" in p_lower:
+        return ["drawer", "cabinet"]
+    if "door" in p_lower:
+        return ["door", "door frame"]
+    if "book" in p_lower:
+        return ["book cover", "book base"]
+    if "box" in p_lower and any(k in p_lower for k in ("open", "close", "fold", "lid", "shut")):
+        return ["box lid", "box base"]
+
+    # 2. Extract colors if present
+    tokens = re.findall(r"[a-zA-Z]+", p_lower)
     extracted_colors: list[str] = []
     for tok in tokens:
         canon = _COLOR_SYNONYMS.get(tok)
@@ -85,6 +100,18 @@ def extract_prompts_from_user_intent(
         return [f"{extracted_colors[0]} object"] + [
             p for p in fallback_prompts if extracted_colors[0] not in p.lower()
         ]
+
+    # 3. Common manipulation nouns
+    _COMMON_NOUNS = (
+        "cube", "block", "coaster", "target", "cylinder", "bottle", "can",
+        "cup", "mug", "plate", "bowl", "tray", "phone", "pen", "pencil",
+        "container", "shelf", "screen", "keyboard", "lid", "base", "obstacle",
+    )
+    extracted_nouns = [n for n in _COMMON_NOUNS if n in p_lower]
+    if len(extracted_nouns) >= 2:
+        return extracted_nouns
+    if len(extracted_nouns) == 1:
+        return [extracted_nouns[0]]
 
     return fallback_prompts
 
@@ -325,10 +352,10 @@ class SAM31Tracker:
         cost_tracker: CostTracker | None = None,
         erosion_px: int = 4,
     ) -> None:
-        raw_key = api_key or os.environ.get("META_API_KEY", "")
+        raw_key = api_key if api_key is not None else os.environ.get("META_API_KEY", "")
         self.api_key = raw_key if (raw_key and not raw_key.startswith("your_")) else None
-        self.api_url = api_url or os.environ.get("META_SAM_API_URL")
-        self.endpoint_url = endpoint_url or os.environ.get("SAM31_ENDPOINT_URL")
+        self.api_url = api_url if api_url is not None else os.environ.get("META_SAM_API_URL")
+        self.endpoint_url = endpoint_url if endpoint_url is not None else os.environ.get("SAM31_ENDPOINT_URL")
         if local_hf is not None:
             self.local_hf = local_hf
         else:
@@ -972,7 +999,7 @@ class SAM31Tracker:
             or []
         )
 
-        max_mask_area = int(h * w * 0.25)
+        max_mask_area = int(h * w * 0.85)
         min_mask_area = 250 if object_ids is None else 20
 
         for idx, item in enumerate(raw_items):
